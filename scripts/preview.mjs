@@ -85,6 +85,8 @@ const ctx = {
   theme: { injectCss: (s) => { injected.css = s; return () => {}; }, setTokens: () => () => {} },
   storage: { get: async () => null, set: async () => {}, delete: async () => {} },
   documentStorage: {
+    // 宿主的隔离存储根。解读默认就跑在这个目录下，设置页也要显示它。
+    getLocation: async () => ({ kind: "data", path: "C:/Users/you/.ccgui-next/plugin-data/github-trending" }),
     // 上次快照：只放 4 条，且刻意让「superpowers」「CLI-Anything」掉出、其余错位，
     // 好让预览里同时看到新上榜、上升、下跌三种标签。
     // 别只给 3 条——那样几乎整榜都是「新上榜」，看不出真实榜单里标签稀疏的样子。

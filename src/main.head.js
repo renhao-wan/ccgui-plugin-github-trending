@@ -72,6 +72,8 @@ const DEFAULT_STATE = {
   modelsError: "",
   workspaces: [],
   workspacesLoaded: false,
+  /** 插件数据目录的绝对路径；生成解读时的默认 cwd。 */
+  storagePath: "",
 };
 
 const store = { snap: { ...DEFAULT_STATE }, listeners: new Set() };
@@ -479,19 +481,51 @@ async function refresh(ctx, options) {
 
 /* ---------- AI 解读 ---------- */
 
-async function resolveWorkspace(ctx, settings) {
-  const configured = String(settings.workspacePath || "").trim();
-  if (configured) return configured;
+/**
+ * 插件自己的数据目录（宿主隔离存储根，通常是 ~/.ccgui-next/plugin-data/<id>）。
+ * 拿不到时返回空串，由调用方回退。
+ */
+async function pluginDataDir(ctx) {
+  const cached = store.snap.storagePath;
+  if (cached) return cached;
+  const ds = ctx && ctx.documentStorage;
+  if (!ds || typeof ds.getLocation !== "function") return "";
   try {
-    const rows = await ctx.workspaces.list();
-    const first = (Array.isArray(rows) ? rows : []).find(
-      (row) => row && typeof row.path === "string" && row.path.trim(),
-    );
-    if (first) return first.path;
+    const loc = await ds.getLocation();
+    const path = String(loc && loc.path ? loc.path : "").replace(/[\\/]+$/, "");
+    if (path) set({ storagePath: path });
+    return path;
   } catch {
-    /* 没有工作区授权或列表为空都走下面的失败路径 */
+    return "";
   }
-  return "";
+}
+
+/**
+ * 生成解读时引擎进程的 cwd。
+ *
+ * 顺序：用户显式设置 > 插件数据目录 > 侧栏第一个工作区。
+ * 中间这层是默认值，不是可有可无的兜底：agent 跑一轮会在 ~/.claude/projects
+ * 留下会话记录，cwd 就是这里传的值。挂在真实项目名下，「生成热点解读」这个
+ * 动作本身会被那个项目的会话历史记成一次工作产出。收到插件目录后，
+ * 这类会话归在 plugin-data/github-trending 下，谁产生的也一眼看得出。
+ */
+async function resolveWorkspace(ctx, settings) {
+  const own = await pluginDataDir(ctx);
+  if (String(settings.workspacePath || "").trim()) return pickWorkspace(settings, own, []);
+  let rows = [];
+  try {
+    rows = await ctx.workspaces.list();
+  } catch {
+    /* 没有工作区授权或列表为空：交给 pickWorkspace 返回空串 */
+  }
+  return pickWorkspace(settings, own, rows);
+}
+
+/** 界面展示统一用本机分隔符；传给宿主与存储的仍是原始路径。 */
+function displayPath(p) {
+  const s = String(p || "").trim();
+  if (!s) return "";
+  return /^[A-Za-z]:[\\/]|^\\\\/.test(s) ? s.replace(/\//g, "\\") : s.replace(/\\/g, "/");
 }
 
 /** 侧栏工作区列表：设置页直接选，避免让用户手打路径（手打的路径没有授权）。 */
@@ -525,7 +559,8 @@ async function loadCatalog(ctx, options) {
   catalogLoading = true;
   set({ modelsLoading: true, modelsError: "" });
   try {
-    const workspace = String(store.snap.settings.workspacePath || "").trim();
+    // 目录也按生成时真正会用的 cwd 去查，免得下拉里看到的引擎和实际跑的不是一套。
+    const workspace = await resolveWorkspace(ctx, store.snap.settings);
     const list = await ctx.agent.catalog(workspace || undefined);
     const entries = (Array.isArray(list) ? list : []).filter(
       (e) => e && typeof e.engine === "string" && e.engine.trim() !== "",
@@ -1350,7 +1385,10 @@ function SettingsSection() {
   };
 
   // 工作区直接选侧栏里已有的：手打的路径没有对应授权，后续会失败。
-  const workspaceItems = [{ value: "", label: "自动（最近打开的工作区）" }];
+  // 「自动」= 插件自己的数据目录；把真实路径写进选项，用户才知道进程会在哪跑。
+  const ownDataDir = snap.storagePath || "";
+  const autoLabel = ownDataDir ? "自动（插件数据目录：" + displayPath(ownDataDir) + "）" : "自动（插件数据目录）";
+  const workspaceItems = [{ value: "", label: autoLabel }];
   for (const row of snap.workspaces) {
     workspaceItems.push({ value: row.path, label: row.name || row.path });
   }
@@ -1530,7 +1568,8 @@ function SettingsSection() {
             onChange: (v) => patch("workspacePath", v),
             emptyText: "侧栏还没有工作区",
           }),
-          "模型进程在这个工作区目录下运行。解读内容来自当前榜单，不读这里的文件。",
+          "模型进程在这个目录下运行。解读内容来自当前榜单、不读这里的文件；"
+            + "默认落在插件数据目录，免得解读会话混进某个项目的会话历史。",
         ),
       ),
     ),
@@ -1943,6 +1982,10 @@ export default function activate(ctx) {
     }
     await pruneHistory(ctx);
   })();
+
+  // 数据目录既是快照的落盘位置，也是解读默认的 cwd。早点读到，设置页才能
+  // 把真实路径显示出来；读不到不影响任何功能，届时回退到侧栏第一个工作区。
+  void pluginDataDir(ctx);
 
   const dispose = () => {
     activateSeq += 1;

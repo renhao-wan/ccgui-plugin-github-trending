@@ -274,6 +274,8 @@ const ctx = {
     },
   },
   documentStorage: {
+    // 宿主的隔离存储根：默认 plugin-data/<id>/。解读默认就跑在这个目录下。
+    getLocation: async () => ({ kind: "data", path: storageDir }),
     readText: async (rel) => {
       const p = path.join(storageDir, rel);
       if (!fs.existsSync(p)) return null;
@@ -543,7 +545,13 @@ await check("生成解读：按 runId 过滤、流式写入", async () => {
   // 真实宿主对不支持的引擎是整轮拒绝，不是降级——传错这个参数生成直接失败。
   assert.equal(agentStarts[0].readOnly, false, "引擎不支持时不能请求只读运行");
   assert.match(agentStarts[0].prompt, /GitHub Trending daily/);
-  assert.ok(agentStarts[0].workspacePath, "应带工作区");
+  // 默认 cwd 必须是插件数据目录，而不是侧栏第一个工作区（os.tmpdir() 在这里
+  // 扮演「真实项目」）。挂在项目名下，解读会话会被那个项目的会话历史记成产出。
+  assert.equal(
+    agentStarts[0].workspacePath,
+    storageDir,
+    "默认工作区应是插件数据目录，不是侧栏工作区",
+  );
 });
 
 await check("解读只显示不落盘", async () => {
@@ -680,6 +688,9 @@ await check("设置页：工作区从侧栏列表选，不需要手打路径", a
   renderFresh(settingsDef.component, {}, { effects: true });
   // 假宿主不提供 workspaces，这里只验证「自动」这一项存在、且没有路径输入框
   assert.ok(await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("自动")));
+  // 「自动」要写清楚默认落在哪：只说「自动」等于没告诉用户 cwd 是什么。
+  const text = textOf(renderFresh(settingsDef.component));
+  assert.match(text, /自动（插件数据目录/, "默认项应写明插件数据目录");
   let pathInputs = 0;
   walk(renderFresh(settingsDef.component), (n) => {
     if (n.type === "input" && n.props && n.props.placeholder && /工作区路径|D:\\\\|example/.test(n.props.placeholder)) {
