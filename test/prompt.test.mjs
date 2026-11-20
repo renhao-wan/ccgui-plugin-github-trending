@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildDigestPrompt } from "../src/lib/prompt.mjs";
+import { buildDigestPrompt, buildDiscussPrompt } from "../src/lib/prompt.mjs";
 
 const makeRepo = (i) => ({
   repo: "owner/repo-" + i,
@@ -113,4 +113,65 @@ test("坏输入退化为安全默认值", () => {
   const out = buildDigestPrompt({});
   assert.match(out.prompt, /GitHub Trending daily/);
   assert.equal(out.truncated, false);
+});
+
+/* ---------- 单个仓库的讨论 prompt ---------- */
+
+const discussRow = (overrides = {}) => ({
+  repo: "obra/superpowers",
+  language: "Shell",
+  stars: 322190,
+  gain: 2028,
+  gainPeriod: "daily",
+  rank: 2,
+  rankDelta: -1,
+  description: "An agentic skills framework & software development methodology that works.",
+  ...overrides,
+});
+
+test("讨论 prompt 带上仓库名、URL 与已知事实", () => {
+  const p = buildDiscussPrompt({ row: discussRow(), view: "trending", period: "daily", language: "" });
+  assert.match(p, /obra\/superpowers/);
+  assert.match(p, /https:\/\/github\.com\/obra\/superpowers/);
+  assert.match(p, /Shell/);
+  assert.match(p, /322190/);
+  assert.match(p, /下降 1 位/);
+  assert.match(p, /GitHub Trending daily 榜/);
+});
+
+test("讨论 prompt 要求先找本地副本，找不到再读远程并说明", () => {
+  const p = buildDiscussPrompt({ row: discussRow(), view: "trending", period: "weekly", language: "python" });
+  assert.match(p, /本地副本/);
+  assert.match(p, /没找到本地代码/);
+  // 时间档与语言要如实反映，不能写死 daily
+  assert.match(p, /GitHub Trending weekly 榜（python）/);
+});
+
+test("讨论 prompt 禁止编造，推测要标出来", () => {
+  const p = buildDiscussPrompt({ row: discussRow(), view: "trending", period: "daily", language: "" });
+  assert.match(p, /推测/);
+  assert.match(p, /不要编造/);
+  assert.match(p, /下一步/);
+});
+
+test("讨论 prompt 在事实缺失时不崩，也不写空行", () => {
+  const p = buildDiscussPrompt({ row: { repo: "a/b" }, view: "rising" });
+  assert.match(p, /a\/b/);
+  assert.match(p, /只有仓库名/);
+  assert.match(p, /近 7 天新建/);
+  // 不应该出现 "undefined" 或 "null"
+  assert.ok(!/undefined|null|NaN/.test(p));
+});
+
+test("讨论 prompt 对空输入也返回可用的字符串", () => {
+  const p = buildDiscussPrompt({});
+  assert.equal(typeof p, "string");
+  assert.match(p, /这个仓库/);
+  assert.ok(p.length > 100);
+});
+
+test("讨论 prompt 会截断超长描述", () => {
+  const p = buildDiscussPrompt({ row: discussRow({ description: "x".repeat(2000) }), view: "trending" });
+  // 单行描述不能撑爆整个 prompt
+  assert.ok(p.length < 2000);
 });

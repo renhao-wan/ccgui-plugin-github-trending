@@ -68,6 +68,10 @@ const DEFAULT_STATE = {
   digestIncluded: 0,
   digestTotal: 0,
   generating: false,
+  /** 正在为哪一行开会话（仓库全名）；空串 = 没有在开。 */
+  discussing: "",
+  /** 开会话失败的原因。会话是真 token，失败必须说明白，不能静默。 */
+  discussError: "",
   catalog: [],
   catalogLoaded: false,
   modelsLoading: false,
@@ -501,7 +505,7 @@ async function pluginDataDir(ctx) {
 }
 
 /**
- * 生成解读时引擎进程的 cwd。
+ * 解读与「讨论」时引擎进程的 cwd。
  *
  * 顺序：用户显式选择 > 插件数据目录。
  *
@@ -684,6 +688,92 @@ function abortDigest(ctx) {
 /** 兼容旧调用名。 */
 function stopDigest(ctx) {
   abortDigest(ctx);
+}
+
+/* ---------- 单个仓库的讨论会话 ---------- */
+
+/**
+ * 和「生成解读」是两种东西，不能混用同一个 API：
+ * - `agent.start` 的输出去向只有本插件，用户只能在面板里看完；
+ * - `sessions.startRun` 会在侧栏起一个**宿主聊天会话**，用户能接着追问、能停、
+ *   能我们之外的人接管。这正是「进项目里聊聊」需要的形态。
+ *
+ * 能力探测而不是硬用：`sessions` 是 0.3.18 才有的，宿主版本不达标时
+ * `ctx.sessions` 不存在。这里必须给出可读文案，不能让按钮点了没反应。
+ */
+function supportsDiscuss(ctx) {
+  const s = ctx && ctx.sessions;
+  return Boolean(s && typeof s.startRun === "function");
+}
+
+let discussSeq = 0;
+
+/**
+ * 为一行榜单开一个会话。
+ *
+ * 不走 activeDigest 那套「start 在飞时点停止」的状态机：会话一旦建起来就归
+ * 宿主聊天托管，插件的责任只有「别开两轮」和「失败要说清楚」。
+ */
+async function discussRepo(ctx, row) {
+  const snap = store.snap;
+  if (!row || !row.repo) return;
+  if (snap.discussing) return;
+  if (!supportsDiscuss(ctx)) {
+    set({ discussError: "当前 CC GUI 版本不支持从插件发起会话，请升级宿主" });
+    return;
+  }
+
+  const seq = ++discussSeq;
+  set({ discussing: row.repo, discussError: "" });
+  const settings = snap.settings;
+  const bailed = (message) => {
+    if (seq === discussSeq) set({ discussing: "", discussError: message });
+  };
+
+  try {
+    const workspace = await resolveWorkspace(ctx, settings);
+    if (seq !== discussSeq) return;
+    // 工作目录是会话的 cwd，拿不到就没法保证 agent 在哪读文件。
+    if (!workspace) return bailed("读不到插件数据目录，请到设置里点「选择…」指定一个 AI 工作区");
+
+    // 引擎目录可能还没加载（用户直接从页签点进来看榜单）。
+    if (!store.snap.catalogLoaded) {
+      await loadCatalog(ctx);
+      if (seq !== discussSeq) return;
+    }
+    if (store.snap.modelsError) return bailed(store.snap.modelsError);
+
+    const entry = pickEntry(store.snap.catalog, settings.engine);
+    if (!entry) return bailed("没有可用引擎，请先在设置里选择");
+    if (entry.available === false) return bailed(engineLabel(entry.engine) + " 当前不可用，请换一个引擎");
+
+    const models = (entry.models || []).filter((m) => m && typeof m.id === "string" && m.id.trim());
+    const model = String(settings.model || "").trim() || (models[0] ? models[0].id : undefined);
+
+    const prompt = buildDiscussPrompt({
+      row,
+      view: snap.view,
+      period: snap.view === "rising" ? RISING_PERIOD.key : settings.period,
+      language: snap.view === "rising" ? "" : settings.language,
+    });
+
+    // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。
+    await ctx.sessions.startRun({
+      engine: entry.engine,
+      model: model || undefined,
+      prompt,
+      workspacePath: workspace,
+    });
+    if (seq === discussSeq) set({ discussing: "", discussError: "" });
+  } catch (error) {
+    // 用原始 message 判权限，不要过 messageOf：那边把 "missing permission"
+    // 一概当网络授权问题，会把「没装 host:session」误报成「重新安装插件」。
+    const rawMessage = error && error.message ? String(error.message) : String(error || "");
+    const hint = /host:session|permission|not declared/i.test(rawMessage)
+      ? "缺少会话权限，请重新安装插件（manifest 已声明 host:session）"
+      : messageOf(error);
+    bailed("开会话失败：" + hint);
+  }
 }
 
 async function generateDigest(ctx) {
@@ -873,10 +963,13 @@ function movementClass(row) {
   return delta > 0 ? " gt-move--up" : " gt-move--down";
 }
 
-function RepoRow({ row }) {
+function RepoRow({ row, ctx, discussing }) {
   const h = appCtx.react.createElement;
   const href = safeHref(row.url);
   const movement = movementLabel(row);
+  const busy = Boolean(discussing) && discussing === row.repo;
+  // 一次只能开一个：别的行在开的时候按钮禁用，避免连点开出好几个真会话。
+  const blocked = Boolean(discussing) && !busy;
 
   return h(
     "li",
@@ -900,6 +993,19 @@ function RepoRow({ row }) {
         movement
           ? h("span", { className: "gt-move" + movementClass(row) }, movement)
           : null,
+        // 放在标题行末尾：跟仓库名同一视觉层级，用户扫榜时顺手就能点。
+        h(
+          "button",
+          {
+            type: "button",
+            className: "gt-btn gt-discuss" + (busy ? " gt-discuss--busy" : ""),
+            onClick: () => void discussRepo(ctx, row),
+            disabled: blocked || busy,
+            title: "在 AI 工作区里开一个会话，分析这个项目",
+            "aria-label": "就 " + row.repo + " 开会话",
+          },
+          busy ? "打开中…" : "讨论",
+        ),
       ),
       row.description ? h("p", { className: "gt-desc" }, row.description) : null,
       h(
@@ -927,7 +1033,7 @@ function Toolbar({ snap, ctx }) {
   const onView = (view) => {
     if (view === snap.view) return;
     if (snap.generating) stopDigest(ctx);
-    set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false });
+    set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false, discussError: "" });
     void refresh(ctx, { force: true });
   };
   const onPeriod = (period) => {
@@ -935,7 +1041,7 @@ function Toolbar({ snap, ctx }) {
     if (snap.generating) stopDigest(ctx);
     setSettings({ period });
     void persistSettings(ctx, { period });
-    set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [] });
+    set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [], discussError: "" });
     void refresh(ctx, { force: true });
   };
 
@@ -1012,6 +1118,13 @@ function StatusLine({ snap }) {
     );
   }
   if (!snap.loaded) return h("p", { className: "gt-notice" }, "点「刷新」拉取榜单。");
+  if (snap.discussError) {
+    return h(
+      "div",
+      { className: "gt-notice gt-notice--error", role: "status" },
+      h("span", null, snap.discussError),
+    );
+  }
   return h(
     "p",
     { className: "gt-notice" },
@@ -1300,7 +1413,7 @@ function MainTab() {
       "div",
       { className: "gt-scroll" },
       snap.repos.length > 0
-        ? h("ol", { className: "gt-list" }, snap.repos.map((row) => h(RepoRow, { key: row.repo, row })))
+        ? h("ol", { className: "gt-list" }, snap.repos.map((row) => h(RepoRow, { key: row.repo, row, ctx, discussing: snap.discussing })))
         : snap.loading
           ? h(SkeletonList, null)
           : snap.loaded
@@ -1816,10 +1929,11 @@ function SettingsSection() {
           modelHint(),
         ),
         segField(
-          "解读用的工作区",
+          "AI 工作区",
           workspaceControl,
-          "模型进程在这个目录下运行。解读内容来自当前榜单、不读这里的文件；"
-            + "默认落在插件数据目录，免得解读会话混进某个项目的会话历史。"
+          "解读与「讨论」都会在这个目录下运行。"
+            + "点榜单某行的「讨论」时，模型先在这里找同名仓库的本地副本，找不到再读远程。"
+            + "默认落在插件数据目录，免得这些会话混进某个项目的会话历史。"
             + (flashMsg ? " " + flashMsg : ""),
         ),
       ),
@@ -1980,7 +2094,7 @@ const CSS = `
   .gt-spinner { animation: none; }
   .gt-skel::after { animation: none; opacity: 0; }
   .gt-list { animation: none; }
-  .gt-row, .gt-chip, .gt-btn { transition: none; }
+  .gt-row, .gt-chip, .gt-btn, .gt-discuss { transition: none; }
 }
 .gt-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 18px; }
 .gt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; animation: gt-fade-in 180ms ease; }
@@ -2004,6 +2118,16 @@ const CSS = `
 .gt-repo { font-size: 13.5px; font-weight: 600; text-decoration: none; color: inherit; word-break: break-all; }
 .gt-repo:hover { text-decoration: underline; }
 .gt-repo-owner { font-weight: 400; color: var(--gt-muted); }
+/* 讨论入口：平时压得很轻，不抢仓库名的注意力；悬停/聚焦时才浮起来。
+ * 25 行各摆一个显眼按钮会让整个榜显得吵闹，而且误触是一轮真 token。 */
+.gt-discuss {
+  margin-left: auto; flex: none; padding: 2px 9px;
+  font-size: 11px; border-radius: 6px; opacity: 0;
+  transition: opacity 120ms ease;
+}
+.gt-row:hover .gt-discuss, .gt-row:focus-within .gt-discuss { opacity: 1; }
+.gt-discuss:focus-visible { opacity: 1; }
+.gt-discuss--busy { opacity: 1; }
 .gt-sep { white-space: pre; }
 .gt-move {
   flex: none; font-size: 10.5px; padding: 1px 6px; border-radius: 5px;

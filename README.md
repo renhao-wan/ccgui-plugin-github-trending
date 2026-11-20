@@ -10,6 +10,7 @@
 - **新星库**：近 7 天新建、star 达到阈值的仓库（GitHub Search API）
 - **变化对比**：与上一次成功快照相比，标出「新上榜 ↑ 降位 ↓」并列出掉榜
 - **中文解读**：点「生成解读」才调用模型，读完可自己判断要不要看
+- **单项目讨论**：榜单每一行悬停时出现「讨论」，在 AI 工作区里起一个宿主聊天会话，模型先找本地副本、找不到再读远程
 - **不打扰**：侧栏徽标只在有新上榜时显示数字；不会后台自动跑
 
 ## 安装
@@ -27,7 +28,8 @@
 | `network:github.com` | 抓 `github.com/trending` 公开页面（不占 API 配额） |
 | `network:api.github.com` | 新星库搜索；可选 Token 只发给这个域名 |
 | `agent` | 「生成解读」时起一个只读的后台轮次；引擎清单来自宿主的 `agent.catalog()` |
-| `assets:directory` | 设置页里用系统文件夹选择器指定解读用的工作区 |
+| `assets:directory` | 设置页里用系统文件夹选择器指定 AI 工作区 |
+| `host:session` | 「讨论」通过 `sessions.startRun` 起一个可在侧栏接管的聊天会话 |
 | `ui:center-tab` / `ui:sidebar-entry` / `ui:settings-section` / `ui:command` | 界面入口 |
 | `storage` / `plugin.storage` | 设置与历史快照 |
 | `theme` / `events` | 注入样式、接收 agent 事件流 |
@@ -39,7 +41,8 @@
 - 只访问 `github.com` 与 `api.github.com` 两个域名。
 - 榜单与解读只在本机显示；解读不会自动写入任何文件。
 - 历史快照存在插件数据目录（默认 `plugin-data/github-trending/history/`），随时可在插件详情页清空。
-- 「生成解读」的模型进程也默认在这个目录下运行（设置页可改成别的目录），因此不会把解读记录混进某个真实项目的工作区历史。
+- 「生成解读」与「讨论」的模型进程默认都在插件数据目录下运行（设置页可改成别的目录），因此不会把这些记录混进某个真实项目的工作区历史。
+- 「讨论」起的会话归宿主管；插件自己不保存对话内容，会话历史按宿主的会话规则留存。
 - GitHub Token 存在本机插件数据里，只作为 `Authorization` 头发给 `api.github.com`；不填也能用（未认证时搜索接口 10 次/分钟）。
 
 ## 已知限制
@@ -54,7 +57,7 @@
 ```bash
 npm run build     # 把 src/lib/*.mjs 内联进 main.js
 npm test          # 纯函数单测（解析 / 搜索归一化 / 对比 / prompt 预算）
-npm run smoke     # 假宿主冒烟：刷新 → 列表 → 解读 → 停止 → 限流 → 卸载
+npm run smoke     # 假宿主冒烟：刷新 → 列表 → 解读 → 讨论 → 停止 → 限流 → 卸载
 npm run validate  # manifest、权限 ↔ 调用、禁用写法、产物自检
 npm run check     # 上面四步全跑
 npm run icon      # 重新生成 docs/icon.png

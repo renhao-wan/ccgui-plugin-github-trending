@@ -232,6 +232,9 @@ const kv = new Map();
 const httpCalls = [];
 const agentStarts = [];
 const agentInterrupts = [];
+/** sessions.startRun 的入参；讨论功能的核心断言对象。 */
+const sessionStarts = [];
+let sessionStartError = null;
 const cssCalls = [];
 const eventHandlers = new Set();
 
@@ -360,6 +363,16 @@ const ctx = {
   // 用来验证「选择…」把结果写进设置，且设置里存的是原始路径不是展示形式。
   assets: {
     grantDirectory: async () => ({ grantId: "g-1", path: pickedWorkspaceDir }),
+  },
+  // 会话：讨论功能走这个，不是 agent.start。
+  // 形态照 SDK 0.3.18 的 startRun 契约：新会话不带 sessionId，resolve runId + sessionId。
+  sessions: {
+    startRun: async (def) => {
+      sessionStarts.push(def);
+      if (sessionStartError) throw sessionStartError;
+      return { runId: "srun-" + sessionStarts.length, sessionId: "sess-" + sessionStarts.length };
+    },
+    interruptRun: async () => {},
   },
   agent: {
     // 与宿主真实契约一致：PluginAgentCatalogEntry[]
@@ -632,6 +645,140 @@ await check("解读正文渲染成 Markdown，表格变成真表格", async () =
 await check("解读只显示不落盘", async () => {
   const files = fs.readdirSync(storageDir, { recursive: true }).map(String);
   assert.ok(!files.some((f) => /digest|解读/.test(f)), "不应写解读文件");
+});
+
+/* ---------- 单个仓库的讨论会话 ---------- */
+
+/** 讨论按钮只在这一行的标题行里；按仓库名定位，避免点到别的行。 */
+function discussButtonFor(tree, repo) {
+  let hit = null;
+  walk(tree, (n) => {
+    if (hit || n.type !== "button") return;
+    const c = n.props && n.props.className;
+    if (typeof c !== "string" || !c.split(/\s+/).includes("gt-discuss")) return;
+    if (String(n.props.title || "").length === 0) return;
+    // 按钮本身不带仓库名，靠它在哪一行来认：向上找最近的 li，看标题文字
+    hit = hit || n;
+  });
+  // 精确版本：遍历 li，找该行里的讨论按钮
+  const rows = [];
+  walk(tree, (n) => {
+    if (n.type === "li" && (n.props && n.props.className || "").split(/\s+/).includes("gt-row")) rows.push(n);
+  });
+  for (const li of rows) {
+    if (!textOf(li).includes(repo)) continue;
+    let btn = null;
+    walk(li, (n) => {
+      if (btn || n.type !== "button") return;
+      const c = n.props && n.props.className;
+      if (typeof c === "string" && c.split(/\s+/).includes("gt-discuss")) btn = n;
+    });
+    if (btn) return btn;
+  }
+  return hit;
+}
+
+await check("每行都有讨论入口，点后向 sessions.startRun 开会话而不是 agent.start", async () => {
+  const before = agentStarts.length;
+  const btn = discussButtonFor(render(), "beta/two");
+  assert.ok(btn, "榜单行里应有讨论按钮");
+  btn.props.onClick();
+  assert.ok(await waitFor(() => sessionStarts.length === 1), "应调用 sessions.startRun");
+  // 讨论绝不能走 agent.start：那条路的输出只回插件，用户接管不了。
+  assert.equal(agentStarts.length, before, "讨论不应走 agent.start");
+
+  const def = sessionStarts[0];
+  assert.equal(def.engine, "claude");
+  assert.equal(def.model, "claude-sonnet-5", "没选模型时用该引擎第一个");
+  assert.match(def.prompt, /beta\/two/);
+  assert.match(def.prompt, /https:\/\/github\.com\/beta\/two/);
+  assert.match(def.prompt, /本地副本/);
+  // 新会话不带 sessionId，否则会续接到别人的会话上
+  assert.ok(!def.sessionId, "新会话不应带 sessionId");
+  assert.equal(def.workspacePath, storageDir, "会话 cwd 应是 AI 工作区");
+});
+
+await check("讨论会尊重设置里选的工作区", async () => {
+  // 用独立实例 + 独立的 storage：改全局 kv 会污染后面用例（设置只在激活时
+  // 读一次，改 kv 对已激活的 store 不生效，反过来又会漏给下一个用例）。
+  const picked = { workspacePath: pickedWorkspaceDir };
+  const fresh = await import(PLUGIN + "?discuss-ws=" + Date.now());
+  let freshTab = null;
+  const dispose2 = fresh.default(
+    Object.assign({}, ctx, {
+      storage: {
+        get: async (k) => (k === "settings" ? picked : null),
+        set: async () => {},
+        delete: async () => {},
+      },
+      // 只接管页签；其余注册一律 noop，否则会把全局的 settingsDef/navDef
+      // 换成这个实例的，后面的设置页用例全跑在一个 workspacePath 已设值的 store 上。
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: (d) => {
+          freshTab = d;
+          return () => {};
+        },
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: () => () => {},
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  try {
+    assert.ok(await waitFor(() => !!freshTab, 2000), "独立实例应注册页签");
+    renderFresh(freshTab.component, {}, { effects: true });
+    assert.ok(await waitFor(() => !!discussButtonFor(renderFresh(freshTab.component, {}), "beta/two"), 2000));
+    sessionStarts.length = 0;
+    discussButtonFor(renderFresh(freshTab.component, {}), "beta/two").props.onClick();
+    assert.ok(await waitFor(() => sessionStarts.length === 1), "应再次开会话");
+    assert.equal(sessionStarts[0].workspacePath, pickedWorkspaceDir, "应使用用户指定的工作区");
+  } finally {
+    dispose2();
+  }
+});
+
+await check("开会话期间按钮显示打开中，避免连点开出多个会话", async () => {
+  sessionStarts.length = 0;
+  sessionStartError = null;
+  // 让 startRun 挂住，观察中间态
+  const gated = [];
+  const original = ctx.sessions.startRun;
+  ctx.sessions.startRun = async (def) => {
+    sessionStarts.push(def);
+    await new Promise((r) => gated.push(r));
+    return { runId: "srun-x", sessionId: null };
+  };
+  discussButtonFor(render(), "beta/two").props.onClick();
+  assert.ok(await waitFor(() => sessionStarts.length === 1), "应开始开会话");
+  assert.ok(await waitFor(() => textOf(render()).includes("打开中")), "按钮应显示打开中");
+  // 别的行这时应该被禁用
+  const other = discussButtonFor(render(), "alpha/one");
+  assert.equal(other.props.disabled, true, "别的行在开会话期间应禁用");
+  for (const r of gated) r();
+  ctx.sessions.startRun = original;
+  assert.ok(await waitFor(() => !textOf(render()).includes("打开中")), "完成后应复位");
+});
+
+await check("开会话失败时说明原因，不静默吞掉", async () => {
+  sessionStartError = new Error("missing permission host:session");
+  sessionStarts.length = 0;
+  discussButtonFor(render(), "beta/two").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("缺少会话权限")), "应给人看得懂的提示");
+  assert.ok(findByText(render(), "讨论"), "按钮应回到可点状态");
+  sessionStartError = null;
+});
+
+await check("宿主没有 sessions 时按钮给出升级提示", async () => {
+  const saved = ctx.sessions;
+  delete ctx.sessions;
+  try {
+    sessionStarts.length = 0;
+    discussButtonFor(render(), "beta/two").props.onClick();
+    assert.ok(await waitFor(() => textOf(render()).includes("不支持从插件发起会话")), "应提示升级");
+    assert.equal(sessionStarts.length, 0, "不能调用不存在的 API");
+  } finally {
+    ctx.sessions = saved;
+  }
 });
 
 await check("模型报错时显示原因并复位按钮", async () => {

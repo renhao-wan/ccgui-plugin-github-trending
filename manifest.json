@@ -21,6 +21,7 @@
     "theme",
     "events",
     "agent",
+    "host:session",
     "assets:directory",
     "network:github.com",
     "network:api.github.com"

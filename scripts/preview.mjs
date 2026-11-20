@@ -78,7 +78,10 @@ function expand(node) {
 
 /** 渲染并按 React 的时机跑 effect；返回元素树（还没序列化）。 */
 async function renderTreeWithEffects(component) {
-  const tree = fakeReact.createElement(component, {});
+  // 先 expand 一遍：组件函数是在 expand 里被调用的，useEffect 也在此刻才
+  // 被登记进来。先 splice 再 expand 会拿到上一次渲染残留的队列（首次为空），
+  // 表现就是「第一屏永远没数据」。
+  expand(fakeReact.createElement(component, {}));
   const effects = pendingEffects.splice(0);
   for (const fn of effects) fn();
   await new Promise((r) => setTimeout(r, 150));
@@ -166,6 +169,11 @@ const ctx = {
       return { runId, sessionId: null };
     },
     interrupt: async () => true,
+  },
+  // 讨论入口会调这个。预览里不需要真的跑聊天，只验证按钮存在与禁用态。
+  sessions: {
+    startRun: async () => ({ runId: "preview-srun", sessionId: "preview-sess" }),
+    interruptRun: async () => {},
   },
   bridge: {
     invoke: async (_cmd, args) => {

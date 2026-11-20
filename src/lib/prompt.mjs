@@ -114,3 +114,66 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
     total: repos.length,
   };
 }
+
+/**
+ * 单个仓库的讨论 prompt。
+ *
+ * 与解读的区别不只是范围：讨论是**一次真正的会话**，用户会接着追问，所以
+ * prompt 必须交代清楚「上下文只有这些」和「怎么拿到代码」两件事。否则模型
+ * 会拿一句榜单描述开始猜代码结构。
+ *
+ * @param {object} input
+ * @param {object} input.row 榜单里的那一行
+ * @param {"trending"|"rising"} input.view
+ * @param {string} input.period
+ * @param {string} input.language
+ * @returns {string}
+ */
+export function buildDiscussPrompt(input) {
+  const row = (input && input.row) || {};
+  const repo = String(row.repo || "").trim() || "这个仓库";
+  const url = repo.indexOf("/") > 0 ? "https://github.com/" + repo : "";
+  const scope =
+    input.view === "rising"
+      ? "近 7 天新建且 star 增长快的新仓库（GitHub Search）"
+      : "GitHub Trending " + (input.period || "daily") + " 榜" + (input.language ? "（" + input.language + "）" : "");
+
+  const facts = [];
+  if (row.description) facts.push("- 简介：" + clip(row.description, 400));
+  if (row.language) facts.push("- 主要语言：" + row.language);
+  if (Number.isFinite(row.stars)) facts.push("- 总 star：" + row.stars);
+  if (Number.isFinite(row.gain)) facts.push("- 近期增长：+" + row.gain + "/" + (row.gainPeriod || "recent"));
+  if (Number.isFinite(row.rank)) facts.push("- 当前名次：" + row.rank + "（" + scope + "）");
+  if (Number.isFinite(row.ageDays)) facts.push("- 仓库创建于 " + row.ageDays + " 天前");
+  if (row.isNew) facts.push("- 本次新上榜");
+  else if (Number.isFinite(row.rankDelta) && row.rankDelta !== 0) {
+    facts.push("- 较上次" + (row.rankDelta > 0 ? "上升 " : "下降 ") + Math.abs(row.rankDelta) + " 位");
+  }
+
+  return [
+    "我想认真了解一下这个项目，先帮我弄清楚它是什么、值不值得投入时间。",
+    "",
+    "## 仓库",
+    repo,
+    url,
+    // 来源单独一行，不依附于「名次」：新星库没有名次，但它同样是榜单来的，
+    // 模型需要知道自己在看什么范围的数据。
+    "来源：" + scope,
+    "",
+    "## 我这边已知的事实",
+    facts.length > 0 ? facts.join("\n") : "- （榜单里只有仓库名，没有更多信息）",
+    "",
+    "## 你要做的",
+    "1. 先在这个工作目录里找有没有这个仓库的本地副本（按仓库名，比如 `" + repo + "` 或只有后半段的目录）。",
+    "   找得到就直接读代码，结论以代码为准。",
+    "   找不到就读远程仓库（README、目录结构、最近的 release/issue），并在开头用一句话说明「没找到本地代码，以下基于远程信息」。",
+    "2. 用自己的话讲清楚：它解决什么问题、核心机制是什么、和同类项目比区别在哪。",
+    "3. 给一个明确的判断：什么人适合用、什么情况下不适合。",
+    "",
+    "## 格式",
+    "- 中文，术语保留英文原文。",
+    "- 用 Markdown，不要写一级标题。",
+    "- 结论要有依据。凡是推测而不是从代码或文档里读到的，明确标成「推测」，不要编造 API、参数、性能数字。",
+    "- 最后一行给我一个「下一步」建议（比如读哪个文件、跑什么命令验证）。",
+  ].join("\n");
+}
