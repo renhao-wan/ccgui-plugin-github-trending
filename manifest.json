@@ -1,0 +1,29 @@
+{
+  "id": "github-trending",
+  "name": "每日热点",
+  "version": "0.1.0",
+  "sdkVersion": "^0.3.25",
+  "minAppVersion": "1.2.4",
+  "author": "renhao-wan",
+  "description": "每天的 GitHub Trending 与近 7 天新星库，标出新上榜与排名变化；需要时让模型写一段中文解读。",
+  "repo": "renhao-wan/ccgui-plugin-github-trending",
+  "license": "MIT",
+  "icon": "docs/icon.png",
+  "keywords": ["github", "trending", "hot", "daily", "digest", "热点", "榜单"],
+  "tier": "js",
+  "permissions": [
+    "ui:center-tab",
+    "ui:sidebar-entry",
+    "ui:settings-section",
+    "ui:command",
+    "storage",
+    "plugin.storage",
+    "theme",
+    "events",
+    "agent",
+    "host:workspace",
+    "host:models",
+    "network:github.com",
+    "network:api.github.com"
+  ]
+}
