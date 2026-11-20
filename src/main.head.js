@@ -62,6 +62,8 @@ const DEFAULT_STATE = {
   loading: false,
   loaded: false,
   digest: "",
+  /** 用户主动停止：正文是半截的，界面要说清楚，不能装成写完了。 */
+  digestStopped: false,
   digestTruncated: false,
   digestIncluded: 0,
   digestTotal: 0,
@@ -674,7 +676,9 @@ function abortDigest(ctx) {
   const session = activeDigest;
   if (session) session.cancelled = true;
   disposeSession(session, (runId) => ctx.agent.interrupt(runId));
-  set({ generating: false });
+  // 已经写出来的半截正文留着（用户可能还想看），但要标成「已停止」：
+  // 否则它和一份正常写完的解读长得一模一样。
+  set({ generating: false, digestStopped: Boolean(store.snap.digest) });
 }
 
 /** 兼容旧调用名。 */
@@ -699,6 +703,7 @@ async function generateDigest(ctx) {
   set({
     generating: true,
     digest: "",
+    digestStopped: false,
     httpError: "",
   });
   const session = newDigestSession(seq);
@@ -751,7 +756,7 @@ async function generateDigest(ctx) {
       set({ generating: false, httpError: messageOf(error) });
       return;
     }
-    set({ generating: false, digest: value });
+    set({ generating: false, digest: value, digestStopped: false });
   };
 
   const handleEvent = (event) => {
@@ -922,7 +927,7 @@ function Toolbar({ snap, ctx }) {
   const onView = (view) => {
     if (view === snap.view) return;
     if (snap.generating) stopDigest(ctx);
-    set({ view, digest: "", dropped: [], isFirstRun: true, repos: [], loaded: false });
+    set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false });
     void refresh(ctx, { force: true });
   };
   const onPeriod = (period) => {
@@ -930,7 +935,7 @@ function Toolbar({ snap, ctx }) {
     if (snap.generating) stopDigest(ctx);
     setSettings({ period });
     void persistSettings(ctx, { period });
-    set({ loaded: false, repos: [], digest: "", dropped: [] });
+    set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [] });
     void refresh(ctx, { force: true });
   };
 
@@ -1049,18 +1054,219 @@ function SkeletonList() {
   return h("ul", { className: "gt-skel-list" }, rows);
 }
 
-function DigestPanel({ snap }) {
+/* ---------- 解读正文的 Markdown 渲染 ---------- */
+
+/**
+ * 行内节点。解析结果来自 src/lib/markdown.mjs，这里只负责变成元素，
+ * 全程不拼 HTML 字符串——模型输出属于不可信内容。
+ *
+ * 强调类节点带 children（解析器会对它们递归，处理 `**\`repo\`**` 这种嵌套），
+ * 没带 children 的老式节点退化成纯文本。
+ */
+function inlineNodes(inlines, keyBase) {
   const h = appCtx.react.createElement;
+  return (inlines || []).map((n, i) => {
+    const key = keyBase + "i" + i;
+    const kids = n.children ? inlineNodes(n.children, key + "_") : n.v;
+    if (n.t === "strong") return h("strong", { key }, kids);
+    if (n.t === "em") return h("em", { key }, kids);
+    if (n.t === "del") return h("del", { key }, kids);
+    if (n.t === "code") return h("code", { key, className: "gt-md-code" }, n.v);
+    if (n.t === "link") {
+      return h("a", { key, href: n.href, target: "_blank", rel: "noreferrer noopener" }, n.v);
+    }
+    return n.v;
+  });
+}
+
+/**
+ * 解析结果缓存。流式输出时每个 delta 都会重渲染整棵解读树，而解析要扫全文；
+ * 内容没变（别处 set 触发的重渲染）就不该再解析一遍。
+ * 只缓存最后一次：解读面板同一时刻只有一份正文。
+ */
+let mdCache = { text: null, blocks: null };
+
+function markdownBlocks(text) {
+  const src = String(text || "");
+  if (mdCache.text !== src) mdCache = { text: src, blocks: parseMarkdown(src) };
+  return mdCache.blocks;
+}
+
+/** 块节点 → 元素。表格单独包一层可横向滚动，窄窗口下不会把整页撑宽。 */
+function renderMarkdown(text) {
+  const h = appCtx.react.createElement;
+  const blocks = markdownBlocks(text);
+  return blocks.map((b, i) => {
+    const key = "md" + i;
+    if (b.type === "heading") return h("h" + b.level, { key, className: "gt-md-h" + b.level }, inlineNodes(b.inlines, key));
+    if (b.type === "paragraph") return h("p", { key, className: "gt-md-p" }, inlineNodes(b.inlines, key));
+    if (b.type === "hr") return h("hr", { key, className: "gt-md-hr" });
+    if (b.type === "quote") return h("blockquote", { key, className: "gt-md-quote" }, inlineNodes(b.inlines, key));
+    if (b.type === "code") {
+      return h(
+        "pre",
+        { key, className: "gt-md-pre" },
+        h("code", { className: b.lang ? "language-" + b.lang : "" }, b.text),
+      );
+    }
+    if (b.type === "ul" || b.type === "ol") {
+      return h(
+        b.type,
+        { key, className: "gt-md-list" },
+        b.items.map((item, j) =>
+          h(
+            "li",
+            {
+              key: key + "li" + j,
+              // 缩进用内边距表达层级：嵌套列表在窄面板里越缩越窄，不如一级一档
+              style: item.depth ? { marginLeft: item.depth * 14 } : undefined,
+            },
+            inlineNodes(item.inlines, key + "li" + j),
+          ),
+        ),
+      );
+    }
+    if (b.type === "table") {
+      const cellStyle = (ci) => (b.align[ci] ? { textAlign: b.align[ci] } : undefined);
+      return h(
+        "div",
+        { key, className: "gt-md-table-wrap" },
+        h(
+          "table",
+          { className: "gt-md-table" },
+          h(
+            "thead",
+            null,
+            h(
+              "tr",
+              null,
+              b.head.map((cell, ci) => h("th", { key: key + "th" + ci, style: cellStyle(ci) }, inlineNodes(cell, key + "th" + ci))),
+            ),
+          ),
+          h(
+            "tbody",
+            null,
+            b.rows.map((row, ri) =>
+              h(
+                "tr",
+                { key: key + "tr" + ri },
+                row.map((cell, ci) => h("td", { key: key + "td" + ci, style: cellStyle(ci) }, inlineNodes(cell, key + "td" + ri + "_" + ci))),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return null;
+  });
+}
+
+function DigestPanel({ snap }) {
+  const R = appCtx.react;
+  const h = R.createElement;
+  const bodyRef = R.useRef(null);
+  const wasGenerating = R.useRef(false);
+  const copyState = R.useState("");
+  const copyStatus = copyState[0];
+  const setCopyStatus = copyState[1];
+  const copyTimer = R.useRef(null);
+
+  // 解读面板在一个可滚动区域的底部：点「生成解读」后如果不滚过去，用户看到的
+  // 是「什么都没发生」。只在「开始生成」这一刻滚，之后不抢用户正在看的位置。
+  R.useEffect(() => {
+    if (snap.generating && !wasGenerating.current) {
+      wasGenerating.current = true;
+      const el = bodyRef.current;
+      if (el && typeof el.scrollIntoView === "function") {
+        try {
+          el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        } catch {
+          /* 老内核不支持参数对象：不滚也不影响阅读 */
+        }
+      }
+    } else if (!snap.generating) {
+      wasGenerating.current = false;
+    }
+  }, [snap.generating]);
+
+  R.useEffect(() => () => {
+    if (copyTimer.current) clearTimeout(copyTimer.current);
+  }, []);
+
   if (!snap.generating && !snap.digest) return null;
+
   const note = snap.digestTruncated
     ? "事实过长，已截断（" + snap.digestIncluded + "/" + snap.digestTotal + "）"
     : "";
+  const chars = snap.digest ? snap.digest.length : 0;
+
+  const copy = () => {
+    const text = snap.digest || "";
+    if (!text) return;
+    const done = () => {
+      setCopyStatus("已复制");
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopyStatus(""), 2000);
+    };
+    const fail = () => setCopyStatus("复制失败");
+    try {
+      const clip = typeof navigator !== "undefined" ? navigator.clipboard : null;
+      if (clip && typeof clip.writeText === "function") {
+        clip.writeText(text).then(done, fail);
+        return;
+      }
+    } catch {
+      /* 落到下面 */
+    }
+    fail();
+  };
+
+  const status = snap.generating
+    ? h(
+        "span",
+        { className: "gt-digest-run" },
+        h("span", { className: "gt-spinner", "aria-hidden": "true" }),
+        chars ? "生成中 · " + chars + " 字" : "生成中…",
+      )
+    : snap.digestStopped
+      ? h("span", { className: "gt-digest-run gt-digest-stopped" }, "已停止，下面是写到这里的内容")
+      : null;
+
   return h(
     "section",
-    { className: "gt-digest", "aria-live": "polite" },
-    h("header", { className: "gt-digest-head" }, h("h3", null, "解读"), note ? h("span", { className: "gt-stamp" }, note) : null),
-    h("pre", { className: "gt-digest-body" }, snap.digest || "…"),
-    snap.digest && !snap.generating ? h("p", { className: "gt-notice" }, "解读只在本机显示，未写入任何文件。") : null,
+    { className: "gt-digest", "aria-busy": snap.generating ? "true" : "false" },
+    h(
+      "header",
+      { className: "gt-digest-head" },
+      h("h3", null, "解读"),
+      status,
+      note ? h("span", { className: "gt-stamp" }, note) : null,
+      snap.digest
+        ? h(
+            "button",
+            {
+              type: "button",
+              className: "gt-btn gt-digest-copy",
+              onClick: copy,
+              disabled: snap.generating,
+              title: "复制 Markdown 原文",
+            },
+            copyStatus || "复制",
+          )
+        : null,
+    ),
+    // aria-live 放在正文外层而不是 section 上：正文逐字追加时，读屏软件会
+    // 把每个字都念一遍。这里只在「生成中/已完成」这类状态变化时播报。
+    h(
+      "div",
+      { className: "gt-digest-body", ref: bodyRef },
+      snap.digest
+        ? renderMarkdown(snap.digest)
+        : h("p", { className: "gt-md-p gt-digest-wait" }, "正在整理今天的榜单…"),
+    ),
+    snap.digest && !snap.generating
+      ? h("p", { className: "gt-notice", role: "status" }, "解读只在本机显示，未写入任何文件。")
+      : null,
   );
 }
 
@@ -1824,13 +2030,77 @@ const CSS = `
 .gt-dropped { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--gt-border); }
 .gt-dropped h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; opacity: 0.7; }
 .gt-dropped p { margin: 0; font-size: 12px; opacity: 0.6; word-break: break-all; }
-.gt-digest { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--gt-border); }
-.gt-digest-head { display: flex; align-items: baseline; gap: 10px; }
-.gt-digest h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
-.gt-digest-body {
-  margin: 0; white-space: pre-wrap; word-break: break-word;
-  font: inherit; font-size: 13px; line-height: 1.7;
+/* 解读面板：和榜单卡片同一套表面，再用一条强调色左边框区分「这是模型写的」 */
+.gt-digest {
+  margin-top: 14px; padding: 14px 16px; border-radius: 10px;
+  background: var(--gt-surface); border: 1px solid var(--gt-border);
+  border-left: 3px solid var(--gt-accent);
 }
+.gt-digest-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+/* 只管头部那个「解读」标题。写成 .gt-digest h3 会顺带压过正文里
+ * .gt-md-h3 的字号（元素选择器比单个类更具体）。 */
+.gt-digest-head > h3 { margin: 0; font-size: 13px; font-weight: 600; }
+/* 生成中：转圈 + 已收字数。让用户确认进程活着，也知道还要等多久 */
+.gt-digest-run {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--gt-muted); font-variant-numeric: tabular-nums;
+}
+.gt-digest-stopped { color: var(--gt-muted); font-weight: 600; }
+.gt-digest-copy { margin-left: auto; padding: 3px 9px; font-size: 11.5px; }
+.gt-digest-body { font-size: 13px; line-height: 1.7; word-break: break-word; }
+.gt-digest-wait { color: var(--gt-muted); }
+.gt-digest-body > *:first-child { margin-top: 0; }
+.gt-digest-body > *:last-child { margin-bottom: 0; }
+
+/* 解读正文里的 Markdown。只覆盖本插件自己的类名，不影响宿主样式。
+ * 正文是 13px，标题梯度要拉到能一眼分节——模型最爱写三级标题，只比正文大
+ * 1px 的话读起来和段落没区别。 */
+.gt-md-p { margin: 0 0 10px; }
+.gt-md-h1, .gt-md-h2, .gt-md-h3, .gt-md-h4, .gt-md-h5, .gt-md-h6 {
+  margin: 18px 0 8px; font-weight: 600; line-height: 1.35;
+}
+.gt-md-h1 { font-size: 18px; }
+.gt-md-h2 { font-size: 16.5px; }
+.gt-md-h3 { font-size: 15px; }
+.gt-md-h4 { font-size: 14px; }
+.gt-md-h5, .gt-md-h6 { font-size: 13px; }
+.gt-md-list { margin: 0 0 10px; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.gt-md-list .gt-md-list { margin: 4px 0 0; }
+.gt-md-quote {
+  margin: 0 0 10px; padding: 2px 0 2px 10px;
+  border-left: 2px solid var(--gt-border); color: var(--gt-muted);
+}
+.gt-md-hr { margin: 14px 0; border: 0; border-top: 1px solid var(--gt-border); }
+.gt-md-code {
+  padding: 1px 5px; border-radius: 4px; background: var(--gt-raised);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+.gt-md-pre {
+  margin: 0 0 10px; padding: 10px 12px; border-radius: 8px;
+  background: var(--gt-raised); border: 1px solid var(--gt-border);
+  overflow-x: auto;
+}
+.gt-md-pre code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px; line-height: 1.6; white-space: pre;
+}
+/* 表格外壳负责横向滚动：解读面板在窄窗口里不能把整页撑宽 */
+.gt-md-table-wrap {
+  margin: 0 0 10px; overflow-x: auto;
+  border: 1px solid var(--gt-border); border-radius: 8px;
+}
+/* 宽度 100% 让宽窗口铺满；min-width 是内容下限——窄窗口里宁可横向滚动，
+ * 也不要把四列中文挤成一条条竖排。 */
+.gt-md-table { width: 100%; min-width: 420px; border-collapse: collapse; font-size: 12.5px; line-height: 1.55; }
+.gt-md-table th, .gt-md-table td {
+  padding: 7px 10px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--gt-border); word-break: break-word;
+}
+.gt-md-table th { background: var(--gt-raised); font-weight: 600; white-space: nowrap; }
+.gt-md-table tbody tr:last-child td { border-bottom: 0; }
+.gt-md-table tbody tr:nth-child(even) td { background: var(--gt-raised); }
+.gt-digest-body a { color: var(--gt-accent); }
 .gt-settings {
   --gt-control: #d4d4d4;
   --gt-text: #0a0a0a; --gt-muted: #6b6b6b; --gt-border: #e6e6e6;
@@ -2061,6 +2331,7 @@ export default function activate(ctx) {
       generating: false,
       loading: false,
       digest: "",
+      digestStopped: false,
       repos: [],
       loaded: false,
       httpError: "",

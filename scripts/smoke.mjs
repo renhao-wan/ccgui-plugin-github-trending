@@ -196,6 +196,23 @@ function countByType(node, type) {
   return n;
 }
 
+/**
+ * 按标签名找元素，可再按类名收窄。className 用空格切分后精确比对——
+ * 用 includes 的话 gt-md-table-wrap 会同时命中 gt-md-table。
+ */
+function findByType(node, type, cls) {
+  let hit = null;
+  walk(node, (n) => {
+    if (hit || n.type !== type) return;
+    if (cls) {
+      const c = n.props && n.props.className;
+      if (typeof c !== "string" || !c.split(/\s+/).includes(cls)) return;
+    }
+    hit = n;
+  });
+  return hit;
+}
+
 /** 按 className 里的某个类名找元素（冒烟测试里只断言存在性）。 */
 function countByClass(node, cls) {
   let n = 0;
@@ -387,7 +404,12 @@ const ctx = {
       agentRunIdx += 1;
       const idx = agentRunIdx;
       const runId = "run-" + idx;
-      if (agentMode === "silent") return { runId, sessionId: null };
+      if (agentMode === "silent") {
+        // 先推半截正文再保持沉默：模拟「模型写了开头就卡住」，用户这时点停止，
+        // 界面要能区分「半截」和「写完了」。
+        setTimeout(() => emit({ runId, kind: "delta", data: "## 今天在热什么\n\n写到这里就停了" }), 10);
+        return { runId, sessionId: null };
+      }
       if (agentMode === "slow-start") {
         // start 迟迟不 resolve：用来验证「start 在飞时点停止」不会留下孤儿进程
         await sleep(agentStartDelay);
@@ -400,8 +422,12 @@ const ctx = {
         }
         // 故意先推一个别的 run，验证按 runId 过滤
         emit({ runId: "stale-run", kind: "delta", data: "不该出现的内容" });
-        emit({ runId, kind: "delta", data: "## 今天在热什么\n" });
-        emit({ runId, kind: "delta", data: "- 测试解读正文\n" });
+        emit({ runId, kind: "delta", data: "## 今天在热什么\n\n" });
+        emit({ runId, kind: "delta", data: "**Rust** 在升温，`tokio` 生态最活跃。\n\n" });
+        emit({ runId, kind: "delta", data: "| 仓库 | 方向 | 解决什么问题 | 适合谁 |\n" });
+        emit({ runId, kind: "delta", data: "| --- | --- | --- | --- |\n" });
+        emit({ runId, kind: "delta", data: "| alpha/one | 工具 | 测试解读正文 | 写代码的人 |\n" });
+        emit({ runId, kind: "delta", data: "| [beta/two](https://github.com/beta/two) | 框架 | - | - |\n" });
         if (idx < 99) emit({ runId, kind: "done", data: null });
       }, 10);
       return { runId, sessionId: null };
@@ -558,6 +584,51 @@ await check("生成解读：按 runId 过滤、流式写入", async () => {
   );
 });
 
+await check("解读正文渲染成 Markdown，表格变成真表格", async () => {
+  const tree = render();
+  let digest = null;
+  walk(tree, (n) => {
+    if (!digest && n.props && typeof n.props.className === "string" && n.props.className.split(/\s+/).includes("gt-digest-body")) {
+      digest = n;
+    }
+  });
+  assert.ok(digest, "应有解读正文容器");
+  // 以前整段塞 <pre>：模型写的表格和粗体全都显示成星号和竖线
+  assert.ok(!findByType(digest, "pre"), "解读正文不该还是 <pre> 原文");
+  assert.ok(findByType(digest, "h2"), "## 应渲染成标题");
+  assert.ok(findByType(digest, "strong"), "**粗体** 应渲染成 strong");
+  assert.ok(findByType(digest, "code", "gt-md-code"), "行内代码应渲染成 code");
+  const table = findByType(digest, "table", "gt-md-table");
+  assert.ok(table, "表格应渲染成 <table>");
+  const ths = [];
+  walk(table, (n) => {
+    if (n.type === "th") ths.push(textOf(n));
+  });
+  assert.deepEqual(ths, ["仓库", "方向", "解决什么问题", "适合谁"], "表头四列都在");
+  let tds = 0;
+  walk(table, (n) => {
+    if (n.type === "td") tds += 1;
+  });
+  assert.equal(tds, 8, "两行数据各四格");
+  // 表格外面要有一层横向滚动容器，窄窗口下不能把整页撑宽
+  let wrap = null;
+  walk(digest, (n) => {
+    if (!wrap && n.props && typeof n.props.className === "string" && n.props.className.split(/\s+/).includes("gt-md-table-wrap")) {
+      wrap = n;
+    }
+  });
+  assert.ok(wrap && findByType(wrap, "table"), "表格应包在可横向滚动的容器里");
+  // 模型写的链接只能变成 http(s) 的 <a>
+  let link = null;
+  walk(digest, (n) => {
+    if (!link && n.type === "a") link = n;
+  });
+  assert.ok(link, "Markdown 链接应渲染成 <a>");
+  assert.equal(link.props.href, "https://github.com/beta/two");
+  assert.equal(link.props.target, "_blank");
+  assert.match(String(link.props.rel), /noopener/);
+});
+
 await check("解读只显示不落盘", async () => {
   const files = fs.readdirSync(storageDir, { recursive: true }).map(String);
   assert.ok(!files.some((f) => /digest|解读/.test(f)), "不应写解读文件");
@@ -581,6 +652,58 @@ await check("停止生成会通知宿主 interrupt", async () => {
   assert.ok(await waitFor(() => agentInterrupts.length >= 1), "应调用 interrupt");
   assert.ok(findByText(render(), "生成解读"));
   agentMode = "stream";
+});
+
+await check("中途停止后正文标成「已停止」，不是一份写完的解读", async () => {
+  // 先完整跑一次拿到正文，再重新生成并在中途停：半截正文留着，但要有标记，
+  // 否则它和正常写完的解读长得一模一样。
+  agentMode = "stream";
+  findByText(render(), "生成解读").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("测试解读正文")), "应有一份完整解读");
+  assert.ok(!/已停止/.test(textOf(render())), "完整解读不该带停止标记");
+
+  agentMode = "silent";
+  findByText(render(), "生成解读").props.onClick();
+  assert.ok(await waitFor(() => !!findByText(render(), "停止生成")), "应进入生成中");
+  await sleep(60);
+  findByText(render(), "停止生成").props.onClick();
+  assert.ok(await waitFor(() => /已停止/.test(textOf(render()))), "停止后应说明正文不完整");
+  // 重新生成要把标记清掉
+  agentMode = "stream";
+  findByText(render(), "生成解读").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("测试解读正文") && !/已停止/.test(textOf(render()))), "重新生成后标记应消失");
+});
+
+await check("解读有复制按钮，复制的是 Markdown 原文", async () => {
+  let copied = null;
+  const prev = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { writeText: async (t) => { copied = t; } } },
+  });
+  try {
+    // 「已复制」是组件内部 state：renderFresh 每帧都会重置它，必须用 renderKeep。
+    const keep = () => renderKeep(tab(), {});
+    let btn = null;
+    walk(keep(), (n) => {
+      if (!btn && n.type === "button" && textOf(n) === "复制") btn = n;
+    });
+    assert.ok(btn, "写完的解读应有复制按钮");
+    btn.props.onClick();
+    assert.ok(await waitFor(() => copied !== null), "应调用剪贴板");
+    // 复制原文而不是渲染后的纯文本：粘到别处仍是表格
+    assert.match(copied, /^\| 仓库 \| 方向 \|/m);
+    assert.match(copied, /\*\*Rust\*\*/);
+    assert.ok(await waitFor(() => {
+      let hit = null;
+      walk(keep(), (n) => {
+        if (!hit && n.type === "button" && textOf(n) === "已复制") hit = n;
+      });
+      return !!hit;
+    }, 2000), "应给出复制成功反馈");
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: prev });
+  }
 });
 
 await check("切到新星库走 Search API 并渲染", async () => {

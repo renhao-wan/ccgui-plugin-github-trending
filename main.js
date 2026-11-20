@@ -410,11 +410,22 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
     "",
     "## 写作要求",
     "- 全文中文，术语保留英文原文。",
-    "- 先给 3-5 句总体判断（今天什么方向在升温）。",
-    "- 再挑 5-8 个最值得看的仓库，每个一句：它解决什么问题、适合谁、要不要现在看。",
     "- 只依据上面的「榜单事实」；事实里没有的信息不要编造，也不要猜技术细节。",
     "- 不要复述榜单，不要用「首先/其次/总之」这类填充词。",
-    "- 用 Markdown，但不要写一级标题。",
+    "- 用 Markdown，但不要写一级标题（不要用 `#`）。",
+    "",
+    "按这个结构写：",
+    "",
+    "### 今天在热什么",
+    "3-5 句总体判断：哪个方向在升温、有没有共同的技术主题。",
+    "",
+    "### 值得看的项目",
+    "用一个 Markdown 表格，5-8 行，列固定为：",
+    "| 仓库 | 方向 | 解决什么问题 | 适合谁 |",
+    "每格一句话，仓库名写成 `owner/repo`。不要加评分、不要加星级数字（上面的事实里已有）。",
+    "",
+    "### 一句话结论",
+    "一行，说明今天最值得点开的那一个，以及为什么。",
   ];
 
   const lines = [];
@@ -492,6 +503,279 @@ function pickWorkspace(settings, ownDir) {
   return String(ownDir || "").trim();
 }
 
+// ---- src/lib/markdown.mjs ----
+/**
+ * 解读正文用的 Markdown 子集解析。纯函数，输出的是「节点描述」而不是
+ * HTML —— 渲染端自己把它们变成元素，避免把模型的输出当 HTML 执行。
+ *
+ * 覆盖模型最常写的那几种：标题、段落、有序/无序列表（含缩进层级）、
+ * GFM 表格、代码块、行内代码、粗体、斜体、删除线、链接、引用、分隔线。
+ *
+ * 流式输入的容错是硬要求：解读是一个字一个字推过来的，任何时刻都可能停在
+ * `**粗`、`| a | b`（分隔行还没来）、``` 未闭合这种半截状态。所以：
+ * - 未闭合的行内标记按原文输出，不吞字符；
+ * - 未闭合的代码块一直吃到末尾；
+ * - 没有分隔行的表格行当普通段落。
+ */
+
+/** 行内标记。顺序即优先级：`**` 必须先于 `*`，否则粗体会被切成两个斜体。
+ * 这里存的是不带 g 的「模板」：带 g 的正则 lastIndex 是实例状态，而 parseInline
+ * 会递归，内层一重置就会把外层循环卡在原地。每次调用自己造实例。 */
+const INLINE_RE = /(\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|~~[^~\n]+~~|\[[^\]\n]+\]\([^)\s]+\)|\*[^*\n]+\*)/;
+
+/** 链接只放行 http(s)。其他协议（javascript:、file:）一律降级成文字。
+ * 名字带 md 前缀：这个文件会被内联进 main.js 顶层作用域，和插件里的
+ * safeHref（给仓库链接用）重名就会直接语法错误。 */
+function safeMdHref(href) {
+  return /^https?:\/\//i.test(href) ? href : "";
+}
+
+/**
+ * 把一行切成行内节点。
+ *
+ * 强调类标记（strong/em/del）的内容会递归解析：模型很爱写
+ * `**\`owner/repo\`**` 这种「粗体包代码」，不递归的话反引号会原样显示出来。
+ * 强调标记本身不嵌套（`*a **b** c*` 会先命中内层的 `**b**`），这是有意的
+ * 简化：解读正文里几乎不会出现，换来的是流式输入下不会卡死。递归只往
+ * 「非强调」的行内标记里走，层数限死 2 层。
+ *
+ * 正则每次调用都要新造实例：带 g 的正则 lastIndex 是实例状态，递归共用一个
+ * 就会被内层重置，外层 exec 原地打转。
+ *
+ * @param {string} text
+ * @param {number} [depth]
+ * @returns {Array<{t: string, v: string, href?: string, children?: Array<object>}>}
+ */
+function parseInline(text, depth = 0) {
+  const src = String(text == null ? "" : text);
+  const out = [];
+  let last = 0;
+  let m;
+  // 递归解析强调内容时不能和外层共用同一个带 g 的正则实例。
+  const re = new RegExp(INLINE_RE.source, "g");
+  while ((m = re.exec(src))) {
+    if (m.index > last) out.push({ t: "text", v: src.slice(last, m.index) });
+    const tok = m[0];
+    const wrap = (t) => {
+      const inner = tok.slice(t === "em" ? 1 : 2, t === "em" ? -1 : -2);
+      const node = { t: t, v: inner };
+      if (depth < 2) node.children = parseInline(inner, depth + 1);
+      return node;
+    };
+    if (tok.startsWith("**")) {
+      out.push(wrap("strong"));
+    } else if (tok.startsWith("__")) {
+      out.push(wrap("strong"));
+    } else if (tok.startsWith("`")) {
+      out.push({ t: "code", v: tok.slice(1, -1) });
+    } else if (tok.startsWith("~~")) {
+      out.push(wrap("del"));
+    } else if (tok.startsWith("[")) {
+      const link = /^\[([^\]\n]+)\]\(([^)\s]+)\)$/.exec(tok);
+      const href = link ? safeMdHref(link[2]) : "";
+      if (link && href) out.push({ t: "link", v: link[1], href: href });
+      else out.push({ t: "text", v: tok });
+    } else {
+      out.push(wrap("em"));
+    }
+    last = m.index + tok.length;
+  }
+  if (last < src.length) out.push({ t: "text", v: src.slice(last) });
+  return out;
+}
+
+/* ---- 表格与列表的识别 ---- */
+
+const FENCE_RE = /^\s*(```|~~~)\s*([^\s`]*)\s*$/;
+const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*)$/;
+const HR_RE = /^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/;
+const QUOTE_RE = /^\s{0,3}>\s?(.*)$/;
+const UL_RE = /^(\s*)[-*+]\s+(.*)$/;
+const OL_RE = /^(\s*)\d+[.)]\s+(.*)$/;
+const TABLE_DIV_RE = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
+
+function hasPipe(line) {
+  return String(line || "").indexOf("|") >= 0;
+}
+
+/** 表头行 + `|---|` 分隔行；只有表头行时不算表格。 */
+function isTableStart(lines, i) {
+  return i + 1 < lines.length && hasPipe(lines[i]) && hasPipe(lines[i + 1]) && TABLE_DIV_RE.test(lines[i + 1]);
+}
+
+function splitRow(raw) {
+  let s = String(raw || "").trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  // 手写扫描而不是 split(/(?<!\\)\|/)：lookbehind 在老版本 Chromium 上不支持，
+  // 宿主的内置内核版本不在我们控制范围内。`\|` 是单元格内的转义竖线。
+  const cells = [];
+  let buf = "";
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch === "\\" && s[i + 1] === "|") {
+      buf += "|";
+      i += 1;
+      continue;
+    }
+    if (ch === "|") {
+      cells.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  cells.push(buf.trim());
+  return cells;
+}
+
+function cellAlign(spec) {
+  const s = String(spec || "").trim();
+  const left = s.startsWith(":");
+  const right = s.endsWith(":");
+  if (left && right) return "center";
+  if (right) return "right";
+  if (left) return "left";
+  return "";
+}
+
+/** 缩进换算成层级：两个空格或一个 Tab 算一级，最多 4 级（再深也没人看）。 */
+function depthOf(indent) {
+  const expanded = String(indent || "").replace(/\t/g, "  ").length;
+  return Math.min(4, Math.floor(expanded / 2));
+}
+
+/** 块级元素是否从这里开始；段落收集到这些行就停。 */
+function startsBlock(lines, i) {
+  const line = lines[i];
+  return (
+    FENCE_RE.test(line) ||
+    HEADING_RE.test(line) ||
+    HR_RE.test(line) ||
+    QUOTE_RE.test(line) ||
+    UL_RE.test(line) ||
+    OL_RE.test(line) ||
+    isTableStart(lines, i)
+  );
+}
+
+/**
+ * @param {string} text 模型输出的 Markdown
+ * @returns {Array<object>} 块节点数组，结构见文件头注释
+ */
+function parseMarkdown(text) {
+  const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  let list = null;
+
+  const flushList = () => {
+    if (!list) return;
+    out.push(list);
+    list = null;
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    const fence = FENCE_RE.exec(line);
+    if (fence) {
+      flushList();
+      const marker = fence[1];
+      const lang = fence[2] || "";
+      const buf = [];
+      i += 1;
+      // 闭合行只要以同样的围栏开头即可（```js 和 ``` 都算）
+      while (i < lines.length && lines[i].trim().indexOf(marker) !== 0) {
+        buf.push(lines[i]);
+        i += 1;
+      }
+      // 未闭合时（流式中途）i 会停在末尾，代码原样输出，不丢内容
+      if (i < lines.length) i += 1;
+      out.push({ type: "code", lang: lang, text: buf.join("\n") });
+      continue;
+    }
+
+    if (isTableStart(lines, i)) {
+      flushList();
+      const head = splitRow(line).map(parseInline);
+      const align = splitRow(lines[i + 1]).map(cellAlign);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim() && hasPipe(lines[i]) && !startsBlock(lines, i)) {
+        const cells = splitRow(lines[i]);
+        // 列数按表头补齐/截断：模型偶尔少写一格，不能让整行错位
+        const row = [];
+        for (let c = 0; c < head.length; c += 1) row.push(parseInline(cells[c] == null ? "" : cells[c]));
+        rows.push(row);
+        i += 1;
+      }
+      out.push({ type: "table", align: align, head: head, rows: rows });
+      continue;
+    }
+
+    const heading = HEADING_RE.exec(line);
+    if (heading) {
+      flushList();
+      out.push({ type: "heading", level: Math.min(6, heading[1].length), inlines: parseInline(heading[2]) });
+      i += 1;
+      continue;
+    }
+
+    if (HR_RE.test(line)) {
+      flushList();
+      out.push({ type: "hr" });
+      i += 1;
+      continue;
+    }
+
+    if (QUOTE_RE.test(line)) {
+      flushList();
+      const buf = [];
+      while (i < lines.length) {
+        const q = QUOTE_RE.exec(lines[i]);
+        if (!q) break;
+        buf.push(q[1]);
+        i += 1;
+      }
+      out.push({ type: "quote", inlines: parseInline(buf.join(" ")) });
+      continue;
+    }
+
+    const ul = UL_RE.exec(line);
+    const ol = OL_RE.exec(line);
+    if (ul || ol) {
+      const type = ul ? "ul" : "ol";
+      // 有序/无序切换或缩进回退都要重开一个列表：混在一个 <ul> 里会全变成圆点
+      if (!list || list.type !== type || list.depth !== depthOf((ul || ol)[1])) {
+        flushList();
+        list = { type: type, depth: depthOf((ul || ol)[1]), items: [] };
+      }
+      list.items.push({ inlines: parseInline((ul || ol)[2]), depth: depthOf((ul || ol)[1]) });
+      i += 1;
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushList();
+      i += 1;
+      continue;
+    }
+
+    flushList();
+    const buf = [line];
+    i += 1;
+    while (i < lines.length && lines[i].trim() && !startsBlock(lines, i)) {
+      buf.push(lines[i]);
+      i += 1;
+    }
+    out.push({ type: "paragraph", inlines: parseInline(buf.join(" ")) });
+  }
+
+  flushList();
+  return out;
+}
+
 
 const PLUGIN_ID = "github-trending";
 const HISTORY_DIR = "history";
@@ -538,6 +822,8 @@ const DEFAULT_STATE = {
   loading: false,
   loaded: false,
   digest: "",
+  /** 用户主动停止：正文是半截的，界面要说清楚，不能装成写完了。 */
+  digestStopped: false,
   digestTruncated: false,
   digestIncluded: 0,
   digestTotal: 0,
@@ -1150,7 +1436,9 @@ function abortDigest(ctx) {
   const session = activeDigest;
   if (session) session.cancelled = true;
   disposeSession(session, (runId) => ctx.agent.interrupt(runId));
-  set({ generating: false });
+  // 已经写出来的半截正文留着（用户可能还想看），但要标成「已停止」：
+  // 否则它和一份正常写完的解读长得一模一样。
+  set({ generating: false, digestStopped: Boolean(store.snap.digest) });
 }
 
 /** 兼容旧调用名。 */
@@ -1175,6 +1463,7 @@ async function generateDigest(ctx) {
   set({
     generating: true,
     digest: "",
+    digestStopped: false,
     httpError: "",
   });
   const session = newDigestSession(seq);
@@ -1227,7 +1516,7 @@ async function generateDigest(ctx) {
       set({ generating: false, httpError: messageOf(error) });
       return;
     }
-    set({ generating: false, digest: value });
+    set({ generating: false, digest: value, digestStopped: false });
   };
 
   const handleEvent = (event) => {
@@ -1398,7 +1687,7 @@ function Toolbar({ snap, ctx }) {
   const onView = (view) => {
     if (view === snap.view) return;
     if (snap.generating) stopDigest(ctx);
-    set({ view, digest: "", dropped: [], isFirstRun: true, repos: [], loaded: false });
+    set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false });
     void refresh(ctx, { force: true });
   };
   const onPeriod = (period) => {
@@ -1406,7 +1695,7 @@ function Toolbar({ snap, ctx }) {
     if (snap.generating) stopDigest(ctx);
     setSettings({ period });
     void persistSettings(ctx, { period });
-    set({ loaded: false, repos: [], digest: "", dropped: [] });
+    set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [] });
     void refresh(ctx, { force: true });
   };
 
@@ -1525,18 +1814,219 @@ function SkeletonList() {
   return h("ul", { className: "gt-skel-list" }, rows);
 }
 
-function DigestPanel({ snap }) {
+/* ---------- 解读正文的 Markdown 渲染 ---------- */
+
+/**
+ * 行内节点。解析结果来自 src/lib/markdown.mjs，这里只负责变成元素，
+ * 全程不拼 HTML 字符串——模型输出属于不可信内容。
+ *
+ * 强调类节点带 children（解析器会对它们递归，处理 `**\`repo\`**` 这种嵌套），
+ * 没带 children 的老式节点退化成纯文本。
+ */
+function inlineNodes(inlines, keyBase) {
   const h = appCtx.react.createElement;
+  return (inlines || []).map((n, i) => {
+    const key = keyBase + "i" + i;
+    const kids = n.children ? inlineNodes(n.children, key + "_") : n.v;
+    if (n.t === "strong") return h("strong", { key }, kids);
+    if (n.t === "em") return h("em", { key }, kids);
+    if (n.t === "del") return h("del", { key }, kids);
+    if (n.t === "code") return h("code", { key, className: "gt-md-code" }, n.v);
+    if (n.t === "link") {
+      return h("a", { key, href: n.href, target: "_blank", rel: "noreferrer noopener" }, n.v);
+    }
+    return n.v;
+  });
+}
+
+/**
+ * 解析结果缓存。流式输出时每个 delta 都会重渲染整棵解读树，而解析要扫全文；
+ * 内容没变（别处 set 触发的重渲染）就不该再解析一遍。
+ * 只缓存最后一次：解读面板同一时刻只有一份正文。
+ */
+let mdCache = { text: null, blocks: null };
+
+function markdownBlocks(text) {
+  const src = String(text || "");
+  if (mdCache.text !== src) mdCache = { text: src, blocks: parseMarkdown(src) };
+  return mdCache.blocks;
+}
+
+/** 块节点 → 元素。表格单独包一层可横向滚动，窄窗口下不会把整页撑宽。 */
+function renderMarkdown(text) {
+  const h = appCtx.react.createElement;
+  const blocks = markdownBlocks(text);
+  return blocks.map((b, i) => {
+    const key = "md" + i;
+    if (b.type === "heading") return h("h" + b.level, { key, className: "gt-md-h" + b.level }, inlineNodes(b.inlines, key));
+    if (b.type === "paragraph") return h("p", { key, className: "gt-md-p" }, inlineNodes(b.inlines, key));
+    if (b.type === "hr") return h("hr", { key, className: "gt-md-hr" });
+    if (b.type === "quote") return h("blockquote", { key, className: "gt-md-quote" }, inlineNodes(b.inlines, key));
+    if (b.type === "code") {
+      return h(
+        "pre",
+        { key, className: "gt-md-pre" },
+        h("code", { className: b.lang ? "language-" + b.lang : "" }, b.text),
+      );
+    }
+    if (b.type === "ul" || b.type === "ol") {
+      return h(
+        b.type,
+        { key, className: "gt-md-list" },
+        b.items.map((item, j) =>
+          h(
+            "li",
+            {
+              key: key + "li" + j,
+              // 缩进用内边距表达层级：嵌套列表在窄面板里越缩越窄，不如一级一档
+              style: item.depth ? { marginLeft: item.depth * 14 } : undefined,
+            },
+            inlineNodes(item.inlines, key + "li" + j),
+          ),
+        ),
+      );
+    }
+    if (b.type === "table") {
+      const cellStyle = (ci) => (b.align[ci] ? { textAlign: b.align[ci] } : undefined);
+      return h(
+        "div",
+        { key, className: "gt-md-table-wrap" },
+        h(
+          "table",
+          { className: "gt-md-table" },
+          h(
+            "thead",
+            null,
+            h(
+              "tr",
+              null,
+              b.head.map((cell, ci) => h("th", { key: key + "th" + ci, style: cellStyle(ci) }, inlineNodes(cell, key + "th" + ci))),
+            ),
+          ),
+          h(
+            "tbody",
+            null,
+            b.rows.map((row, ri) =>
+              h(
+                "tr",
+                { key: key + "tr" + ri },
+                row.map((cell, ci) => h("td", { key: key + "td" + ci, style: cellStyle(ci) }, inlineNodes(cell, key + "td" + ri + "_" + ci))),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return null;
+  });
+}
+
+function DigestPanel({ snap }) {
+  const R = appCtx.react;
+  const h = R.createElement;
+  const bodyRef = R.useRef(null);
+  const wasGenerating = R.useRef(false);
+  const copyState = R.useState("");
+  const copyStatus = copyState[0];
+  const setCopyStatus = copyState[1];
+  const copyTimer = R.useRef(null);
+
+  // 解读面板在一个可滚动区域的底部：点「生成解读」后如果不滚过去，用户看到的
+  // 是「什么都没发生」。只在「开始生成」这一刻滚，之后不抢用户正在看的位置。
+  R.useEffect(() => {
+    if (snap.generating && !wasGenerating.current) {
+      wasGenerating.current = true;
+      const el = bodyRef.current;
+      if (el && typeof el.scrollIntoView === "function") {
+        try {
+          el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        } catch {
+          /* 老内核不支持参数对象：不滚也不影响阅读 */
+        }
+      }
+    } else if (!snap.generating) {
+      wasGenerating.current = false;
+    }
+  }, [snap.generating]);
+
+  R.useEffect(() => () => {
+    if (copyTimer.current) clearTimeout(copyTimer.current);
+  }, []);
+
   if (!snap.generating && !snap.digest) return null;
+
   const note = snap.digestTruncated
     ? "事实过长，已截断（" + snap.digestIncluded + "/" + snap.digestTotal + "）"
     : "";
+  const chars = snap.digest ? snap.digest.length : 0;
+
+  const copy = () => {
+    const text = snap.digest || "";
+    if (!text) return;
+    const done = () => {
+      setCopyStatus("已复制");
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopyStatus(""), 2000);
+    };
+    const fail = () => setCopyStatus("复制失败");
+    try {
+      const clip = typeof navigator !== "undefined" ? navigator.clipboard : null;
+      if (clip && typeof clip.writeText === "function") {
+        clip.writeText(text).then(done, fail);
+        return;
+      }
+    } catch {
+      /* 落到下面 */
+    }
+    fail();
+  };
+
+  const status = snap.generating
+    ? h(
+        "span",
+        { className: "gt-digest-run" },
+        h("span", { className: "gt-spinner", "aria-hidden": "true" }),
+        chars ? "生成中 · " + chars + " 字" : "生成中…",
+      )
+    : snap.digestStopped
+      ? h("span", { className: "gt-digest-run gt-digest-stopped" }, "已停止，下面是写到这里的内容")
+      : null;
+
   return h(
     "section",
-    { className: "gt-digest", "aria-live": "polite" },
-    h("header", { className: "gt-digest-head" }, h("h3", null, "解读"), note ? h("span", { className: "gt-stamp" }, note) : null),
-    h("pre", { className: "gt-digest-body" }, snap.digest || "…"),
-    snap.digest && !snap.generating ? h("p", { className: "gt-notice" }, "解读只在本机显示，未写入任何文件。") : null,
+    { className: "gt-digest", "aria-busy": snap.generating ? "true" : "false" },
+    h(
+      "header",
+      { className: "gt-digest-head" },
+      h("h3", null, "解读"),
+      status,
+      note ? h("span", { className: "gt-stamp" }, note) : null,
+      snap.digest
+        ? h(
+            "button",
+            {
+              type: "button",
+              className: "gt-btn gt-digest-copy",
+              onClick: copy,
+              disabled: snap.generating,
+              title: "复制 Markdown 原文",
+            },
+            copyStatus || "复制",
+          )
+        : null,
+    ),
+    // aria-live 放在正文外层而不是 section 上：正文逐字追加时，读屏软件会
+    // 把每个字都念一遍。这里只在「生成中/已完成」这类状态变化时播报。
+    h(
+      "div",
+      { className: "gt-digest-body", ref: bodyRef },
+      snap.digest
+        ? renderMarkdown(snap.digest)
+        : h("p", { className: "gt-md-p gt-digest-wait" }, "正在整理今天的榜单…"),
+    ),
+    snap.digest && !snap.generating
+      ? h("p", { className: "gt-notice", role: "status" }, "解读只在本机显示，未写入任何文件。")
+      : null,
   );
 }
 
@@ -2300,13 +2790,77 @@ const CSS = `
 .gt-dropped { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--gt-border); }
 .gt-dropped h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; opacity: 0.7; }
 .gt-dropped p { margin: 0; font-size: 12px; opacity: 0.6; word-break: break-all; }
-.gt-digest { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--gt-border); }
-.gt-digest-head { display: flex; align-items: baseline; gap: 10px; }
-.gt-digest h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
-.gt-digest-body {
-  margin: 0; white-space: pre-wrap; word-break: break-word;
-  font: inherit; font-size: 13px; line-height: 1.7;
+/* 解读面板：和榜单卡片同一套表面，再用一条强调色左边框区分「这是模型写的」 */
+.gt-digest {
+  margin-top: 14px; padding: 14px 16px; border-radius: 10px;
+  background: var(--gt-surface); border: 1px solid var(--gt-border);
+  border-left: 3px solid var(--gt-accent);
 }
+.gt-digest-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+/* 只管头部那个「解读」标题。写成 .gt-digest h3 会顺带压过正文里
+ * .gt-md-h3 的字号（元素选择器比单个类更具体）。 */
+.gt-digest-head > h3 { margin: 0; font-size: 13px; font-weight: 600; }
+/* 生成中：转圈 + 已收字数。让用户确认进程活着，也知道还要等多久 */
+.gt-digest-run {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--gt-muted); font-variant-numeric: tabular-nums;
+}
+.gt-digest-stopped { color: var(--gt-muted); font-weight: 600; }
+.gt-digest-copy { margin-left: auto; padding: 3px 9px; font-size: 11.5px; }
+.gt-digest-body { font-size: 13px; line-height: 1.7; word-break: break-word; }
+.gt-digest-wait { color: var(--gt-muted); }
+.gt-digest-body > *:first-child { margin-top: 0; }
+.gt-digest-body > *:last-child { margin-bottom: 0; }
+
+/* 解读正文里的 Markdown。只覆盖本插件自己的类名，不影响宿主样式。
+ * 正文是 13px，标题梯度要拉到能一眼分节——模型最爱写三级标题，只比正文大
+ * 1px 的话读起来和段落没区别。 */
+.gt-md-p { margin: 0 0 10px; }
+.gt-md-h1, .gt-md-h2, .gt-md-h3, .gt-md-h4, .gt-md-h5, .gt-md-h6 {
+  margin: 18px 0 8px; font-weight: 600; line-height: 1.35;
+}
+.gt-md-h1 { font-size: 18px; }
+.gt-md-h2 { font-size: 16.5px; }
+.gt-md-h3 { font-size: 15px; }
+.gt-md-h4 { font-size: 14px; }
+.gt-md-h5, .gt-md-h6 { font-size: 13px; }
+.gt-md-list { margin: 0 0 10px; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.gt-md-list .gt-md-list { margin: 4px 0 0; }
+.gt-md-quote {
+  margin: 0 0 10px; padding: 2px 0 2px 10px;
+  border-left: 2px solid var(--gt-border); color: var(--gt-muted);
+}
+.gt-md-hr { margin: 14px 0; border: 0; border-top: 1px solid var(--gt-border); }
+.gt-md-code {
+  padding: 1px 5px; border-radius: 4px; background: var(--gt-raised);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+.gt-md-pre {
+  margin: 0 0 10px; padding: 10px 12px; border-radius: 8px;
+  background: var(--gt-raised); border: 1px solid var(--gt-border);
+  overflow-x: auto;
+}
+.gt-md-pre code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px; line-height: 1.6; white-space: pre;
+}
+/* 表格外壳负责横向滚动：解读面板在窄窗口里不能把整页撑宽 */
+.gt-md-table-wrap {
+  margin: 0 0 10px; overflow-x: auto;
+  border: 1px solid var(--gt-border); border-radius: 8px;
+}
+/* 宽度 100% 让宽窗口铺满；min-width 是内容下限——窄窗口里宁可横向滚动，
+ * 也不要把四列中文挤成一条条竖排。 */
+.gt-md-table { width: 100%; min-width: 420px; border-collapse: collapse; font-size: 12.5px; line-height: 1.55; }
+.gt-md-table th, .gt-md-table td {
+  padding: 7px 10px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--gt-border); word-break: break-word;
+}
+.gt-md-table th { background: var(--gt-raised); font-weight: 600; white-space: nowrap; }
+.gt-md-table tbody tr:last-child td { border-bottom: 0; }
+.gt-md-table tbody tr:nth-child(even) td { background: var(--gt-raised); }
+.gt-digest-body a { color: var(--gt-accent); }
 .gt-settings {
   --gt-control: #d4d4d4;
   --gt-text: #0a0a0a; --gt-muted: #6b6b6b; --gt-border: #e6e6e6;
@@ -2537,6 +3091,7 @@ export default function activate(ctx) {
       generating: false,
       loading: false,
       digest: "",
+      digestStopped: false,
       repos: [],
       loaded: false,
       httpError: "",

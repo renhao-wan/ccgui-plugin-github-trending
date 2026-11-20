@@ -16,7 +16,7 @@ const ROOT = path.join(HERE, "..");
 const START = "/*__LIB_SOURCE__*/";
 const END = "/*__LIB_SOURCE_END__*/";
 
-const LIB_ORDER = ["parse", "rising", "diff", "prompt", "catalog"];
+const LIB_ORDER = ["parse", "rising", "diff", "prompt", "catalog", "markdown"];
 
 function stripExports(source) {
   // 只动行首的 export 关键字，避免误伤字符串里的 "export"。
@@ -60,5 +60,18 @@ for (const name of LIB_ORDER) {
   if (!written.includes(src)) throw new Error(`内联校验失败：${name}.mjs 与产物不一致`);
 }
 if (written.includes("__LIB_SOURCE__")) throw new Error("产物里残留内联标记");
+
+// 顶层重名自检：库文件和 main.head.js 会被拼进同一个作用域，重名不是
+// 「后一个覆盖前一个」而是整个模块语法错误（宿主导入即失败）。库文件里的
+// 辅助函数一律带前缀，就是为了这个。这里只扫顶层声明，函数体内不受影响。
+const topLevel = /^(?:export\s+)?(?:function|const|let|var|class)\s+([A-Za-z0-9_$]+)/gm;
+const seen = new Map();
+let m2;
+while ((m2 = topLevel.exec(written))) {
+  const name = m2[1];
+  const line = written.slice(0, m2.index).split("\n").length;
+  if (seen.has(name)) throw new Error(`顶层标识符重名：${name}（第 ${seen.get(name)} 行与第 ${line} 行）`);
+  seen.set(name, line);
+}
 
 process.stdout.write("main.js " + Buffer.byteLength(splice) + " bytes\n");

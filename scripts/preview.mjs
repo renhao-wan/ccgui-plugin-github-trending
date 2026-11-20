@@ -15,6 +15,7 @@ if (!cssMatch) throw new Error("main.js 里找不到 CSS 常量");
 const css = cssMatch[1];
 
 let injected = { css: "", tab: null, settings: null, nav: null };
+const eventListeners = new Map();
 
 /* 极简 React 替身：把元素树序列化成 HTML 字符串 */
 function esc(s) {
@@ -64,13 +65,28 @@ const fakeReact = {
   useSyncExternalStore: (_sub, getSnapshot) => getSnapshot(),
 };
 
-/** 渲染并按 React 的时机跑 effect；返回序列化后的元素树。 */
-async function renderWithEffects(component) {
-  const tree = render(fakeReact.createElement(component, {}));
+/** 把函数组件节点就地展开成元素节点，才能找到它们的 props.onClick。 */
+function expand(node) {
+  if (Array.isArray(node)) return node.map(expand);
+  if (!node || typeof node !== "object") return node;
+  if (typeof node.type === "function") {
+    const props = Object.assign({}, node.props || {}, { children: node.children || [] });
+    return expand(node.type(props));
+  }
+  return Object.assign({}, node, { children: (node.children || []).map(expand) });
+}
+
+/** 渲染并按 React 的时机跑 effect；返回元素树（还没序列化）。 */
+async function renderTreeWithEffects(component) {
+  const tree = fakeReact.createElement(component, {});
   const effects = pendingEffects.splice(0);
   for (const fn of effects) fn();
   await new Promise((r) => setTimeout(r, 150));
-  return render(fakeReact.createElement(component, {}));
+  return expand(fakeReact.createElement(component, {}));
+}
+
+function renderWithEffects(component) {
+  return renderTreeWithEffects(component).then(render);
 }
 
 /** 让 Trending 请求一直挂起，用来抓「正在抓取」这一刻的界面。 */
@@ -112,7 +128,16 @@ const ctx = {
     registerCommand: () => () => {},
     openCenterTab: () => {},
     openSettings: () => {},
-  },  events: { on: () => () => {}, emit: () => {} },
+  },  events: {
+    // 简单的订阅表：预览要手动推 agent 事件，才能看到「解读写到一半」和
+    // 「写完的 Markdown」这两屏。
+    on: (ch, fn) => {
+      if (!eventListeners.has(ch)) eventListeners.set(ch, new Set());
+      eventListeners.get(ch).add(fn);
+      return () => eventListeners.get(ch).delete(fn);
+    },
+    emit: () => {},
+  },
   // 路径只能来自系统文件夹选择器（和真实宿主一致）。预览里点「选择…」会
   // 直接拿到这个目录，用来肉眼看选中后的形态。
   assets: {
@@ -131,7 +156,15 @@ const ctx = {
         models: [{ id: "gpt-5", label: "GPT-5" }], efforts: [] },
       { engine: "qoder", label: "Qoder", available: false, readOnly: true, providers: [], models: [], efforts: [] },
     ],
-    start: async () => ({ runId: "preview", sessionId: null }),
+    start: async () => {
+      // 正文由脚本按段推过来：先给一屏「写到一半」，再补齐成完整解读，
+      // 这样预览里能同时核对加载态和排版。
+      const runId = "preview-run";
+      setTimeout(() => {
+        for (const chunk of DIGEST_CHUNKS_HALF) emitAgent(runId, chunk);
+      }, 30);
+      return { runId, sessionId: null };
+    },
     interrupt: async () => true,
   },
   bridge: {
@@ -145,8 +178,39 @@ const ctx = {
   },
 };
 
-/** 和真实 trending 页面同构的样本，让预览走真实解析路径。 */
-function TRENDING_HTML() {
+/* ---------- 解读样本 ---------- */
+
+/** 推 agent 事件；channel 就是 createDigest 订阅的那个。 */
+function emitAgent(runId, text) {
+  const set = eventListeners.get("agent://github-trending");
+  if (!set) return;
+  for (const fn of set) fn({ runId, kind: "delta", data: text });
+}
+function emitAgentDone(runId) {
+  const set = eventListeners.get("agent://github-trending");
+  if (!set) return;
+  for (const fn of set) fn({ runId, kind: "done", data: null });
+}
+
+const DIGEST_CHUNKS_HALF = [
+  "### 今天在热什么\n\n",
+  "今天的热度集中在 **agent 工具链**：`skill`、`plugin` 这类让模型直接干活的形态占了前五里的一半。",
+];
+
+const DIGEST_CHUNKS_REST = [
+  " Rust 侧的 `tokio` 生态之外，没有明显的新语言趋势。\n\n",
+  "### 值得看的项目\n\n",
+  "| 仓库 | 方向 | 解决什么问题 | 适合谁 |\n",
+  "| --- | --- | --- | --- |\n",
+  "| `obra/superpowers` | agent 技能框架 | 把开发方法论固化成可复用的技能包 | 已经在用 Claude Code 的人 |\n",
+  "| `jingyaogong/minimind` | 小模型训练 | 两小时训出一个 64M 的 LLM，门槛极低 | 想动手学预训练的人 |\n",
+  "| `cursor/plugins` | 编辑器插件规范 | 给 Cursor 定一套插件契约 | 做编辑器扩展的人 |\n",
+  "| `HKUDS/CLI-Anything` | CLI 基建 | 让所有软件都能被 agent 当命令行调用 | 写自动化脚本的人 |\n",
+  "\n### 一句话结论\n\n",
+  "最值得点开的是 **`jingyaogong/minimind`** —— 它是今天唯一一个能让人在两小时内跑通全流程的项目。\n",
+];
+
+/** 和真实 trending 页面同构的样本，让预览走真实解析路径。 */function TRENDING_HTML() {
   const rows = [
     ["elementalsouls/Claude-BugHunter", "A Claude Code skill bundle for bug hunting and external red-team work — 82 skills, 15 slash commands.", "Python", "#3572A5", "12,721", "1,602", "1,349"],
     ["obra/superpowers", "An agentic skills framework & software development methodology that works.", "Shell", "#89e051", "322,190", "28,636", "2,028"],
@@ -187,6 +251,41 @@ fs.mkdirSync(path.dirname(OUT), { recursive: true });
 const tabHtml = await renderWithEffects(injected.tab.component);
 // 设置页的 effect 会拉引擎与工作区，同样需要跑一遍
 const settingsHtml = await renderWithEffects(injected.settings.component);
+
+/* 解读面板：点一次「生成解读」，先抓「写到一半」，再补齐抓「完整解读」。
+ * 这两屏是这次改动的主要验证目标——以前整段塞 <pre>，表格和粗体全是原文。 */
+const digestFlow = await (async () => {
+  const findButton = (node, text) => {
+    let hit = null;
+    const walkTree = (n) => {
+      if (hit || !n || typeof n !== "object") return;
+      if (Array.isArray(n)) return n.forEach(walkTree);
+      if (n.type === "button") {
+        const flat = (x) => (typeof x === "string" ? x : Array.isArray(x) ? x.map(flat).join("") : x && x.children ? flat(x.children) : "");
+        if (flat(n).includes(text)) {
+          hit = n;
+          return;
+        }
+      }
+      (n.children || []).forEach(walkTree);
+    };
+    walkTree(node);
+    return hit;
+  };
+
+  const tree0 = await renderTreeWithEffects(injected.tab.component);
+  const btn = findButton(tree0, "生成解读");
+  if (!btn) return { half: "", full: "" };
+  btn.props.onClick();
+  await new Promise((r) => setTimeout(r, 120)); // 等 half 那几段推完
+  const half = render(await renderTreeWithEffects(injected.tab.component));
+
+  for (const chunk of DIGEST_CHUNKS_REST) emitAgent("preview-run", chunk);
+  emitAgentDone("preview-run");
+  await new Promise((r) => setTimeout(r, 60));
+  const full = render(await renderTreeWithEffects(injected.tab.component));
+  return { half, full };
+})();
 
 /* 抓取中的样子：另开一份模块实例（独立 store），让 Trending 请求一直挂起，
  * 这样就能抓到「第一次打开、还没数据」的那一屏。 */
@@ -268,6 +367,12 @@ const html = `<!doctype html>
   <div class="tab-host dark" id="tab-loading-dark"></div>
   <h2>中心页签 · 榜单（深色）</h2>
   <div class="tab-host dark" id="tab-host-dark"></div>
+  <h2>解读 · 生成中（流式渲染 Markdown）</h2>
+  <div class="tab-host" id="tab-digest-half"></div>
+  <h2>解读 · 完成（表格 + 粗体 + 行内代码）</h2>
+  <div class="tab-host" id="tab-digest-full"></div>
+  <h2>解读 · 完成（深色）</h2>
+  <div class="tab-host dark" id="tab-digest-full-dark"></div>
   <h2>设置页</h2>
   ${settingsHtml}
 </div>
@@ -278,6 +383,15 @@ const html = `<!doctype html>
   document.getElementById("tab-first").innerHTML = ${JSON.stringify(firstHtml)};
   document.getElementById("tab-host-dark").innerHTML = ${JSON.stringify(darkTabHtml)};
   document.getElementById("tab-loading-dark").innerHTML = ${JSON.stringify(darkLoadingHtml)};
+  document.getElementById("tab-digest-half").innerHTML = ${JSON.stringify(digestFlow.half)};
+  document.getElementById("tab-digest-full").innerHTML = ${JSON.stringify(digestFlow.full)};
+  document.getElementById("tab-digest-full-dark").innerHTML = ${JSON.stringify(asDark(digestFlow.full))};
+  // 解读在列表下方：把这一屏内部的滚动区滚到底，截图里才看得到正文
+  for (const id of ["tab-digest-half", "tab-digest-full", "tab-digest-full-dark"]) {
+    const host = document.getElementById(id);
+    const scroller = host && host.querySelector(".gt-scroll");
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  }
 </script>
 </body>
 </html>`;

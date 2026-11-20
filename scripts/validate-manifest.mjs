@@ -149,7 +149,7 @@ if (!fs.existsSync(bundle)) {
 }
 
 // 纯函数库与产物一致性由 build.mjs 断言；这里再确认源文件存在。
-for (const name of ["parse", "rising", "diff", "prompt"]) {
+for (const name of ["parse", "rising", "diff", "prompt", "catalog", "markdown"]) {
   if (!fs.existsSync(path.join(ROOT, "src", "lib", name + ".mjs"))) fail(`缺少 src/lib/${name}.mjs`);
 }
 

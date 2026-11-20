@@ -30,6 +30,14 @@ test("prompt 带上数据范围与写作要求", () => {
   assert.match(prompt, /不要编造/);
 });
 
+test("要求用表格给「值得看的项目」，并固定列", () => {
+  // 结果页要渲染 Markdown 表格，前提是模型真的用表格回答。
+  const { prompt } = buildDigestPrompt(base());
+  assert.match(prompt, /\| 仓库 \| 方向 \| 解决什么问题 \| 适合谁 \|/);
+  assert.match(prompt, /### 今天在热什么/);
+  assert.match(prompt, /### 一句话结论/);
+});
+
 test("每个仓库一行，含增量与新上榜标记", () => {
   const { prompt } = buildDigestPrompt(base());
   assert.match(prompt, /- owner\/repo-0 \[Python\] ★1000 \+100\/daily 新上榜 \| desc 0/);
