@@ -340,12 +340,15 @@ const ctx = {
   },
   agent: {
     // 与宿主真实契约一致：PluginAgentCatalogEntry[]
+    // readOnly 是「这个引擎能不能做隔离只读运行」，不是「这个调用要不要只读」。
+    // claude 实测不返回该字段（或返回 false），宿主对不支持的引擎会直接拒绝整轮，
+    // 所以假数据必须复刻这个形态，否则测试根本发现不了传错参数。
     catalog: async () => [
       {
         engine: "claude",
         label: "Claude Code",
         available: true,
-        readOnly: true,
+        readOnly: false,
         providers: [],
         models: [
           { id: "claude-sonnet-5", label: "Sonnet 5" },
@@ -536,7 +539,9 @@ await check("生成解读：按 runId 过滤、流式写入", async () => {
   assert.doesNotMatch(text, /不该出现的内容/, "别的 runId 的事件必须丢弃");
   assert.match(text, /今天在热什么/);
   assert.equal(agentStarts.length, 1);
-  assert.equal(agentStarts[0].readOnly, true);
+  // 「自动」会选中排第一的 claude，而 claude 不支持隔离只读：必须传 false。
+  // 真实宿主对不支持的引擎是整轮拒绝，不是降级——传错这个参数生成直接失败。
+  assert.equal(agentStarts[0].readOnly, false, "引擎不支持时不能请求只读运行");
   assert.match(agentStarts[0].prompt, /GitHub Trending daily/);
   assert.ok(agentStarts[0].workspacePath, "应带工作区");
 });

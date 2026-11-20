@@ -782,8 +782,9 @@ async function generateDigest(ctx) {
       model,
       workspacePath: workspace,
       prompt: built.prompt,
-      // 解读只读榜单，不需要写权限；catalog 说不行就不给。
-      readOnly: entry.readOnly !== false,
+      // 宿主里 claude 不支持隔离只读，传 true 会被整轮拒绝（不是降级）。
+      // 只有 catalog 明确声明支持的引擎（Pi、Codex 规划）才请求只读。
+      readOnly: supportsReadOnly(entry),
     });
     const runId = started && started.runId ? started.runId : null;
     session.runId = runId;
