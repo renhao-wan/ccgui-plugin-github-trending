@@ -85,13 +85,17 @@ const ctx = {
   theme: { injectCss: (s) => { injected.css = s; return () => {}; }, setTokens: () => () => {} },
   storage: { get: async () => null, set: async () => {}, delete: async () => {} },
   documentStorage: {
-    // 给一份「上次快照」，让排名变化与新上榜在预览里能看出来
+    // 上次快照：只放 4 条，且刻意让「superpowers」「CLI-Anything」掉出、其余错位，
+    // 好让预览里同时看到新上榜、上升、下跌三种标签。
+    // 别只给 3 条——那样几乎整榜都是「新上榜」，看不出真实榜单里标签稀疏的样子。
     readText: async (rel) => {
       if (!/daily-all\.json$/.test(rel)) return null;
       const prev = [
+        { repo: "obra/superpowers" },
         { repo: "jingyaogong/minimind" },
         { repo: "elementalsouls/Claude-BugHunter" },
         { repo: "HKUDS/CLI-Anything" },
+        { repo: "old/dropped" },
       ];
       return { content: JSON.stringify({ savedAt: new Date(now - 86400000).toISOString(), repos: prev }), version: "1" };
     },
@@ -200,6 +204,25 @@ await new Promise((r) => setTimeout(r, 60));
 const loadingHtml = await renderWithEffects(loadingTab.component);
 holdTrending = false;
 
+/* 「首次抓取」：没有历史快照。这是最容易看错的一屏——
+ * 一行标签都不该出现，但名次徽章必须在，否则整行只剩仓库名。 */
+let firstTab = null;
+const firstMod = await import(pathToFileURL(path.join(ROOT, "main.js")).href + "?first=1");
+firstMod.default(
+  Object.assign({}, ctx, {
+    ui: Object.assign({}, noopUi, {
+      registerCenterTab: (d) => {
+        firstTab = d;
+        return () => {};
+      },
+    }),
+    // 没有历史：读快照一律返回 null（真机上就是第一次装插件的样子）
+    documentStorage: Object.assign({}, ctx.documentStorage, { readText: async () => null }),
+  }),
+);
+await new Promise((r) => setTimeout(r, 60));
+const firstHtml = await renderWithEffects(firstTab.component);
+
 /* 深色一份：骨架屏、转圈、涨跌色都必须在深色下确认过 */
 const asDark = (s) => s.replace(/class="gt-root"/g, 'class="gt-root dark"');
 const darkLoadingHtml = asDark(loadingHtml);
@@ -232,6 +255,8 @@ const html = `<!doctype html>
   <h1>每日热点 · 样式预览（真实组件 + 真实 CSS）</h1>
   <h2>中心页签 · 首次抓取中</h2>
   <div class="tab-host" id="tab-loading"></div>
+  <h2>中心页签 · 首次抓取（无历史快照）</h2>
+  <div class="tab-host" id="tab-first"></div>
   <h2>中心页签 · 榜单</h2>
   <div class="tab-host" id="tab-host"></div>
   <h2>中心页签 · 首次抓取中（深色）</h2>
@@ -245,6 +270,7 @@ const html = `<!doctype html>
   // 主面板数据靠组件挂载后的 effect 拉取；预览里没有网络，直接把渲染结果塞进去。
   document.getElementById("tab-host").innerHTML = ${JSON.stringify(tabHtml)};
   document.getElementById("tab-loading").innerHTML = ${JSON.stringify(loadingHtml)};
+  document.getElementById("tab-first").innerHTML = ${JSON.stringify(firstHtml)};
   document.getElementById("tab-host-dark").innerHTML = ${JSON.stringify(darkTabHtml)};
   document.getElementById("tab-loading-dark").innerHTML = ${JSON.stringify(darkLoadingHtml)};
 </script>

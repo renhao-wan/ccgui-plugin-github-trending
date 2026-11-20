@@ -14,7 +14,15 @@ export function diffSnapshot(repos, previous) {
 
   if (firstRun) {
     return {
-      repos: list.map((row) => ({ ...row, rank: null, previousRank: null, rankDelta: null, isNew: false })),
+      // 首次抓取也要给名次：榜单顺序本身就是排名，缺了它整行标题只剩仓库名，
+      // 看起来像界面坏了。没有上一次快照时 rankDelta 为 null，不声称任何变化。
+      repos: list.map((row, index) => ({
+        ...row,
+        rank: index + 1,
+        previousRank: null,
+        rankDelta: null,
+        isNew: false,
+      })),
       dropped: [],
       isFirstRun: true,
     };

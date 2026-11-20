@@ -296,7 +296,15 @@ function diffSnapshot(repos, previous) {
 
   if (firstRun) {
     return {
-      repos: list.map((row) => ({ ...row, rank: null, previousRank: null, rankDelta: null, isNew: false })),
+      // 首次抓取也要给名次：榜单顺序本身就是排名，缺了它整行标题只剩仓库名，
+      // 看起来像界面坏了。没有上一次快照时 rankDelta 为 null，不声称任何变化。
+      repos: list.map((row, index) => ({
+        ...row,
+        rank: index + 1,
+        previousRank: null,
+        rankDelta: null,
+        isNew: false,
+      })),
       dropped: [],
       isFirstRun: true,
     };
@@ -1410,7 +1418,15 @@ function StatusLine({ snap }) {
     snap.view === "rising" ? "近 7 天新建的高增长仓库" : "GitHub Trending · " + snap.settings.period,
     snap.view === "trending" && snap.settings.language ? " · " + snap.settings.language : "",
     snap.isFirstRun ? " · 首次抓取，下次刷新可看到排名变化" : "",
+    // 没有变化时整榜都没有涨跌标签，不说明会让人以为标签没渲染出来
+    !snap.isFirstRun && snap.repos.length > 0 && !hasRankChange(snap.repos) ? " · 与上次相比排名无变化" : "",
   );
+}
+
+/** 整榜是否有任何涨跌/新上榜。全为 false 时列表里不会出现任何变化标签。 */
+function hasRankChange(repos) {
+  const list = Array.isArray(repos) ? repos : [];
+  return list.some((row) => row && (row.isNew || (Number.isFinite(row.rankDelta) && row.rankDelta !== 0)));
 }
 
 /** 骨架屏：条数与真实榜单接近，让加载完的落位不跳。 */

@@ -4,12 +4,14 @@ import { diffSnapshot, snapshotSignature } from "../src/lib/diff.mjs";
 
 const rows = (...repos) => repos.map((repo) => ({ repo }));
 
-test("首次使用不标新上榜", () => {
+test("首次使用不标新上榜，但名次要给", () => {
   const out = diffSnapshot(rows("a/b", "c/d"), null);
   assert.equal(out.isFirstRun, true);
   assert.equal(out.dropped.length, 0);
   assert.deepEqual(out.repos.map((r) => r.isNew), [false, false]);
-  assert.deepEqual(out.repos.map((r) => r.rank), [null, null]);
+  // 榜单顺序本身就是排名：缺了 rank，整行标题只剩仓库名，看起来像界面坏了
+  assert.deepEqual(out.repos.map((r) => r.rank), [1, 2]);
+  assert.deepEqual(out.repos.map((r) => r.rankDelta), [null, null]);
 });
 
 test("空数组也算首次使用", () => {

@@ -471,6 +471,22 @@ await check("首次打开自动拉取并渲染列表", async () => {
   assert.match(text, /首次抓取/);
 });
 
+await check("首次抓取也有名次徽章，只是不标涨跌", () => {
+  // 宿主里第一次装插件看到的就是这一屏：没有历史快照。
+  // 曾经这里 rank 为 null，标题行只剩仓库名，实机上看着像是标签没渲染出来。
+  const tree = render();
+  const ranks = [];
+  walk(tree, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-rank")) ranks.push(textOf(n));
+  });
+  assert.deepEqual(ranks, ["1", "2", "3"], "首次抓取也应按榜单顺序给出名次");
+
+  // 没有可比的历史，任何涨跌/新上榜标签都不该出现
+  assert.equal(countByClass(tree, "gt-move"), 0, "首次抓取不应有任何变化标签");
+  assert.doesNotMatch(textOf(tree), /新上榜|↑|↓/, "首次抓取不应声称排名变化");
+});
+
 await check("请求只打到两个已声明的 host", () => {
   assert.ok(httpCalls.length >= 1);
   for (const call of httpCalls) {
@@ -500,6 +516,17 @@ await check("第二次刷新标出新上榜/掉榜/升降位", async () => {
   assert.match(text, /新/, "delta 标记新上榜");
   assert.match(text, /掉榜（1）/);
   assert.match(text, /gamma\/three/);
+});
+
+await check("榜单没变时说明「排名无变化」，而不是整行空着", async () => {
+  // 再抓一次同一份榜单：所有 rankDelta 为 0，标签本来就不渲染。
+  // 不解释一句，用户会以为涨跌标签坏了。
+  const btn = findByText(render(), "刷新");
+  assert.ok(btn, "应有刷新按钮");
+  btn.props.onClick();
+  assert.ok(await waitFor(() => /排名无变化/.test(textOf(render()))), "应说明排名无变化");
+  assert.equal(countByClass(render(), "gt-move"), 0, "没有变化就不该有标签");
+  assert.ok(countByClass(render(), "gt-rank") >= 3, "名次徽章仍要在");
 });
 
 await check("生成解读：按 runId 过滤、流式写入", async () => {
