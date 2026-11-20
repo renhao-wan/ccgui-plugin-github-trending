@@ -328,15 +328,41 @@ const ctx = {
   workspaces: {
     list: async () => [{ path: os.tmpdir() }],
   },
-  models: {
-    listEngines: async () => [
-      { id: "claude", name: "Claude", enabled: true },
-      { id: "codex", name: "Codex", enabled: true },
-      { id: "off", name: "Off", enabled: false },
-    ],
-    listEngineModels: async () => ({ models: [{ id: "m-one" }, { id: "m-two" }] }),
-  },
   agent: {
+    // 与宿主真实契约一致：PluginAgentCatalogEntry[]
+    catalog: async () => [
+      {
+        engine: "claude",
+        label: "Claude Code",
+        available: true,
+        readOnly: true,
+        providers: [],
+        models: [
+          { id: "claude-sonnet-5", label: "Sonnet 5" },
+          { id: "claude-opus-5", label: "Opus 5" },
+        ],
+        efforts: ["low", "medium", "high"],
+      },
+      {
+        engine: "codex",
+        label: "Codex",
+        available: true,
+        readOnly: true,
+        providers: [],
+        models: [{ id: "gpt-5", label: "GPT-5" }],
+        efforts: [],
+      },
+      {
+        // 已安装但没配置好：应显示为「不可用」而不是直接消失
+        engine: "qoder",
+        label: "Qoder",
+        available: false,
+        readOnly: true,
+        providers: [],
+        models: [],
+        efforts: [],
+      },
+    ],
     start: async (opts) => {
       agentStarts.push(opts);
       agentRunIdx += 1;
@@ -577,9 +603,9 @@ await check("设置页：分节布局，改动自动保存", async () => {
   assert.equal(kv.get("settings").language, "rust");
 });
 
-await check("设置页：引擎下拉展开后列出可用引擎，过滤未启用项", async () => {
+await check("设置页：引擎下拉来自 agent.catalog，不可用的标出来但不隐藏", async () => {
   renderFresh(settingsDef.component, {}, { effects: true });
-  // 等引擎列表加载完成（触发器存在且可展开）
+  // 等引擎目录加载完成（触发器存在且可展开）
   assert.ok(await waitFor(() => !!findTrigger(renderFresh(settingsDef.component, {}, { effects: true }), "自动"), 1500));
 
   const engineTrigger = findTrigger(renderKeep(settingsDef.component, {}), "自动（第一个可用引擎）");
@@ -587,9 +613,10 @@ await check("设置页：引擎下拉展开后列出可用引擎，过滤未启�
   engineTrigger.props.onClick();
 
   const opened = textOf(renderKeep(settingsDef.component, {}));
-  assert.match(opened, /Claude/, "展开后应列出 Claude");
-  assert.match(opened, /Codex/, "展开后应列出 Codex");
-  assert.doesNotMatch(opened, /Off/, "未启用的引擎不应出现");
+  assert.match(opened, /Claude Code/, "应显示引擎的友好名而不是裸 id");
+  assert.match(opened, /Codex/);
+  // 已安装但不可用的引擎保留在列表里并标注，而不是静默消失
+  assert.match(opened, /Qoder（不可用）/, "不可用引擎应标注出来");
 });
 
 await check("设置页：时间档与阈值用下拉而不是手填", async () => {

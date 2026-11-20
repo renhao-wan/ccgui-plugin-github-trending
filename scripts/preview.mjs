@@ -111,15 +111,17 @@ const ctx = {
       { id: "3", path: "D:/projects/school/compiler", name: "compiler", lastOpenedAt: now - 5000 },
     ],
   },
-  models: {
-    listEngines: async () => [
-      { id: "claude", name: "Claude", enabled: true },
-      { id: "codex", name: "Codex", enabled: true },
-      { id: "qoder", name: "Qoder", enabled: true },
+  agent: {
+    catalog: async () => [
+      { engine: "claude", label: "Claude Code", available: true, readOnly: true, providers: [],
+        models: [{ id: "claude-sonnet-5", label: "Sonnet 5" }, { id: "claude-opus-5", label: "Opus 5" }], efforts: ["low", "medium", "high"] },
+      { engine: "codex", label: "Codex", available: true, readOnly: true, providers: [],
+        models: [{ id: "gpt-5", label: "GPT-5" }], efforts: [] },
+      { engine: "qoder", label: "Qoder", available: false, readOnly: true, providers: [], models: [], efforts: [] },
     ],
-    listEngineModels: async () => ({ models: [{ id: "claude-sonnet-5" }, { id: "claude-opus-5" }] }),
+    start: async () => ({ runId: "preview", sessionId: null }),
+    interrupt: async () => true,
   },
-  agent: { start: async () => ({ runId: "preview", sessionId: null }), interrupt: async () => true },
   bridge: {
     invoke: async (_cmd, args) => {
       if (String(args.url).includes("/trending")) return { status: 200, body: TRENDING_HTML() };

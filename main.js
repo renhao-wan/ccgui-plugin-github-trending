@@ -496,8 +496,8 @@ const DEFAULT_STATE = {
   digestIncluded: 0,
   digestTotal: 0,
   generating: false,
-  engines: [],
-  engineModels: [],
+  catalog: [],
+  catalogLoaded: false,
   modelsLoading: false,
   modelsError: "",
   workspaces: [],
@@ -923,42 +923,85 @@ async function loadWorkspaces(ctx) {
   }
 }
 
-async function loadEngines(ctx) {
+/**
+ * 引擎目录。与工作志同一套：走 ctx.agent.catalog()，一次调用就同时拿到
+ * 引擎、可用性、模型与 readOnly 标记。
+ *
+ * 不用 ctx.models：那是宿主模型目录接口，需要额外的 host:models 权限，
+ * 且要分两次调（引擎一次、每个引擎的模型再一次），还没有 available 标记。
+ */
+let catalogLoading = false;
+
+async function loadCatalog(ctx, options) {
+  if (catalogLoading) return;
+  const force = Boolean(options && options.force);
+  if (!force && store.snap.catalogLoaded) return;
+  catalogLoading = true;
   set({ modelsLoading: true, modelsError: "" });
   try {
-    const engines = await ctx.models.listEngines();
-    const list = (Array.isArray(engines) ? engines : []).filter(
-      (e) => e && typeof e.id === "string" && e.enabled !== false,
+    const workspace = String(store.snap.settings.workspacePath || "").trim();
+    const list = await ctx.agent.catalog(workspace || undefined);
+    const entries = (Array.isArray(list) ? list : []).filter(
+      (e) => e && typeof e.engine === "string" && e.engine.trim() !== "",
     );
-    set({ engines: list, modelsLoading: false });
-    const chosen = store.snap.settings.engine || (list[0] && list[0].id) || "";
-    if (chosen) await loadModels(ctx, chosen);
+    set({ catalog: entries, catalogLoaded: true, modelsLoading: false });
   } catch (error) {
-    // 「读不到引擎列表」和「一个引擎都没装」是两回事，提示不能混。
+    // 「读不到引擎目录」和「没有可用引擎」是两回事，提示不能混。
     set({
-      engines: [],
-      engineModels: [],
+      catalog: [],
+      catalogLoaded: false,
       modelsLoading: false,
-      modelsError: "读取引擎列表失败：" + messageOf(error),
+      modelsError: "读取引擎目录失败：" + messageOf(error),
     });
+  } finally {
+    catalogLoading = false;
   }
 }
 
-async function loadModels(ctx, engine) {
-  if (!engine) {
-    set({ engineModels: [] });
-    return;
-  }
-  try {
-    const workspace = await resolveWorkspace(ctx, store.snap.settings);
-    const catalog = await ctx.models.listEngineModels(engine, workspace || undefined);
-    const models = (catalog && Array.isArray(catalog.models) ? catalog.models : [])
-      .map((m) => (typeof m === "string" ? m : m && m.id))
-      .filter((m) => typeof m === "string" && m);
-    set({ engineModels: models });
-  } catch {
-    set({ engineModels: [] });
-  }
+const ENGINE_LABELS = {
+  claude: "Claude Code",
+  codex: "Codex",
+  opencode: "OpenCode",
+  qoder: "Qoder",
+  "qoder-cn": "Qoder (CN)",
+  kimi: "Kimi CLI",
+  grok: "Grok CLI",
+  codebuddy: "CodeBuddy",
+  minimax: "MiniMax",
+  omp: "OMP",
+  dsh: "DSH",
+  agy: "AGY",
+  pi: "Pi",
+};
+
+/** 宿主 catalog 的 id 是不可信输入：只认表里的自有属性。 */
+function engineLabel(id) {
+  const key = String(id || "").trim();
+  if (!key) return "";
+  const hit = Object.prototype.hasOwnProperty.call(ENGINE_LABELS, key)
+    ? ENGINE_LABELS[key]
+    : Object.prototype.hasOwnProperty.call(ENGINE_LABELS, key.toLowerCase())
+      ? ENGINE_LABELS[key.toLowerCase()]
+      : "";
+  return hit || key;
+}
+
+/** 可用的排前面，组内按显示名排序（与工作志、CLI 安装检测插件一致）。 */
+function sortCatalog(list) {
+  return (Array.isArray(list) ? list.slice() : []).sort((a, b) => {
+    const ai = a && a.available === false ? 1 : 0;
+    const bi = b && b.available === false ? 1 : 0;
+    if (ai !== bi) return ai - bi;
+    return engineLabel(a && a.engine).localeCompare(engineLabel(b && b.engine), "en");
+  });
+}
+
+/** 取选中引擎的目录条目；没显式选就返回第一个可用的。 */
+function pickEntry(catalog, preferred) {
+  const list = Array.isArray(catalog) ? catalog : [];
+  const want = String(preferred || "").trim();
+  if (want) return list.find((e) => e && e.engine === want) || null;
+  return list.find((e) => e && e.available !== false) || null;
 }
 
 /**
@@ -1079,16 +1122,21 @@ async function generateDigest(ctx) {
   if (seq !== digestSeq || session.cancelled) return bailed("");
   if (!workspace) return bailed("还没有可用工作区：请先在设置里填写 agent 的工作区路径");
 
-  // 中央页签不会先打开设置页，引擎列表要在这里按需补一次。
-  if (store.snap.engines.length === 0) {
-    await loadEngines(ctx);
+  // 中央页签不会先打开设置页，引擎目录要在这里按需补一次。
+  if (!store.snap.catalogLoaded) {
+    await loadCatalog(ctx);
     if (seq !== digestSeq || session.cancelled) return bailed("");
   }
+  if (store.snap.modelsError) return bailed(store.snap.modelsError);
 
-  const engine = String(settings.engine || (store.snap.engines[0] && store.snap.engines[0].id) || "").trim();
-  if (!engine) {
-    return bailed(store.snap.modelsError || "没有可用引擎，请先在设置里选择");
-  }
+  const entry = pickEntry(store.snap.catalog, settings.engine);
+  if (!entry) return bailed("没有可用引擎，请先在设置里选择");
+  if (entry.available === false) return bailed(engineLabel(entry.engine) + " 当前不可用，请换一个引擎");
+
+  // 模型：用户选的优先，否则用该引擎的第一个；catalog 的 label 是显示名。
+  const models = (entry.models || []).filter((m) => m && typeof m.id === "string" && m.id.trim());
+  const model = String(settings.model || "").trim() || (models[0] ? models[0].id : undefined);
+  const engine = entry.engine;
 
   let queued = [];
   let text = "";
@@ -1145,10 +1193,11 @@ async function generateDigest(ctx) {
   try {
     const started = await ctx.agent.start({
       engine,
-      model: settings.model || undefined,
+      model,
       workspacePath: workspace,
       prompt: built.prompt,
-      readOnly: true,
+      // 解读只读榜单，不需要写权限；catalog 说不行就不给。
+      readOnly: entry.readOnly !== false,
     });
     const runId = started && started.runId ? started.runId : null;
     session.runId = runId;
@@ -1589,7 +1638,7 @@ function SettingsSection() {
   };
 
   R.useEffect(() => {
-    if (snap.engines.length === 0) void loadEngines(ctx);
+    if (!snap.catalogLoaded) void loadCatalog(ctx);
     void loadWorkspaces(ctx);
   }, []);
 
@@ -1624,17 +1673,46 @@ function SettingsSection() {
     [],
   );
 
+  // 引擎选项来自 agent.catalog：不可用的保留在列表里但禁用，用户能看到
+  // 「装了这个引擎但没配好」，而不是莫名其妙少一项。
   const engineItems = [{ value: "", label: "自动（第一个可用引擎）" }];
-  for (const e of snap.engines) engineItems.push({ value: e.id, label: e.name || e.id });
-  if (snap.modelsLoading && snap.engines.length === 0) {
-    engineItems.push({ value: "", label: "读取引擎列表中…", disabled: true });
+  for (const e of sortCatalog(snap.catalog)) {
+    engineItems.push({
+      value: e.engine,
+      label: engineLabel(e.engine) + (e.available === false ? "（不可用）" : ""),
+      disabled: e.available === false,
+    });
+  }
+  if (snap.modelsLoading && snap.catalog.length === 0) {
+    engineItems.push({ value: "", label: "读取引擎目录中…", disabled: true });
+  }
+  // 配置里已有、但这次目录没列出来的引擎：保留一项，避免下拉把它吃掉
+  if (form.engine && !snap.catalog.some((e) => e.engine === form.engine)) {
+    engineItems.push({ value: form.engine, label: engineLabel(form.engine) });
   }
 
+  // 模型跟着所选引擎走；catalog 的 label 已是显示名。
+  const entry = pickEntry(snap.catalog, form.engine);
+  const entryModels = entry && Array.isArray(entry.models) ? entry.models : [];
   const modelItems = [{ value: "", label: "自动（该引擎的第一个模型）" }];
-  for (const m of snap.engineModels) modelItems.push({ value: m, label: m });
-  if (form.model && !snap.engineModels.includes(form.model)) {
+  for (const m of entryModels) {
+    if (m && typeof m.id === "string" && m.id) {
+      modelItems.push({ value: m.id, label: m.label || m.id });
+    }
+  }
+  if (form.model && !entryModels.some((m) => m && m.id === form.model)) {
     modelItems.push({ value: form.model, label: form.model });
   }
+
+  /** 模型一栏的说明文字：要能回答「现在实际会用哪个引擎」。 */
+  const modelHint = () => {
+    if (!entry) return "先选引擎，模型列表会跟着变。";
+    const name = engineLabel(entry.engine);
+    if (entry.available === false) return name + " 当前不可用，请在宿主的引擎配置里启用它。";
+    if (!entryModels.length) return name + " 没有报告模型列表，留空即可。";
+    const prefix = form.engine ? "" : "当前跟随「自动」选中的 " + name + "；";
+    return prefix + "留空则用该引擎的第一个可用模型。";
+  };
 
   // 工作区直接选侧栏里已有的：手打的路径没有对应授权，后续会失败。
   const workspaceItems = [{ value: "", label: "自动（最近打开的工作区）" }];
@@ -1782,13 +1860,16 @@ function SettingsSection() {
             items: engineItems,
             value: form.engine,
             onChange: (v) => {
+              // 换引擎时模型要清空：旧引擎的 model id 对新引擎无意义
               patch("engine", v);
               patch("model", "");
-              void loadModels(ctx, v);
             },
-            disabled: snap.engines.length === 0,
+            disabled: snap.modelsLoading && snap.catalog.length === 0,
+            emptyText: "宿主没有返回引擎",
           }),
-          snap.modelsError ? snap.modelsError : "选项来自宿主当前可用的引擎。",
+          snap.modelsError
+            ? snap.modelsError
+            : "选项来自宿主当前可用的引擎；标「不可用」的是已安装但没配置好。",
         ),
         segField(
           "模型",
@@ -1796,10 +1877,15 @@ function SettingsSection() {
             items: modelItems,
             value: form.model,
             onChange: (v) => patch("model", v),
-            disabled: !form.engine,
-            emptyText: form.engine ? "该引擎未报告可用模型" : "先选引擎",
+            // 「自动」时按第一个可用引擎的模型列表给选项，用户仍能先挑模型。
+            disabled: !entry || entry.available === false,
+            emptyText: entry
+              ? entry.available === false
+                ? "该引擎当前不可用"
+                : "该引擎未报告可用模型"
+              : "先选引擎",
           }),
-          form.engine ? "留空则用该引擎的第一个可用模型。" : "先选引擎，模型列表会跟着变。",
+          modelHint(),
         ),
         segField(
           "解读用的工作区",
