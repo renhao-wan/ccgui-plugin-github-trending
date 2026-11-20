@@ -60,9 +60,14 @@ function escapeRegExp(input) {
  * 星标/复刻数：锚点内容里夹着 svg path，只认 `</a>` 前的最后一段数字。
  * 不在正则里限定窗口长度——GitHub 给大仓库加 badge 时 path 会变长，写死窗口
  * 会让星数静默变 null。这里先定位到锚点，再取它这一段里最后一个数字。
+ *
+ * @param {string} article
+ * @param {string} slug 调用方已转义好的仓库全名（escapeRegExp 过），
+ *   这样整榜 25 行只转义一次，不必每篇再算两遍。
+ * @param {string} kind stargazers | forks
  */
 function countFromAnchor(article, slug, kind) {
-  const anchor = 'href="/' + escapeRegExp(slug) + "/" + kind + '"';
+  const anchor = 'href="/' + slug + "/" + kind + '"';
   const at = article.search(new RegExp(anchor));
   if (at < 0) return null;
   const end = article.indexOf("</a>", at);
@@ -72,6 +77,19 @@ function countFromAnchor(article, slug, kind) {
   if (!nums || nums.length === 0) return null;
   // 锚点 href 里也可能有数字（如 /a/repo2/stargazers），最后一段才是计数
   return toCount(nums[nums.length - 1]);
+}
+
+/**
+ * GitHub 语言色点只会是 `#abcdef` 或 `rgb(...)` / `rgba(...)`。
+ * 白名单不只是美观：这个值会原样进渲染层的 style，而 `background` 接受
+ * `url(...)`——一个被改版的页面就能让渲染进程绕过插件的 network 白名单去
+ * 发请求。其余所有不可信字段都做过 cleanText，这里不能例外。
+ */
+const COLOR_RE = /^(#[0-9a-f]{3,8}|rgba?\(\s*[\d.,\s%]{1,40}\))$/i;
+
+function safeColor(raw) {
+  const s = String(raw || "").trim();
+  return COLOR_RE.test(s) ? s : "";
 }
 
 /** GitHub 会重定向 /apps、/marketplace 这类非仓库路径，正文里不该当仓库。 */
@@ -139,6 +157,9 @@ export function parseTrending(html) {
     // 否则恶意/巧合的描述会盖过真实数字。
     const footer = descMatch ? article.replace(descMatch[0], "") : article;
     const gainMatch = footer.match(/([\d,]+)\s+stars\s+(today|this week|this month)/);
+    // 转义一次给两次计数用：整榜 25 行就是这个函数的 25 次调用，
+    // 每篇再各算两遍 escapeRegExp 纯属浪费。
+    const slugEscaped = escapeRegExp(slug);
 
     repos.push({
       repo: slug,
@@ -147,9 +168,9 @@ export function parseTrending(html) {
       url: "https://github.com/" + slug,
       description: descMatch ? cleanText(descMatch[1]) : "",
       language: langMatch ? cleanText(langMatch[1]) : "",
-      languageColor: colorMatch ? colorMatch[1].trim() : "",
-      stars: countFromAnchor(article, slug, "stargazers"),
-      forks: countFromAnchor(article, slug, "forks"),
+      languageColor: colorMatch ? safeColor(colorMatch[1]) : "",
+      stars: countFromAnchor(article, slugEscaped, "stargazers"),
+      forks: countFromAnchor(article, slugEscaped, "forks"),
       gain: gainMatch ? toCount(gainMatch[1]) : null,
       gainPeriod: gainMatch ? normalisePeriod(gainMatch[2]) : null,
     });

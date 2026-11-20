@@ -8,6 +8,9 @@ function asCount(value) {
 }
 
 function normalise(item) {
+  // items 是不可信数组：GitHub 曾经在分页边界返回过 null 元素，直接读
+  // item.full_name 会整页抛 TypeError（一个坏元素毁掉整榜）。
+  if (!item || typeof item !== "object") return null;
   const full = typeof item.full_name === "string" ? item.full_name : "";
   const slash = full.indexOf("/");
   if (slash <= 0 || slash === full.length - 1) return null;

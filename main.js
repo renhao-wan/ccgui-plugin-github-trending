@@ -77,9 +77,14 @@ function escapeRegExp(input) {
  * 星标/复刻数：锚点内容里夹着 svg path，只认 `</a>` 前的最后一段数字。
  * 不在正则里限定窗口长度——GitHub 给大仓库加 badge 时 path 会变长，写死窗口
  * 会让星数静默变 null。这里先定位到锚点，再取它这一段里最后一个数字。
+ *
+ * @param {string} article
+ * @param {string} slug 调用方已转义好的仓库全名（escapeRegExp 过），
+ *   这样整榜 25 行只转义一次，不必每篇再算两遍。
+ * @param {string} kind stargazers | forks
  */
 function countFromAnchor(article, slug, kind) {
-  const anchor = 'href="/' + escapeRegExp(slug) + "/" + kind + '"';
+  const anchor = 'href="/' + slug + "/" + kind + '"';
   const at = article.search(new RegExp(anchor));
   if (at < 0) return null;
   const end = article.indexOf("</a>", at);
@@ -89,6 +94,19 @@ function countFromAnchor(article, slug, kind) {
   if (!nums || nums.length === 0) return null;
   // 锚点 href 里也可能有数字（如 /a/repo2/stargazers），最后一段才是计数
   return toCount(nums[nums.length - 1]);
+}
+
+/**
+ * GitHub 语言色点只会是 `#abcdef` 或 `rgb(...)` / `rgba(...)`。
+ * 白名单不只是美观：这个值会原样进渲染层的 style，而 `background` 接受
+ * `url(...)`——一个被改版的页面就能让渲染进程绕过插件的 network 白名单去
+ * 发请求。其余所有不可信字段都做过 cleanText，这里不能例外。
+ */
+const COLOR_RE = /^(#[0-9a-f]{3,8}|rgba?\(\s*[\d.,\s%]{1,40}\))$/i;
+
+function safeColor(raw) {
+  const s = String(raw || "").trim();
+  return COLOR_RE.test(s) ? s : "";
 }
 
 /** GitHub 会重定向 /apps、/marketplace 这类非仓库路径，正文里不该当仓库。 */
@@ -156,6 +174,9 @@ function parseTrending(html) {
     // 否则恶意/巧合的描述会盖过真实数字。
     const footer = descMatch ? article.replace(descMatch[0], "") : article;
     const gainMatch = footer.match(/([\d,]+)\s+stars\s+(today|this week|this month)/);
+    // 转义一次给两次计数用：整榜 25 行就是这个函数的 25 次调用，
+    // 每篇再各算两遍 escapeRegExp 纯属浪费。
+    const slugEscaped = escapeRegExp(slug);
 
     repos.push({
       repo: slug,
@@ -164,9 +185,9 @@ function parseTrending(html) {
       url: "https://github.com/" + slug,
       description: descMatch ? cleanText(descMatch[1]) : "",
       language: langMatch ? cleanText(langMatch[1]) : "",
-      languageColor: colorMatch ? colorMatch[1].trim() : "",
-      stars: countFromAnchor(article, slug, "stargazers"),
-      forks: countFromAnchor(article, slug, "forks"),
+      languageColor: colorMatch ? safeColor(colorMatch[1]) : "",
+      stars: countFromAnchor(article, slugEscaped, "stargazers"),
+      forks: countFromAnchor(article, slugEscaped, "forks"),
       gain: gainMatch ? toCount(gainMatch[1]) : null,
       gainPeriod: gainMatch ? normalisePeriod(gainMatch[2]) : null,
     });
@@ -194,6 +215,9 @@ function asCount(value) {
 }
 
 function normalise(item) {
+  // items 是不可信数组：GitHub 曾经在分页边界返回过 null 元素，直接读
+  // item.full_name 会整页抛 TypeError（一个坏元素毁掉整榜）。
+  if (!item || typeof item !== "object") return null;
   const full = typeof item.full_name === "string" ? item.full_name : "";
   const slash = full.indexOf("/");
   if (slash <= 0 || slash === full.length - 1) return null;
@@ -844,6 +868,12 @@ const PLUGIN_ID = "github-trending";
 const HISTORY_DIR = "history";
 const REQUEST_TIMEOUT_MS = 20000;
 const AGENT_TIMEOUT_MS = 120000;
+/**
+ * 开会话的超时。这条路径不能像解读那样等 120s：`discussing` 非空期间全榜的
+ * 「讨论」按钮都是禁用的，挂住就等于整页这个功能不可用，而且没有别的出口。
+ * startRun 只是 spawn，不包含推理，30s 足够；超时后用户可以直接再点一次。
+ */
+const DISCUSS_TIMEOUT_MS = 30000;
 const TRENDING_TEXT_LIMIT = 2_000_000;
 
 /**
@@ -879,7 +909,6 @@ const DEFAULT_STATE = {
   isFirstRun: true,
   loadedAt: null,
   source: "",
-  parseError: "",
   httpError: "",
   errorKind: "",
   loading: false,
@@ -1165,15 +1194,18 @@ const snapshotLocks = new Map();
 async function writeSnapshot(ctx, period, language, repos) {
   const rel = historyPath(period, language);
   const prev = snapshotLocks.get(rel) || Promise.resolve();
-  const next = prev.then(
-    () => writeSnapshotOnce(ctx, rel, period, language, repos),
-    () => writeSnapshotOnce(ctx, rel, period, language, repos),
-  );
-  snapshotLocks.set(rel, next.catch(() => {}));
+  const run = () => writeSnapshotOnce(ctx, rel, period, language, repos);
+  // prev 失败也要继续：上一轮的写盘错误不该让这一轮静默不写。
+  const next = prev.then(run, run);
+  // 记进 Map 的必须是这一轮真正的「队尾」引用，否则 finally 里的 === 判断
+  // 永远不成立（存 next.catch() 存的是另一个 Promise），锁表只增不减。
+  const tail = next.catch(() => {});
+  snapshotLocks.set(rel, tail);
   try {
     await next;
   } finally {
-    if (snapshotLocks.get(rel) === next || snapshotLocks.get(rel) === undefined) snapshotLocks.delete(rel);
+    // 只有自己还是队尾才删：后面已有新写入排队时，删了就会让它们并发。
+    if (snapshotLocks.get(rel) === tail) snapshotLocks.delete(rel);
   }
 }
 
@@ -1260,7 +1292,6 @@ async function refresh(ctx, options) {
   set({
     loading: true,
     httpError: "",
-    parseError: "",
     errorKind: "",
     discussError: "",
     discussNotice: "",
@@ -1310,7 +1341,6 @@ async function refresh(ctx, options) {
     loaded: true,
     errorKind: "",
     httpError: "",
-    parseError: "",
     repos: diff.repos,
     dropped: diff.dropped,
     isFirstRun: diff.isFirstRun,
@@ -1497,9 +1527,16 @@ function releaseSession(session) {
  * 与 releaseSession 分开，是因为「停止」可能发生在 start 还没返回的时候：
  * 那一刻没有 runId 可打断，只能先记下 cancelled；等 start resolve 拿到 runId
  * 后再补这一刀。合并进幂等清理里就会被 settled 守卫挡掉，留下孤儿进程。
+ *
+ * 判据是「有没有真的起来一轮」（runId 是否存在），**不是** cancelled：超时、
+ * 引擎报错同样是「插件放手了、宿主还在跑」，也必须打断。之前用 cancelled
+ * 当闸门，导致 finish(error) 传了 interrupt 也被挡掉，120s 超时后宿主那侧
+ * 继续烧 token 到自然结束。要不要打断由调用方决定（传不传 interruptRun），
+ * 这里只保证不重复打断。
  */
 function interruptSession(session, interruptRun) {
-  if (!session || !session.cancelled || !session.runId || session.interrupted) return;
+  if (!session || !session.runId || session.interrupted) return;
+  if (typeof interruptRun !== "function") return;
   session.interrupted = true;
   try {
     void interruptRun(session.runId);
@@ -1513,20 +1550,25 @@ function disposeSession(session, interruptRun) {
   interruptSession(session, interruptRun);
 }
 
+/**
+ * 作废这一轮并打断宿主侧。
+ *
+ * 「先标记 cancelled、再打断」原本在停止/超时/卸载三处各写一遍，靠每个
+ * 调用方记得两件事都做。收成一个动作后，漏掉任何一半都不可能发生。
+ */
+function cancelSession(session, ctx) {
+  if (!session) return;
+  session.cancelled = true;
+  disposeSession(session, (runId) => ctx.agent.interrupt(runId));
+}
+
 /** 停止当前解读：无论它处于「准备中」「start 在飞」还是「流式中」。 */
 function abortDigest(ctx) {
   digestSeq += 1;
-  const session = activeDigest;
-  if (session) session.cancelled = true;
-  disposeSession(session, (runId) => ctx.agent.interrupt(runId));
+  cancelSession(activeDigest, ctx);
   // 已经写出来的半截正文留着（用户可能还想看），但要标成「已停止」：
   // 否则它和一份正常写完的解读长得一模一样。
   set({ generating: false, digestStopped: Boolean(store.snap.digest) });
-}
-
-/** 兼容旧调用名。 */
-function stopDigest(ctx) {
-  abortDigest(ctx);
 }
 
 /* ---------- 单个仓库的讨论会话 ---------- */
@@ -1608,12 +1650,16 @@ async function discussRepo(ctx, row) {
     // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。
     // 返回的 sessionId 这里不用：startRun 文档写明引擎可能稍后才 announce，
     // 此时是 null。拿它去 selectSession 会有一半时候跳不动，详见 discussRepo 头注释。
-    await ctx.sessions.startRun({
-      engine: entry.engine,
-      model: model || undefined,
-      prompt,
-      workspacePath: workspace,
-    });
+    await withTimeout(
+      ctx.sessions.startRun({
+        engine: entry.engine,
+        model: model || undefined,
+        prompt,
+        workspacePath: workspace,
+      }),
+      DISCUSS_TIMEOUT_MS,
+      "会话启动",
+    );
     // 不跳转这件事必须写在页面上。侧栏多一行对正在扫榜的人是很容易错过的，
     // 不给提示就会被理解成「按钮没反应」，进而连点，多开一轮真 token。
     if (seq === discussSeq) set({ discussing: "", discussError: "", discussNotice: row.repo });
@@ -1623,7 +1669,9 @@ async function discussRepo(ctx, row) {
     const rawMessage = error && error.message ? String(error.message) : String(error || "");
     const hint = /host:session|permission|not declared/i.test(rawMessage)
       ? "缺少会话权限，请重新安装插件（manifest 已声明 host:session）"
-      : messageOf(error);
+      : /会话启动\s*timeout/i.test(rawMessage)
+        ? "宿主没有及时建起会话（30 秒），可以直接再点一次"
+        : messageOf(error);
     bailed("开会话失败：" + hint);
   }
 }
@@ -1692,7 +1740,13 @@ async function generateDigest(ctx) {
 
   const finish = (error, value) => {
     if (session.settled) return;
-    disposeSession(session, null);
+    if (error) {
+      // 超时/引擎报错时宿主那侧未必已经停：和「用户点停止」走同一条打断
+      // 路径，否则 120s 后插件放手、宿主进程继续烧 token 到自然结束。
+      cancelSession(session, ctx);
+    } else {
+      disposeSession(session, null);
+    }
     if (seq !== digestSeq) return;
     if (error) {
       set({ generating: false, httpError: messageOf(error) });
@@ -1755,9 +1809,7 @@ async function generateDigest(ctx) {
     // 用户在 start 期间点了停止 / 切了视图 / 卸载了插件：这一轮已经作废，
     // 但宿主的进程刚起来，必须当场打断。
     if (session.cancelled || seq !== digestSeq) {
-      session.cancelled = true;
-      interruptSession(session, (id) => ctx.agent.interrupt(id));
-      releaseSession(session);
+      cancelSession(session, ctx);
       return;
     }
 
@@ -1819,6 +1871,12 @@ function RepoRow({ row, ctx, discussing }) {
   const h = appCtx.react.createElement;
   const href = safeHref(row.url);
   const movement = movementLabel(row);
+  // owner/name 可能缺失：掉榜行直接来自磁盘快照，只校验过 repo 是字符串。
+  // 少一个字段就会渲染成 "undefined / undefined"，比不显示更糟。
+  const repoName = String(row.repo || "");
+  const slash = repoName.indexOf("/");
+  const owner = row.owner || (slash > 0 ? repoName.slice(0, slash) : repoName);
+  const name = row.name || (slash > 0 ? repoName.slice(slash + 1) : "");
   const busy = Boolean(discussing) && discussing === row.repo;
   // 一次只能开一个：别的行在开的时候按钮禁用，避免连点开出好几个真会话。
   const blocked = Boolean(discussing) && !busy;
@@ -1837,11 +1895,11 @@ function RepoRow({ row, ctx, discussing }) {
           ? h(
               "a",
               { className: "gt-repo", href, target: "_blank", rel: "noreferrer noopener", title: row.repo },
-              h("span", { className: "gt-repo-owner" }, row.owner + " /"),
-              h("span", { className: "gt-sep" }, " "),
-              row.name,
+              h("span", { className: "gt-repo-owner" }, owner + (name ? " /" : "")),
+              name ? h("span", { className: "gt-sep" }, " ") : null,
+              name || null,
             )
-          : h("span", { className: "gt-repo" }, row.repo),
+          : h("span", { className: "gt-repo" }, repoName),
         movement
           ? h("span", { className: "gt-move" + movementClass(row) }, movement)
           : null,
@@ -1884,13 +1942,13 @@ function Toolbar({ snap, ctx }) {
   // 否则旧轮次的 delta 会继续写进新视图，而且宿主那侧还在烧 token。
   const onView = (view) => {
     if (view === snap.view) return;
-    if (snap.generating) stopDigest(ctx);
+    if (snap.generating) abortDigest(ctx);
     set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false, discussError: "", discussNotice: "" });
     void refresh(ctx, { force: true });
   };
   const onPeriod = (period) => {
     if (period === snap.settings.period) return;
-    if (snap.generating) stopDigest(ctx);
+    if (snap.generating) abortDigest(ctx);
     setSettings({ period });
     void persistSettings(ctx, { period });
     set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [], discussError: "", discussNotice: "" });
@@ -1937,8 +1995,11 @@ function Toolbar({ snap, ctx }) {
         {
           type: "button",
           className: "gt-btn gt-btn--primary",
-          onClick: () => (snap.generating ? stopDigest(ctx) : void generateDigest(ctx)),
-          disabled: snap.loading || snap.repos.length === 0,
+          onClick: () => (snap.generating ? abortDigest(ctx) : void generateDigest(ctx)),
+          // 生成中不能跟着 loading 一起禁用：刷新一进来就把 loading 置真，而
+          // 刷新并不中止解读——那样「停止生成」会变成一个点不动的按钮，
+          // 用户只能等 20s 超时，看着 token 继续烧。
+          disabled: snap.generating ? false : snap.loading || snap.repos.length === 0,
         },
         snap.generating ? "停止生成" : "生成解读",
       ),
@@ -1960,6 +2021,43 @@ function StatusLine({ snap }) {
       h("span", { className: "gt-running-text" }, first ? "正在抓取 GitHub…" : "正在刷新榜单…"),
     );
   }
+  // 讨论的两条回执讲的是「你刚才那一按的结果」，比榜单状态更该优先显示：
+  // 先判回执，再判 httpError / loaded。否则上一次生成超时的红字会原样留着，
+  // 把「开会话失败了，因为…」整个吞掉——用户看到的还是几分钟前的错误。
+  if (snap.discussError || snap.discussNotice) {
+    const base = snap.loaded
+      ? h(
+          "p",
+          { className: "gt-notice" },
+          snap.view === "rising" ? "近 7 天新建的高增长仓库" : "GitHub Trending · " + snap.settings.period,
+          snap.view === "trending" && snap.settings.language ? " · " + snap.settings.language : "",
+          snap.isFirstRun ? " · 首次抓取，下次刷新可看到排名变化" : "",
+          !snap.isFirstRun && snap.repos.length > 0 && !hasRankChange(snap.repos) ? " · 与上次相比排名无变化" : "",
+        )
+      : null;
+    return h(
+      "div",
+      { className: "gt-status-rows" },
+      base,
+      snap.discussError
+        ? h("p", { className: "gt-notice gt-notice--error", role: "status" }, snap.discussError)
+        : h(
+            "p",
+            { className: "gt-notice gt-notice--ok", role: "status" },
+            h("span", null, "已在侧栏为 " + snap.discussNotice + " 开了会话"),
+            h("span", { className: "gt-notice-hint" }, "本页不会自动跳转，点侧栏里那一行打开"),
+          ),
+      // 榜单自己的错误不能被回执顶掉：两件事并列说清楚，别二选一。
+      snap.httpError
+        ? h(
+            "p",
+            { className: "gt-notice gt-notice--error", role: "status" },
+            h("span", null, snap.httpError),
+            snap.repos.length > 0 ? h("span", { className: "gt-notice-hint" }, "（当前显示的是上次的结果）") : null,
+          )
+        : null,
+    );
+  }
   if (snap.httpError) {
     const cacheHint = snap.repos.length > 0;
     return h(
@@ -1970,11 +2068,9 @@ function StatusLine({ snap }) {
     );
   }
   if (!snap.loaded) return h("p", { className: "gt-notice" }, "点「刷新」拉取榜单。");
-  // 讨论的回执和榜单说明并列，不互相顶替：回执说的是「你刚才那一按的结果」，
+  // 回执和榜单说明并列，不互相顶替：回执说的是「你刚才那一按的结果」，
   // 榜单行说的是「你现在在看什么数据」，两件事都得在场。
-  // 位置放在榜单行之后，而不是最前面——前面会被「正在刷新榜单…」吞掉，
-  // 那正是最容易让人以为按钮没反应的时候。
-  const base = h(
+  return h(
     "p",
     { className: "gt-notice" },
     snap.view === "rising" ? "近 7 天新建的高增长仓库" : "GitHub Trending · " + snap.settings.period,
@@ -1982,20 +2078,6 @@ function StatusLine({ snap }) {
     snap.isFirstRun ? " · 首次抓取，下次刷新可看到排名变化" : "",
     // 没有变化时整榜都没有涨跌标签，不说明会让人以为标签没渲染出来
     !snap.isFirstRun && snap.repos.length > 0 && !hasRankChange(snap.repos) ? " · 与上次相比排名无变化" : "",
-  );
-  if (!snap.discussError && !snap.discussNotice) return base;
-  return h(
-    "div",
-    { className: "gt-status-rows" },
-    base,
-    snap.discussError
-      ? h("p", { className: "gt-notice gt-notice--error", role: "status" }, snap.discussError)
-      : h(
-          "p",
-          { className: "gt-notice gt-notice--ok", role: "status" },
-          h("span", null, "已在侧栏为 " + snap.discussNotice + " 开了会话"),
-          h("span", { className: "gt-notice-hint" }, "本页不会自动跳转，点侧栏里那一行打开"),
-        ),
   );
 }
 
@@ -2367,25 +2449,56 @@ function Dropdown(props) {
     setFocusIdx(i);
   };
 
-  const onTriggerKeyDown = (ev) => {
+  /**
+   * 键盘处理挂在**容器**上，不是 trigger 上。
+   *
+   * 菜单一打开，useEffect 会把焦点移到 option 上（option 带 tabIndex=-1），
+   * 此后按键事件从 option 冒泡到容器。只挂在 trigger 上的话，打开之后方向键、
+   * Enter 确认、Esc 关闭全部失灵——只剩鼠标能用。
+   *
+   * 容器与 trigger 不能各挂一个：同一事件会冒泡两遍，Enter 会触发两次
+   * onChange。所以只有一个 handler，靠 `ev.target` 认来源。
+   */
+  const onKeyDown = (ev) => {
     if (props.disabled) return;
+    // 按 className 认来源，不用 triggerRef.current：ref 在假宿主/替身里
+    // 未必被赋值，一旦为 null 判断就会恒假，空格键静默失效。
+    const t = ev && ev.target;
+    const onTrigger = Boolean(
+      t && typeof t.className === "string" && t.className.split(/\s+/).includes("gt-dd-trigger"),
+    );
     if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
       ev.preventDefault();
       if (!open) openMenu();
       else move(ev.key === "ArrowDown" ? 1 : -1);
-    } else if (ev.key === "Enter" || ev.key === " ") {
+    } else if (ev.key === "Enter") {
       ev.preventDefault();
       if (open) choose(items[focusIdx]);
       else openMenu();
+    } else if (ev.key === " ") {
+      // 空格只在 trigger 上当「打开」：菜单项里按空格同理会冒泡到这里，
+      // 但那是可滚动列表，别为了这个吃掉滚动键。
+      if (onTrigger) {
+        ev.preventDefault();
+        if (open) choose(items[focusIdx]);
+        else openMenu();
+      }
     } else if (ev.key === "Escape" && open) {
       ev.preventDefault();
+      setOpen(false);
+    } else if (ev.key === "Tab" && open) {
+      // 焦点会离开这个组件；scrim 是 fixed 全屏，不关掉会留下一层看不见的
+      // 遮罩继续吞点击。
       setOpen(false);
     }
   };
 
   return h(
     "div",
-    { className: "gt-dd" + (open ? " is-open" : "") + (up ? " is-up" : "") },
+    {
+      className: "gt-dd" + (open ? " is-open" : "") + (up ? " is-up" : ""),
+      onKeyDown,
+    },
     h(
       "button",
       {
@@ -2396,7 +2509,6 @@ function Dropdown(props) {
         "aria-haspopup": "listbox",
         "aria-expanded": open,
         onClick: () => (open ? setOpen(false) : openMenu()),
-        onKeyDown: onTriggerKeyDown,
       },
       h("span", { className: "gt-dd-value" + (selected ? "" : " is-empty") }, selected ? selected.label : placeholder),
       h("span", { className: "gt-dd-caret", "aria-hidden": "true" }),
@@ -3312,9 +3424,9 @@ export default function activate(ctx) {
     activateSeq += 1;
     genSeq += 1;
     digestSeq += 1;
-    const session = activeDigest;
-    if (session) session.cancelled = true;
-    disposeSession(session, (runId) => ctx.agent.interrupt(runId));
+    // 讨论也一起作废：卸载期间在飞的 startRun 回来后不能往 store 里写回执。
+    discussSeq += 1;
+    cancelSession(activeDigest, ctx);
     try {
       cssDisposer();
     } catch {
@@ -3328,6 +3440,9 @@ export default function activate(ctx) {
       repos: [],
       loaded: false,
       httpError: "",
+      discussing: "",
+      discussError: "",
+      discussNotice: "",
     });
   };
 

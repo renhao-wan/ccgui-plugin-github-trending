@@ -188,6 +188,24 @@ function findByText(node, text) {
   return hit;
 }
 
+/**
+ * 把插件里那些「等 30s / 120s」的超时压缩到可测的尺度。
+ *
+ * 插件里的 withTimeout 直接调全局 setTimeout（宿主环境本来就是这样），
+ * 所以在用例内临时换掉 globalThis.setTimeout 就能让超时路径在几百毫秒内
+ * 走完，而不必真的等两分钟。只改 ≥30s 的延时：HTTP 的 20s、防抖与动画
+ * 一律保持原样，否则正常请求会被误判成超时。
+ */
+async function withFastTimeouts(ms, fn) {
+  const real = globalThis.setTimeout;
+  globalThis.setTimeout = (cb, delay, ...rest) => real(cb, delay >= 30000 ? ms : delay, ...rest);
+  try {
+    return await fn();
+  } finally {
+    globalThis.setTimeout = real;
+  }
+}
+
 function countByType(node, type) {
   let n = 0;
   walk(node, (x) => {
@@ -266,7 +284,7 @@ const GOOD_SEARCH = {
   }),
 };
 let searchPayload = GOOD_SEARCH;
-let agentMode = "stream"; // stream | error | silent | slow-start
+let agentMode = "stream"; // stream | error | silent | slow-start | hang
 let agentStartDelay = 200;
 let agentRunIdx = 0;
 
@@ -426,6 +444,11 @@ const ctx = {
       if (agentMode === "slow-start") {
         // start 迟迟不 resolve：用来验证「start 在飞时点停止」不会留下孤儿进程
         await sleep(agentStartDelay);
+        return { runId, sessionId: null };
+      }
+      if (agentMode === "hang") {
+        // 起了进程但一个事件都不推、也不结束：模拟模型卡死。
+        // 只有插件自己的超时能把用户从这个状态里放出来。
         return { runId, sessionId: null };
       }
       setTimeout(() => {
@@ -793,6 +816,47 @@ await check("开会话成功后回执会话去了侧栏，并说明本页不跳�
   assert.ok(await waitFor(() => !textOf(render()).includes("已在侧栏")), "刷新后回执应消失");
 });
 
+await check("生成中刷新榜单，停止按钮仍然点得动", async () => {
+  // 刷新一进来就把 loading 置真，而刷新并不中止解读。按钮若跟着 loading
+  // 一起禁用，用户就只能等 20s 超时、看着 token 继续烧。
+  agentMode = "silent";
+  const originalInvoke = ctx.bridge.invoke;
+  let trendingDelay = 0;
+  ctx.bridge.invoke = async (cmd, args) => {
+    if (args.url.includes("/trending") && trendingDelay) await sleep(trendingDelay);
+    return originalInvoke(cmd, args);
+  };
+  try {
+    findByText(render(), "生成解读").props.onClick();
+    assert.ok(await waitFor(() => !!findByText(render(), "停止生成")), "应进入生成中");
+
+    trendingDelay = 200;
+    findByText(render(), "刷新").props.onClick();
+    await sleep(30);
+    const stop = findByText(render(), "停止生成");
+    assert.ok(stop, "刷新期间仍应是停止按钮");
+    assert.notEqual(stop.props.disabled, true, "生成中不该被刷新禁掉");
+
+    const before = agentInterrupts.length;
+    await sleep(60);
+    findByText(render(), "停止生成").props.onClick();
+    assert.ok(await waitFor(() => agentInterrupts.length > before), "点了就该 interrupt");
+  } finally {
+    trendingDelay = 0;
+    ctx.bridge.invoke = originalInvoke;
+    agentMode = "stream";
+    // 必须等这次慢刷新落地再退出：留着在飞的 loading，下一条用例刚点的
+    // 生成结果会被「正在刷新榜单…」盖住，失败原因看起来像丢了。
+    assert.ok(
+      await waitFor(() => {
+        const btn = findByText(render(), "刷新");
+        return btn && btn.props["aria-busy"] === "false";
+      }, 2000),
+      "慢刷新应落地",
+    );
+  }
+});
+
 await check("模型报错时显示原因并复位按钮", async () => {
   agentMode = "error";
   findByText(render(), "生成解读").props.onClick();
@@ -910,6 +974,38 @@ function findTrigger(node, label) {
   return hit;
 }
 
+/**
+ * 按触发器文本找到整个下拉容器。
+ *
+ * 键盘处理挂在容器上（菜单打开后焦点会被移到 option 上，只挂 trigger 的话
+ * 方向键、Enter、Esc 全部失灵），所以用例必须拿到容器本身，而不是 trigger。
+ */
+function dropdownFor(node, label) {
+  let trigger = null;
+  walk(node, (n) => {
+    if (trigger || n.type !== "button") return;
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-dd-trigger") && textOf(n).includes(label)) trigger = n;
+  });
+  if (!trigger) return null;
+
+  // 取「包含 trigger 的最内层 gt-dd」：外层可能是别的下拉，用最后一个命中。
+  let hit = null;
+  const contains = (n) => {
+    if (n === trigger) return true;
+    if (!n || typeof n !== "object") return false;
+    return (n.children || []).some(contains);
+  };
+  walk(node, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c !== "string" || !c.split(/\s+/).includes("gt-dd")) return;
+    if (contains(n)) hit = n;
+  });
+  return hit;
+}
+
+const isOpen = (node) => Boolean(node && /(?:^|\s)is-open(?:\s|$)/.test(String(node.props.className)));
+
 await check("设置页：分节布局，改动自动保存", async () => {
   renderFresh(settingsDef.component, {}, { effects: true });
   await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("中文解读"));
@@ -968,6 +1064,60 @@ await check("设置页：时间档与阈值用下拉而不是手填", async () =
     if (n.type === "input" && n.props && n.props.type === "number") numberInputs += 1;
   });
   assert.equal(numberInputs, 0, "阈值不应是手填数字框");
+});
+
+await check("下拉能用键盘操作：方向键移动、Enter 确认、Esc 关闭", async () => {
+  // 键只挂在容器上：菜单一打开焦点就移到 option 上，只挂 trigger 会让
+  // 方向键 / Enter / Esc 全部失灵，只剩鼠标可用。
+  renderFresh(settingsDef.component, {}, { effects: true });
+  assert.ok(await waitFor(() => !!findTrigger(renderFresh(settingsDef.component, {}, { effects: true }), "今日"), 1500));
+
+  const press = (key, target) => {
+    const ev = { key, preventDefault() {}, target };
+    const dd = dropdownFor(renderKeep(settingsDef.component, {}), "今日");
+    assert.ok(dd, "应能找到下拉容器");
+    dd.props.onKeyDown(ev);
+  };
+  const openState = () => {
+    const dd = dropdownFor(renderKeep(settingsDef.component, {}), "今日");
+    return isOpen(dd);
+  };
+  const activeLabel = () => {
+    let hit = null;
+    walk(renderKeep(settingsDef.component, {}), (n) => {
+      const c = n.props && n.props.className;
+      if (hit || typeof c !== "string" || !c.split(/\s+/).includes("gt-dd-item")) return;
+      if (c.split(/\s+/).includes("is-active")) hit = textOf(n);
+    });
+    return hit;
+  };
+
+  assert.equal(openState(), false, "初始应为收起");
+  // 触发器上按方向键直接展开，并把焦点放到当前值（今日）
+  press("ArrowDown", { className: "gt-dd-trigger" });
+  assert.equal(openState(), true, "方向键应能展开");
+  assert.match(activeLabel() || "", /今日/, "焦点应从当前值开始");
+
+  press("ArrowDown", { className: "gt-dd-item" });
+  assert.match(activeLabel() || "", /本周/, "ArrowDown 应下移一项");
+  press("ArrowUp", { className: "gt-dd-item" });
+  assert.match(activeLabel() || "", /今日/, "ArrowUp 应上移一项");
+
+  // Enter 确认当前项；值没变时 onChange 不该被调用（这里今日就是当前值）
+  press("Enter", { className: "gt-dd-item" });
+  assert.equal(openState(), false, "Enter 应确认并收起");
+
+  press("Escape", { className: "gt-dd-trigger" }); // 收起状态按 Esc 无副作用
+  press("ArrowDown", { className: "gt-dd-trigger" });
+  assert.equal(openState(), true);
+  press("Escape", { className: "gt-dd-item" });
+  assert.equal(openState(), false, "Esc 应关闭菜单");
+
+  // Tab 离开组件：scrim 是全屏的，不关掉会留一层看不见的遮罩吞点击
+  press("ArrowDown", { className: "gt-dd-trigger" });
+  assert.equal(openState(), true);
+  press("Tab", { className: "gt-dd-item" });
+  assert.equal(openState(), false, "Tab 离开时应关闭菜单");
 });
 
 await check("设置页：工作区用只读路径 + 选择按钮，不是下拉也不是手填", async () => {
@@ -1157,6 +1307,51 @@ await check("start 还没返回时点停止，拿到 runId 后仍会 interrupt",
 
   agentMode = "stream";
   agentStartDelay = 200;
+});
+
+await check("生成超时后同样要打断宿主，不能只是插件放手", async () => {
+  // 超时和「用户点停止」是同一类事：插件不再管这一轮，但宿主那侧的进程还在。
+  // 如果只在 cancelled 时才 interrupt，这里会留下一个跑满全程的孤儿。
+  agentMode = "hang";
+  let before = 0;
+  try {
+    await withFastTimeouts(120, async () => {
+      before = agentInterrupts.length;
+      findByText(render(), "生成解读").props.onClick();
+      assert.ok(await waitFor(() => !!findByText(render(), "停止生成")), "应进入生成中");
+      assert.ok(
+        await waitFor(() => textOf(render()).includes("生成超时"), 3000),
+        "超时后应告诉用户发生了什么",
+      );
+    });
+  } finally {
+    agentMode = "stream";
+  }
+  assert.ok(findByText(render(), "生成解读"), "超时后按钮应复位，能重试");
+  assert.ok(
+    await waitFor(() => agentInterrupts.length > before, 1000),
+    "超时后应 interrupt，避免宿主继续烧 token",
+  );
+});
+
+await check("开会话挂住时会在 30 秒后放手并说明原因", async () => {
+  // 开会话期间全榜的讨论按钮都是禁用的：挂住不给出口，等于整页功能不可用。
+  const original = ctx.sessions.startRun;
+  ctx.sessions.startRun = () => new Promise(() => {});
+  try {
+    await withFastTimeouts(120, async () => {
+      discussButtonFor(render(), "beta/two").props.onClick();
+      assert.ok(await waitFor(() => textOf(render()).includes("打开中")), "应显示打开中");
+      assert.ok(
+        await waitFor(() => textOf(render()).includes("宿主没有及时建起会话"), 3000),
+        "超时后要说明原因",
+      );
+    });
+  } finally {
+    ctx.sessions.startRun = original;
+  }
+  assert.ok(findByText(render(), "讨论"), "按钮应回到可点状态，可以直接再点一次");
+  assert.equal(discussButtonFor(render(), "alpha/one").props.disabled, false, "别的行也应解除禁用");
 });
 
 await check("start 期间切视图，同样不会留下孤儿进程", async () => {

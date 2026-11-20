@@ -127,3 +127,22 @@ test("parseTrending 解码实体与数字实体", () => {
   const html = `<article class="Box-row"><h2><a href="/a/b">x</a></h2><p class="col-9">&#128293; hot &mdash; ok</p></article>`;
   assert.equal(parseTrending(html).repos[0].description, "🔥 hot — ok");
 });
+
+/** 色点值会原样进渲染层的 style，不能只看正常值的用例。 */
+test("语言色点只接受颜色白名单，其余一律丢弃", () => {
+  const dot = (value) => `<article class="Box-row"><h2><a href="/a/b">x</a></h2>
+    <span class="repo-language-color" style="background-color: ${value}"></span></article>`;
+  const color = (value) => parseTrending(dot(value)).repos[0].languageColor;
+
+  assert.equal(color("#3572A5"), "#3572A5", "正常十六进制应保留");
+  assert.equal(color("#89e051"), "#89e051");
+  assert.equal(color("rgb(46, 160, 67)"), "rgb(46, 160, 67)");
+  assert.equal(color("rgba(46,160,67,0.5)"), "rgba(46,160,67,0.5)");
+
+  // url() 是合法 CSS 值，会让渲染进程绕过插件的 network 白名单直接发请求
+  assert.equal(color("url(https://attacker.example/x.png)"), "", "url() 必须丢弃");
+  assert.equal(color("red; background: url(http://x/y)"), "");
+  assert.equal(color("expression(alert(1))"), "");
+  assert.equal(color("var(--evil)"), "");
+  assert.equal(color(""), "");
+});

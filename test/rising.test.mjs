@@ -58,6 +58,19 @@ test("parseRising 缺 stars 时给 null 而不是 NaN", () => {
   assert.equal(out.repos[0].ageDays, null);
 });
 
+test("items 里的坏元素被跳过，不会让整榜抛错", () => {
+  // GitHub 在分页边界返回过 null 元素；直接读 item.full_name 会整页 TypeError。
+  const out = parseRising({
+    items: [null, { full_name: "good/one" }, undefined, "junk", 42, { full_name: "good/two" }],
+  });
+  assert.equal(out.error, null);
+  assert.deepEqual(out.repos.map((r) => r.repo), ["good/one", "good/two"]);
+});
+
+test("全是坏元素时按空结果处理，而不是崩溃", () => {
+  assert.equal(parseRising({ items: [null, undefined] }).error, "no_items");
+});
+
 test("描述里的换行被折叠，防止伪造榜单行", () => {
   const out = parseRising({
     items: [
