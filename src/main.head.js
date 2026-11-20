@@ -72,6 +72,13 @@ const DEFAULT_STATE = {
   discussing: "",
   /** 开会话失败的原因。会话是真 token，失败必须说明白，不能静默。 */
   discussError: "",
+  /**
+   * 已开好会话的仓库全名；空串 = 没有待确认的会话。
+   *
+   * 本页不会自动跳到新会话（`startRun` 没有这个能力，详见 discussRepo），
+   * 所以「已经开了」这件事必须由页面说出来，否则点完跟没点一样。
+   */
+  discussNotice: "",
   catalog: [],
   catalogLoaded: false,
   modelsLoading: false,
@@ -425,7 +432,16 @@ async function refresh(ctx, options) {
 
   const seq = ++genSeq;
 
-  set({ loading: true, httpError: "", parseError: "", errorKind: "" });
+  // 讨论的回执只服务于那一次点击：刷新是用户明确表示的「再来一次」，
+  // 回执要让位给榜单本身的状态说明，失败的那条同理。
+  set({
+    loading: true,
+    httpError: "",
+    parseError: "",
+    errorKind: "",
+    discussError: "",
+    discussNotice: "",
+  });
 
   let result;
   try {
@@ -713,6 +729,13 @@ let discussSeq = 0;
  *
  * 不走 activeDigest 那套「start 在飞时点停止」的状态机：会话一旦建起来就归
  * 宿主聊天托管，插件的责任只有「别开两轮」和「失败要说清楚」。
+ *
+ * **不会跳转**，这是 API 决定的：`startRun` 只承诺「会话立刻出现在侧栏」，
+ * 入参里没有任何切视图的字段。真正切视图的是 `selectSession(engine,
+ * sessionId, workspacePath)`，而新会话的 sessionId 从 `startRun` 拿不到可靠值
+ * （文档：引擎稍后才 announce 时为 null）。所以这里不硬凑一条「订阅回执再补
+ * 跳」的链子——那种延迟跳转会在用户已经切去别处之后把人拽回来。代价是本页
+ * 停在原地，由 `discussNotice` 在提示行里说明会话去哪了。
  */
 async function discussRepo(ctx, row) {
   const snap = store.snap;
@@ -724,7 +747,9 @@ async function discussRepo(ctx, row) {
   }
 
   const seq = ++discussSeq;
-  set({ discussing: row.repo, discussError: "" });
+  // 新的一轮先把上一条「已开会话」提示收掉：否则连续点两行，页面会同时说
+  // 两个仓库都开了会话，而实际只留了最后那条。
+  set({ discussing: row.repo, discussError: "", discussNotice: "" });
   const settings = snap.settings;
   const bailed = (message) => {
     if (seq === discussSeq) set({ discussing: "", discussError: message });
@@ -758,13 +783,17 @@ async function discussRepo(ctx, row) {
     });
 
     // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。
+    // 返回的 sessionId 这里不用：startRun 文档写明引擎可能稍后才 announce，
+    // 此时是 null。拿它去 selectSession 会有一半时候跳不动，详见 discussRepo 头注释。
     await ctx.sessions.startRun({
       engine: entry.engine,
       model: model || undefined,
       prompt,
       workspacePath: workspace,
     });
-    if (seq === discussSeq) set({ discussing: "", discussError: "" });
+    // 不跳转这件事必须写在页面上。侧栏多一行对正在扫榜的人是很容易错过的，
+    // 不给提示就会被理解成「按钮没反应」，进而连点，多开一轮真 token。
+    if (seq === discussSeq) set({ discussing: "", discussError: "", discussNotice: row.repo });
   } catch (error) {
     // 用原始 message 判权限，不要过 messageOf：那边把 "missing permission"
     // 一概当网络授权问题，会把「没装 host:session」误报成「重新安装插件」。
@@ -1033,7 +1062,7 @@ function Toolbar({ snap, ctx }) {
   const onView = (view) => {
     if (view === snap.view) return;
     if (snap.generating) stopDigest(ctx);
-    set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false, discussError: "" });
+    set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false, discussError: "", discussNotice: "" });
     void refresh(ctx, { force: true });
   };
   const onPeriod = (period) => {
@@ -1041,7 +1070,7 @@ function Toolbar({ snap, ctx }) {
     if (snap.generating) stopDigest(ctx);
     setSettings({ period });
     void persistSettings(ctx, { period });
-    set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [], discussError: "" });
+    set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [], discussError: "", discussNotice: "" });
     void refresh(ctx, { force: true });
   };
 
@@ -1118,14 +1147,11 @@ function StatusLine({ snap }) {
     );
   }
   if (!snap.loaded) return h("p", { className: "gt-notice" }, "点「刷新」拉取榜单。");
-  if (snap.discussError) {
-    return h(
-      "div",
-      { className: "gt-notice gt-notice--error", role: "status" },
-      h("span", null, snap.discussError),
-    );
-  }
-  return h(
+  // 讨论的回执和榜单说明并列，不互相顶替：回执说的是「你刚才那一按的结果」，
+  // 榜单行说的是「你现在在看什么数据」，两件事都得在场。
+  // 位置放在榜单行之后，而不是最前面——前面会被「正在刷新榜单…」吞掉，
+  // 那正是最容易让人以为按钮没反应的时候。
+  const base = h(
     "p",
     { className: "gt-notice" },
     snap.view === "rising" ? "近 7 天新建的高增长仓库" : "GitHub Trending · " + snap.settings.period,
@@ -1133,6 +1159,20 @@ function StatusLine({ snap }) {
     snap.isFirstRun ? " · 首次抓取，下次刷新可看到排名变化" : "",
     // 没有变化时整榜都没有涨跌标签，不说明会让人以为标签没渲染出来
     !snap.isFirstRun && snap.repos.length > 0 && !hasRankChange(snap.repos) ? " · 与上次相比排名无变化" : "",
+  );
+  if (!snap.discussError && !snap.discussNotice) return base;
+  return h(
+    "div",
+    { className: "gt-status-rows" },
+    base,
+    snap.discussError
+      ? h("p", { className: "gt-notice gt-notice--error", role: "status" }, snap.discussError)
+      : h(
+          "p",
+          { className: "gt-notice gt-notice--ok", role: "status" },
+          h("span", null, "已在侧栏为 " + snap.discussNotice + " 开了会话"),
+          h("span", { className: "gt-notice-hint" }, "本页不会自动跳转，点侧栏里那一行打开"),
+        ),
   );
 }
 
@@ -2045,7 +2085,13 @@ const CSS = `
 }
 .gt-stamp { font-size: 11px; opacity: 0.55; white-space: nowrap; }
 .gt-notice { margin: 0; font-size: 12px; opacity: 0.7; }
+/* 状态区可能同时有两件事要说（在看什么数据 + 刚才那一按的结果）。
+ * 合成一列而不是二选一，两句话都短，叠起来还不到原来两行的钱。 */
+.gt-status-rows { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .gt-notice--error { color: var(--gt-negative); opacity: 1; display: flex; gap: 6px; flex-wrap: wrap; }
+/* 开会话成功：用正向色而不是中性灰。它是一条「你做了一件事，结果是好的」
+ * 的回执，不是背景说明，灰掉就等于没说。 */
+.gt-notice--ok { color: var(--gt-positive); opacity: 1; display: flex; gap: 6px; flex-wrap: wrap; }
 .gt-notice-hint { opacity: 0.7; }
 /* 抓取中：提示行里放一枚转圈，用户能确认进程还活着，而不是页面卡住了 */
 .gt-notice.gt-running {

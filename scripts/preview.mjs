@@ -295,6 +295,51 @@ const digestFlow = await (async () => {
   return { half, full };
 })();
 
+/* 讨论成功回执：点一行「讨论」之后页面上会多一句「已在侧栏为 … 开了会话」。
+ * 这一屏专门核对那句提示的层级——它必须读起来比榜单说明更「是你刚才做的事」，
+ * 又不能在扫榜时抢掉仓库名的注意力。 */
+const discussHtml = await (async () => {
+  let discTab = null;
+  const discMod = await import(pathToFileURL(path.join(ROOT, "main.js")).href + "?discuss=1");
+  discMod.default(
+    Object.assign({}, ctx, {
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: (d) => {
+          discTab = d;
+          return () => {};
+        },
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: () => () => {},
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  if (!discTab) return "";
+  await new Promise((r) => setTimeout(r, 60));
+
+  const findDiscuss = (node) => {
+    let hit = null;
+    const walkTree = (n) => {
+      if (hit || !n || typeof n !== "object") return;
+      if (Array.isArray(n)) return n.forEach(walkTree);
+      const c = n.props && n.props.className;
+      if (typeof c === "string" && c.split(/\s+/).includes("gt-discuss")) {
+        hit = n;
+        return;
+      }
+      (n.children || []).forEach(walkTree);
+    };
+    walkTree(node);
+    return hit;
+  };
+
+  const btn = findDiscuss(await renderTreeWithEffects(discTab.component));
+  if (!btn) return "";
+  btn.props.onClick();
+  await new Promise((r) => setTimeout(r, 120));
+  return render(await renderTreeWithEffects(discTab.component));
+})();
+
 /* 抓取中的样子：另开一份模块实例（独立 store），让 Trending 请求一直挂起，
  * 这样就能抓到「第一次打开、还没数据」的那一屏。 */
 holdTrending = true;
@@ -375,6 +420,10 @@ const html = `<!doctype html>
   <div class="tab-host dark" id="tab-loading-dark"></div>
   <h2>中心页签 · 榜单（深色）</h2>
   <div class="tab-host dark" id="tab-host-dark"></div>
+  <h2>中心页签 · 点「讨论」后的回执</h2>
+  <div class="tab-host" id="tab-discuss"></div>
+  <h2>中心页签 · 点「讨论」后的回执（深色）</h2>
+  <div class="tab-host dark" id="tab-discuss-dark"></div>
   <h2>解读 · 生成中（流式渲染 Markdown）</h2>
   <div class="tab-host" id="tab-digest-half"></div>
   <h2>解读 · 完成（表格 + 粗体 + 行内代码）</h2>
@@ -390,6 +439,8 @@ const html = `<!doctype html>
   document.getElementById("tab-loading").innerHTML = ${JSON.stringify(loadingHtml)};
   document.getElementById("tab-first").innerHTML = ${JSON.stringify(firstHtml)};
   document.getElementById("tab-host-dark").innerHTML = ${JSON.stringify(darkTabHtml)};
+  document.getElementById("tab-discuss").innerHTML = ${JSON.stringify(discussHtml)};
+  document.getElementById("tab-discuss-dark").innerHTML = ${JSON.stringify(asDark(discussHtml))};
   document.getElementById("tab-loading-dark").innerHTML = ${JSON.stringify(darkLoadingHtml)};
   document.getElementById("tab-digest-half").innerHTML = ${JSON.stringify(digestFlow.half)};
   document.getElementById("tab-digest-full").innerHTML = ${JSON.stringify(digestFlow.full)};

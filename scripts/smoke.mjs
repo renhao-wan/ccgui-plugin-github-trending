@@ -649,32 +649,20 @@ await check("解读只显示不落盘", async () => {
 
 /* ---------- 单个仓库的讨论会话 ---------- */
 
-/** 讨论按钮只在这一行的标题行里；按仓库名定位，避免点到别的行。 */
+/**
+ * 讨论按钮只在这一行的标题行里；按仓库名定位，避免点到别的行。
+ *
+ * 用 aria-label 精确匹配：行文本里仓库名是渲染成 `owner / name`（中间有空格），
+ * 拿 `owner/name` 去 includes 永远不成立，会静默退回「第一个按钮」——那会让
+ * 「点 A 行却开的是 B 行」这种真 bug 看起来像通过。
+ */
 function discussButtonFor(tree, repo) {
   let hit = null;
+  const label = "就 " + repo + " 开会话";
   walk(tree, (n) => {
     if (hit || n.type !== "button") return;
-    const c = n.props && n.props.className;
-    if (typeof c !== "string" || !c.split(/\s+/).includes("gt-discuss")) return;
-    if (String(n.props.title || "").length === 0) return;
-    // 按钮本身不带仓库名，靠它在哪一行来认：向上找最近的 li，看标题文字
-    hit = hit || n;
+    if (n.props && n.props["aria-label"] === label) hit = n;
   });
-  // 精确版本：遍历 li，找该行里的讨论按钮
-  const rows = [];
-  walk(tree, (n) => {
-    if (n.type === "li" && (n.props && n.props.className || "").split(/\s+/).includes("gt-row")) rows.push(n);
-  });
-  for (const li of rows) {
-    if (!textOf(li).includes(repo)) continue;
-    let btn = null;
-    walk(li, (n) => {
-      if (btn || n.type !== "button") return;
-      const c = n.props && n.props.className;
-      if (typeof c === "string" && c.split(/\s+/).includes("gt-discuss")) btn = n;
-    });
-    if (btn) return btn;
-  }
   return hit;
 }
 
@@ -779,6 +767,30 @@ await check("宿主没有 sessions 时按钮给出升级提示", async () => {
   } finally {
     ctx.sessions = saved;
   }
+});
+
+await check("开会话成功后回执会话去了侧栏，并说明本页不跳转", async () => {
+  sessionStartError = null;
+  sessionStarts.length = 0;
+  discussButtonFor(render(), "beta/two").props.onClick();
+  // 成功了却一声不响，用户会以为按钮没反应，进而连点开出好几轮真 token。
+  assert.ok(
+    await waitFor(() => textOf(render()).includes("已在侧栏为 beta/two 开了会话")),
+    "应回执会话已开",
+  );
+  assert.match(textOf(render()), /不会自动跳转/, "要说明本页不跳转");
+
+  // 再点另一行：上一条回执必须先收掉，否则页面会同时声称两个会话都在等。
+  discussButtonFor(render(), "alpha/one").props.onClick();
+  assert.ok(
+    await waitFor(() => textOf(render()).includes("已在侧栏为 alpha/one 开了会话")),
+    "应换成新的一条回执",
+  );
+  assert.ok(!textOf(render()).includes("beta/two 开了会话"), "旧回执应被替换");
+
+  // 刷新是用户明确表示的「再来一次」，回执要让位给榜单本身的状态说明。
+  findByText(render(), "刷新").props.onClick();
+  assert.ok(await waitFor(() => !textOf(render()).includes("已在侧栏")), "刷新后回执应消失");
 });
 
 await check("模型报错时显示原因并复位按钮", async () => {
