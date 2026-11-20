@@ -4,6 +4,14 @@
  */
 
 const DEFAULT_BUDGET = 6000;
+/** 单行描述上限：不设它的话，一条超长描述会撑爆预算，把整个榜单挤成 0 条。 */
+const MAX_DESCRIPTION = 160;
+
+function clip(text, max) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1).trimEnd() + "…";
+}
 
 function oneLine(row) {
   const bits = ["- " + row.repo];
@@ -14,7 +22,7 @@ function oneLine(row) {
   else if (Number.isFinite(row.rankDelta) && row.rankDelta !== 0) {
     bits.push((row.rankDelta > 0 ? "↑" : "↓") + Math.abs(row.rankDelta) + "位");
   }
-  if (row.description) bits.push("| " + row.description);
+  if (row.description) bits.push("| " + clip(row.description, MAX_DESCRIPTION));
   return bits.join(" ");
 }
 
@@ -62,6 +70,7 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
   const lines = [];
   let used = header.join("\n").length + footer.join("\n").length;
   let truncated = false;
+  let included = 0;
 
   for (const row of repos) {
     const line = oneLine(row);
@@ -71,11 +80,12 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
       break;
     }
     lines.push(line);
+    included += 1;
     used += line.length + 1;
   }
 
   if (truncated) {
-    lines.push("- （事实清单过长，已截断，仅保留前 " + lines.length + " 条）");
+    lines.push("- （事实清单过长，已截断，仅保留前 " + included + " 条）");
   }
 
   if (dropped.length > 0) {
@@ -89,7 +99,7 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
   return {
     prompt,
     truncated,
-    included: lines.filter((line) => line.startsWith("- ") && !line.includes("已截断")).length,
+    included,
     total: repos.length,
   };
 }

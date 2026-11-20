@@ -189,7 +189,8 @@ let openedSettings = 0;
 let openTabFailures = 0;
 
 let trendingPayload = { status: 200, body: trendingHtml(day1) };
-let searchPayload = {
+/** 原始新星库响应；用例改动 payload 后用它复位。 */
+const GOOD_SEARCH = {
   status: 200,
   body: JSON.stringify({
     total_count: 1,
@@ -206,6 +207,7 @@ let searchPayload = {
     ],
   }),
 };
+let searchPayload = GOOD_SEARCH;
 let agentMode = "stream"; // stream | error | silent
 let agentRunIdx = 0;
 
@@ -530,8 +532,53 @@ await check("卸载会中断在跑的 agent 并复位状态", async () => {
   agentMode = "stream";
 });
 
-/* ------------------------------------------------------------ 汇总 */
+await check("快速切换视图时晚到的响应不覆盖新视图", async () => {
+  // 前面的用例改过 payload，这里先复位成正常数据
+  trendingPayload = { status: 200, body: trendingHtml(day2) };
+  searchPayload = GOOD_SEARCH;
+  kv.delete("settings");
 
+  const originalInvoke = ctx.bridge.invoke;
+  let trendingDelay = 0;
+  ctx.bridge.invoke = async (cmd, args) => {
+    if (args.url.includes("/trending") && trendingDelay) await sleep(trendingDelay);
+    return originalInvoke(cmd, args);
+  };
+
+  trendingDelay = 150;
+  findByText(render(), "Trending").props.onClick();
+  await sleep(10);
+  // 立刻切到新星库（Trending 还在路上）
+  findByText(render(), "新星库（7 天）").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("fresh repo")), "新星库应先到");
+  await sleep(250); // 等慢的 Trending 响应回来
+  const text = textOf(render());
+  assert.match(text, /fresh repo/, "新星库内容应还在");
+  assert.doesNotMatch(text, /brand new repo/, "晚到的 Trending 不应覆盖新星库");
+
+  trendingDelay = 0;
+  ctx.bridge.invoke = originalInvoke;
+});
+
+// 放在最后：重新 import 会覆盖模块级的 tabDef/settingsDef，破坏前面用例的装配。
+await check("语言名含路径穿越时不会写到快照目录之外", async () => {
+  kv.set("settings", Object.assign({}, kv.get("settings") || {}, { language: "../../evil" }));
+  const fresh = await import(PLUGIN + "?lang-guard=" + Date.now());
+  const dispose2 = fresh.default(ctx);
+  renderFresh(tab(), {}, { effects: true });
+  await sleep(250);
+
+  assert.ok(!fs.existsSync(path.join(storageDir, "..", "evil.json")), "不应写到 storage 根之外");
+  const historyDir = path.join(storageDir, "history");
+  if (fs.existsSync(historyDir)) {
+    for (const name of fs.readdirSync(historyDir)) {
+      assert.doesNotMatch(name, /[\\/]/, "快照文件名不应含分隔符：" + name);
+    }
+  }
+  dispose2();
+});
+
+/* ------------------------------------------------------------ 汇总 */
 let failed = 0;
 for (const r of results) {
   if (r.ok) {

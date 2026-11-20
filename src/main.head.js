@@ -108,7 +108,6 @@ function useSnap() {
 
 let genSeq = 0;
 let digestSeq = 0;
-let loadController = null;
 let activeRunId = null;
 let activateSeq = 0;
 let digestPhase = 0;
@@ -179,14 +178,26 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+/**
+ * 语言名会进 URL 与快照文件名，先收敛成安全形状：
+ * 只允许字母/数字/加号/井号/点/连字符（覆盖 c++、c#、objective-c、f# 等），
+ * 其余一律换成连字符——这样 `../../evil`、`a/b`、绝对路径都拼不出目录穿越。
+ */
+function safeLanguage(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (!s) return "";
+  const cleaned = s.replace(/[^a-z0-9+#.-]/g, "-").replace(/^[.-]+/, "").replace(/[.-]+$/, "");
+  return cleaned.slice(0, 40);
+}
+
 function trendingUrl(period, language) {
-  const lang = String(language || "").trim().toLowerCase();
+  const lang = safeLanguage(language);
   const base = "https://github.com/trending" + (lang ? "/" + encodeURIComponent(lang) : "");
   return base + "?since=" + encodeURIComponent(period);
 }
 
 function historyPath(period, language) {
-  const suffix = String(language || "").trim().toLowerCase() || "all";
+  const suffix = safeLanguage(language) || "all";
   return HISTORY_DIR + "/" + period + "-" + suffix + ".json";
 }
 
@@ -353,15 +364,6 @@ async function refresh(ctx, options) {
   if (!force && snap.loaded && snap.source === view + ":" + period + ":" + language) return;
 
   const seq = ++genSeq;
-  if (loadController) {
-    try {
-      loadController.abort();
-    } catch {
-      /* 忽略 */
-    }
-  }
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  loadController = controller;
 
   set({ loading: true, httpError: "", parseError: "", errorKind: "" });
 
@@ -373,8 +375,8 @@ async function refresh(ctx, options) {
   }
 
   // 代际校验：用户可能已经切了视图、或发起了新一轮。
+  // 宿主桥没有 AbortSignal，晚到的响应只能靠这里丢弃。
   if (seq !== genSeq) return;
-  loadController = null;
 
   if (!result.ok) {
     const cached = view === "rising" ? null : await readSnapshot(ctx, period, language);
@@ -541,6 +543,7 @@ async function generateDigest(ctx) {
     settled = true;
     if (timer) clearTimeout(timer);
     activeRunId = null;
+    if (activeDigestOff === off) activeDigestOff = null;
     off();
     if (error && expectedRunId) {
       try {
@@ -581,7 +584,7 @@ async function generateDigest(ctx) {
   };
 
   const off = ctx.events.on("agent://" + PLUGIN_ID, onEvent);
-  digestDisposers.push(off);
+  activeDigestOff = off;
   timer = setTimeout(() => finish(new Error("生成超时")), AGENT_TIMEOUT_MS);
 
   try {
@@ -605,12 +608,22 @@ async function generateDigest(ctx) {
   }
 }
 
-const digestDisposers = [];
+/** 当前这一轮解读的事件订阅；每轮只有一条，结束时立即释放。 */
+let activeDigestOff = null;
 
 function stopDigest(ctx) {
   digestSeq += 1;
   const run = activeRunId;
   activeRunId = null;
+  if (activeDigestOff) {
+    const off = activeDigestOff;
+    activeDigestOff = null;
+    try {
+      off();
+    } catch {
+      /* 宿主可能已回收 */
+    }
+  }
   if (run) {
     try {
       void ctx.agent.interrupt(run);
@@ -1166,14 +1179,6 @@ export default function activate(ctx) {
     activateSeq += 1;
     genSeq += 1;
     digestSeq += 1;
-    if (loadController) {
-      try {
-        loadController.abort();
-      } catch {
-        /* 忽略 */
-      }
-      loadController = null;
-    }
     const run = activeRunId;
     activeRunId = null;
     if (run) {
@@ -1183,12 +1188,13 @@ export default function activate(ctx) {
         /* 已结束 */
       }
     }
-    for (const off of digestDisposers.splice(0)) {
+    if (activeDigestOff) {
       try {
-        off();
+        activeDigestOff();
       } catch {
         /* 宿主可能已回收 */
       }
+      activeDigestOff = null;
     }
     try {
       cssDisposer();

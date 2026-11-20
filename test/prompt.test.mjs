@@ -73,6 +73,27 @@ test("掉榜最多列 8 个并标出剩余数量", () => {
   assert.match(prompt, /另有 3 个/);
 });
 
+test("超长描述被裁剪，不会把整榜挤成 0 条", () => {
+  const long = { ...makeRepo(0), description: "x".repeat(20000) };
+  const out = buildDigestPrompt(base({ repos: [long, makeRepo(1)] }), 3000);
+  assert.equal(out.truncated, false);
+  assert.equal(out.included, 2, "两条都应保留；描述被裁到上限");
+  assert.ok(out.prompt.length < 3000);
+});
+
+test("单条独占预算时仍保留一条，而不是全丢", () => {
+  const long = { ...makeRepo(0), description: "y".repeat(5000) };
+  const out = buildDigestPrompt(base({ repos: [long] }), 2000);
+  assert.equal(out.included, 1);
+});
+
+test("included 不把掉榜行算进去", () => {
+  const out = buildDigestPrompt(
+    base({ repos: [makeRepo(0), makeRepo(1)], dropped: [{ repo: "gone/a" }, { repo: "gone/b" }] }),
+  );
+  assert.equal(out.included, 2);
+});
+
 test("空榜单不抛错", () => {
   const out = buildDigestPrompt(base({ repos: [] }));
   assert.equal(out.total, 0);

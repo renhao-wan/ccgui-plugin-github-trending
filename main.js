@@ -303,6 +303,14 @@ function snapshotSignature(repos) {
  */
 
 const DEFAULT_BUDGET = 6000;
+/** 单行描述上限：不设它的话，一条超长描述会撑爆预算，把整个榜单挤成 0 条。 */
+const MAX_DESCRIPTION = 160;
+
+function clip(text, max) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1).trimEnd() + "…";
+}
 
 function oneLine(row) {
   const bits = ["- " + row.repo];
@@ -313,7 +321,7 @@ function oneLine(row) {
   else if (Number.isFinite(row.rankDelta) && row.rankDelta !== 0) {
     bits.push((row.rankDelta > 0 ? "↑" : "↓") + Math.abs(row.rankDelta) + "位");
   }
-  if (row.description) bits.push("| " + row.description);
+  if (row.description) bits.push("| " + clip(row.description, MAX_DESCRIPTION));
   return bits.join(" ");
 }
 
@@ -361,6 +369,7 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
   const lines = [];
   let used = header.join("\n").length + footer.join("\n").length;
   let truncated = false;
+  let included = 0;
 
   for (const row of repos) {
     const line = oneLine(row);
@@ -370,11 +379,12 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
       break;
     }
     lines.push(line);
+    included += 1;
     used += line.length + 1;
   }
 
   if (truncated) {
-    lines.push("- （事实清单过长，已截断，仅保留前 " + lines.length + " 条）");
+    lines.push("- （事实清单过长，已截断，仅保留前 " + included + " 条）");
   }
 
   if (dropped.length > 0) {
@@ -388,7 +398,7 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
   return {
     prompt,
     truncated,
-    included: lines.filter((line) => line.startsWith("- ") && !line.includes("已截断")).length,
+    included,
     total: repos.length,
   };
 }
@@ -485,7 +495,6 @@ function useSnap() {
 
 let genSeq = 0;
 let digestSeq = 0;
-let loadController = null;
 let activeRunId = null;
 let activateSeq = 0;
 let digestPhase = 0;
@@ -556,14 +565,26 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+/**
+ * 语言名会进 URL 与快照文件名，先收敛成安全形状：
+ * 只允许字母/数字/加号/井号/点/连字符（覆盖 c++、c#、objective-c、f# 等），
+ * 其余一律换成连字符——这样 `../../evil`、`a/b`、绝对路径都拼不出目录穿越。
+ */
+function safeLanguage(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (!s) return "";
+  const cleaned = s.replace(/[^a-z0-9+#.-]/g, "-").replace(/^[.-]+/, "").replace(/[.-]+$/, "");
+  return cleaned.slice(0, 40);
+}
+
 function trendingUrl(period, language) {
-  const lang = String(language || "").trim().toLowerCase();
+  const lang = safeLanguage(language);
   const base = "https://github.com/trending" + (lang ? "/" + encodeURIComponent(lang) : "");
   return base + "?since=" + encodeURIComponent(period);
 }
 
 function historyPath(period, language) {
-  const suffix = String(language || "").trim().toLowerCase() || "all";
+  const suffix = safeLanguage(language) || "all";
   return HISTORY_DIR + "/" + period + "-" + suffix + ".json";
 }
 
@@ -730,15 +751,6 @@ async function refresh(ctx, options) {
   if (!force && snap.loaded && snap.source === view + ":" + period + ":" + language) return;
 
   const seq = ++genSeq;
-  if (loadController) {
-    try {
-      loadController.abort();
-    } catch {
-      /* 忽略 */
-    }
-  }
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  loadController = controller;
 
   set({ loading: true, httpError: "", parseError: "", errorKind: "" });
 
@@ -750,8 +762,8 @@ async function refresh(ctx, options) {
   }
 
   // 代际校验：用户可能已经切了视图、或发起了新一轮。
+  // 宿主桥没有 AbortSignal，晚到的响应只能靠这里丢弃。
   if (seq !== genSeq) return;
-  loadController = null;
 
   if (!result.ok) {
     const cached = view === "rising" ? null : await readSnapshot(ctx, period, language);
@@ -918,6 +930,7 @@ async function generateDigest(ctx) {
     settled = true;
     if (timer) clearTimeout(timer);
     activeRunId = null;
+    if (activeDigestOff === off) activeDigestOff = null;
     off();
     if (error && expectedRunId) {
       try {
@@ -958,7 +971,7 @@ async function generateDigest(ctx) {
   };
 
   const off = ctx.events.on("agent://" + PLUGIN_ID, onEvent);
-  digestDisposers.push(off);
+  activeDigestOff = off;
   timer = setTimeout(() => finish(new Error("生成超时")), AGENT_TIMEOUT_MS);
 
   try {
@@ -982,12 +995,22 @@ async function generateDigest(ctx) {
   }
 }
 
-const digestDisposers = [];
+/** 当前这一轮解读的事件订阅；每轮只有一条，结束时立即释放。 */
+let activeDigestOff = null;
 
 function stopDigest(ctx) {
   digestSeq += 1;
   const run = activeRunId;
   activeRunId = null;
+  if (activeDigestOff) {
+    const off = activeDigestOff;
+    activeDigestOff = null;
+    try {
+      off();
+    } catch {
+      /* 宿主可能已回收 */
+    }
+  }
   if (run) {
     try {
       void ctx.agent.interrupt(run);
@@ -1543,14 +1566,6 @@ export default function activate(ctx) {
     activateSeq += 1;
     genSeq += 1;
     digestSeq += 1;
-    if (loadController) {
-      try {
-        loadController.abort();
-      } catch {
-        /* 忽略 */
-      }
-      loadController = null;
-    }
     const run = activeRunId;
     activeRunId = null;
     if (run) {
@@ -1560,12 +1575,13 @@ export default function activate(ctx) {
         /* 已结束 */
       }
     }
-    for (const off of digestDisposers.splice(0)) {
+    if (activeDigestOff) {
       try {
-        off();
+        activeDigestOff();
       } catch {
         /* 宿主可能已回收 */
       }
+      activeDigestOff = null;
     }
     try {
       cssDisposer();
