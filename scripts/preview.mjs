@@ -82,7 +82,16 @@ const ctx = {
   theme: { injectCss: (s) => { injected.css = s; return () => {}; }, setTokens: () => () => {} },
   storage: { get: async () => null, set: async () => {}, delete: async () => {} },
   documentStorage: {
-    readText: async () => null,
+    // 给一份「上次快照」，让排名变化与新上榜在预览里能看出来
+    readText: async (rel) => {
+      if (!/daily-all\.json$/.test(rel)) return null;
+      const prev = [
+        { repo: "jingyaogong/minimind" },
+        { repo: "elementalsouls/Claude-BugHunter" },
+        { repo: "HKUDS/CLI-Anything" },
+      ];
+      return { content: JSON.stringify({ savedAt: new Date(now - 86400000).toISOString(), repos: prev }), version: "1" };
+    },
     writeTextAtomic: async () => ({ version: "1" }),
     remove: async () => {},
     list: async () => [],
@@ -161,6 +170,10 @@ fs.mkdirSync(path.dirname(OUT), { recursive: true });
 const tabHtml = await renderWithEffects(injected.tab.component);
 // 设置页的 effect 会拉引擎与工作区，同样需要跑一遍
 const settingsHtml = await renderWithEffects(injected.settings.component);
+
+if (process.argv.includes("--dump")) {
+  process.stdout.write(tabHtml + "\n");
+}
 
 const html = `<!doctype html>
 <html lang="zh-CN">

@@ -1203,10 +1203,17 @@ function gainLabel(period) {
 }
 
 function movementLabel(row) {
-  if (row.isNew) return "新";
+  if (row.isNew) return "新上榜";
   const delta = row.rankDelta;
   if (!Number.isFinite(delta) || delta === 0) return "";
   return delta > 0 ? "↑" + delta : "↓" + Math.abs(delta);
+}
+
+function movementClass(row) {
+  if (row.isNew) return " gt-move--new";
+  const delta = row.rankDelta;
+  if (!Number.isFinite(delta) || delta === 0) return "";
+  return delta > 0 ? " gt-move--up" : " gt-move--down";
 }
 
 function RepoRow({ row }) {
@@ -1234,7 +1241,7 @@ function RepoRow({ row }) {
             )
           : h("span", { className: "gt-repo" }, row.repo),
         movement
-          ? h("span", { className: "gt-move" + (row.isNew ? " gt-move--new" : "") }, movement)
+          ? h("span", { className: "gt-move" + movementClass(row) }, movement)
           : null,
       ),
       row.description ? h("p", { className: "gt-desc" }, row.description) : null,
@@ -1902,23 +1909,45 @@ const CSS = `
 .gt-notice--error { color: var(--gt-negative); opacity: 1; display: flex; gap: 6px; flex-wrap: wrap; }
 .gt-notice-hint { opacity: 0.7; }
 .gt-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 18px; }
-.gt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.gt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .gt-row {
-  display: flex; gap: 10px; padding: 9px 10px; border-radius: 9px;
-  border: 1px solid transparent; transition: background-color 120ms ease, border-color 120ms ease;
+  display: flex; gap: 12px; padding: 11px 14px; border-radius: 10px;
+  background: var(--gt-surface); border: 1px solid var(--gt-border);
+  transition: background-color 120ms ease, border-color 120ms ease;
 }
-.gt-row:hover { background: var(--gt-raised); border-color: var(--gt-border); }
-.gt-row-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
-.gt-row-title { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
-.gt-rank { font-size: 11px; min-width: 16px; opacity: 0.42; font-variant-numeric: tabular-nums; }
+.gt-row:hover { background: var(--gt-raised); border-color: var(--gt-accent); }
+.gt-row-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.gt-row-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 名次做成定宽徽章：一眼能看出这是榜单的第几条，也把标题行对齐成一条线 */
+.gt-rank {
+  flex: none; min-width: 22px; height: 22px; padding: 0 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px; border: 1px solid var(--gt-border);
+  background: var(--gt-raised);
+  font-size: 11px; font-weight: 600; color: var(--gt-muted);
+  font-variant-numeric: tabular-nums;
+}
 .gt-repo { font-size: 13.5px; font-weight: 600; text-decoration: none; color: inherit; word-break: break-all; }
 .gt-repo:hover { text-decoration: underline; }
-.gt-repo-owner { font-weight: 400; opacity: 0.6; }
+.gt-repo-owner { font-weight: 400; color: var(--gt-muted); }
 .gt-sep { white-space: pre; }
-.gt-move { font-size: 10.5px; padding: 1px 5px; border-radius: 5px; background: var(--gt-raised); opacity: 0.8; font-variant-numeric: tabular-nums; }
-.gt-move--new { background: rgba(46,160,67,0.18); font-weight: 600; opacity: 1; }
-.gt-desc { margin: 0; font-size: 12.5px; line-height: 1.55; opacity: 0.75; }
-.gt-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 11.5px; opacity: 0.66; }
+.gt-move {
+  flex: none; font-size: 10.5px; padding: 1px 6px; border-radius: 5px;
+  background: var(--gt-raised); color: var(--gt-muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+/* 涨跌用颜色区分方向，箭头字形在窄体终端字体里常缺失，颜色更可靠 */
+.gt-move--up { color: #2e7d32; background: rgba(46,160,67,0.12); }
+.gt-move--down { color: #c4242a; background: rgba(196,36,42,0.1); }
+.dark .gt-move--up { color: #4fc27a; }
+.dark .gt-move--down { color: #e5566f; }
+.gt-move--new { background: rgba(46,160,67,0.18); color: #2e7d32; font-weight: 600; }
+.dark .gt-move--new { color: #4fc27a; }
+.gt-desc { margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--gt-muted); }
+.gt-meta {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  font-size: 11.5px; color: var(--gt-muted);
+}
 .gt-lang { display: inline-flex; align-items: center; gap: 5px; }
 .gt-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; opacity: 0.8; display: inline-block; }
 .gt-gain { font-variant-numeric: tabular-nums; }
