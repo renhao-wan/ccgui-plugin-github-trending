@@ -196,6 +196,16 @@ function countByType(node, type) {
   return n;
 }
 
+/** 按 className 里的某个类名找元素（冒烟测试里只断言存在性）。 */
+function countByClass(node, cls) {
+  let n = 0;
+  walk(node, (x) => {
+    const c = x.props && x.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes(cls)) n += 1;
+  });
+  return n;
+}
+
 /* ------------------------------------------------------------ 假宿主 */
 
 const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), "gt-smoke-"));
@@ -761,6 +771,72 @@ await check("start 期间切视图，同样不会留下孤儿进程", async () =
 });
 
 // 放在最后：重新 import 会覆盖模块级的 tabDef/settingsDef，破坏前面用例的装配。
+await check("首次抓取时显示骨架屏与转圈，不再是空屏", async () => {
+  // 前面的用例都已 loaded，这里换一份慢响应，把状态退回到「首次抓取」
+  trendingPayload = { status: 200, body: trendingHtml(day1) };
+  const originalInvoke = ctx.bridge.invoke;
+  let trendingDelay = 0;
+  ctx.bridge.invoke = async (cmd, args) => {
+    if (args.url.includes("/trending") && trendingDelay) await sleep(trendingDelay);
+    return originalInvoke(cmd, args);
+  };
+
+  trendingDelay = 200;
+  // 切一次视图再切回来：会清空列表并重新抓取，等于首次加载的观感
+  findByText(render(), "新星库（7 天）").props.onClick();
+  await waitFor(() => textOf(render()).includes("fresh repo"));
+  findByText(render(), "Trending").props.onClick();
+
+  const during = render();
+  assert.ok(countByClass(during, "gt-skel") >= 4, "抓取中应铺骨架屏占住列表高度");
+  assert.ok(countByClass(during, "gt-spinner") >= 1, "抓取中应显示转圈");
+  assert.match(textOf(during), /正在抓取|正在刷新/, "应给出进行中的文案");
+
+  assert.ok(await waitFor(() => countByClass(render(), "gt-skel") === 0), "表格到达后骨架屏应撤掉");
+  assert.equal(countByClass(render(), "gt-skel"), 0);
+  assert.ok(countByType(render(), "li") >= 3, "应渲染真实列表");
+
+  trendingDelay = 0;
+  ctx.bridge.invoke = originalInvoke;
+});
+
+await check("刷新时保留列表内容，只在按钮和提示行上转圈", async () => {
+  trendingPayload = { status: 200, body: trendingHtml(day2) };
+  const originalInvoke = ctx.bridge.invoke;
+  let trendingDelay = 0;
+  ctx.bridge.invoke = async (cmd, args) => {
+    if (args.url.includes("/trending") && trendingDelay) await sleep(trendingDelay);
+    return originalInvoke(cmd, args);
+  };
+
+  // 先确保有列表
+  assert.ok(findByText(render(), "刷新"), "应有刷新按钮");
+  assert.ok(countByType(render(), "li") >= 3, "刷新前应已有列表");
+
+  trendingDelay = 150;
+  findByText(render(), "刷新").props.onClick();
+  await sleep(20);
+
+  const during = render();
+  assert.ok(countByType(during, "li") >= 3, "刷新期间列表不应被清空");
+  assert.equal(countByClass(during, "gt-skel"), 0, "有旧数据时不该退回骨架屏");
+  assert.match(textOf(during), /正在刷新榜单/, "刷新与首次抓取文案应区分");
+  const busy = findByText(during, "刷新中");
+  assert.ok(busy, "刷新按钮应进入进行中");
+  assert.equal(busy.props["aria-busy"], "true");
+  assert.equal(busy.props.disabled, true, "进行中不能再点第二次");
+
+  // 注意不能用 /刷新/ 判断结束：「刷新中…」也含这两个字，条件会立刻为真
+  assert.ok(await waitFor(() => {
+    const btn = findByText(render(), "刷新");
+    return btn && btn.props["aria-busy"] === "false";
+  }, 2000), "结束后按钮应复位");
+  assert.equal(findByText(render(), "刷新中"), null, "结束后不该还是进行中");
+
+  trendingDelay = 0;
+  ctx.bridge.invoke = originalInvoke;
+});
+
 await check("语言名含路径穿越时不会写到快照目录之外", async () => {
   kv.set("settings", Object.assign({}, kv.get("settings") || {}, { language: "../../evil" }));
   const fresh = await import(PLUGIN + "?lang-guard=" + Date.now());

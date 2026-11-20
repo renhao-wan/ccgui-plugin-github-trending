@@ -927,10 +927,13 @@ function Toolbar({ snap, ctx }) {
         "button",
         {
           type: "button",
-          className: "gt-btn",
+          className: "gt-btn gt-btn--refresh" + (snap.loading ? " gt-btn--busy" : ""),
           onClick: () => void refresh(ctx, { force: true }),
           disabled: snap.loading,
+          "aria-busy": snap.loading ? "true" : "false",
         },
+        // 文案与宽度都不随状态变化，右侧按钮不会跟着挪
+        snap.loading ? h("span", { className: "gt-spinner", "aria-hidden": "true" }) : null,
         snap.loading ? "刷新中…" : "刷新",
       ),
       h(
@@ -950,7 +953,17 @@ function Toolbar({ snap, ctx }) {
 
 function StatusLine({ snap }) {
   const h = appCtx.react.createElement;
-  if (snap.loading) return h("p", { className: "gt-notice" }, "正在抓取 GitHub…");
+  if (snap.loading) {
+    // 刷新时列表还在：只转圈 + 一句话，不抢走用户正在看的内容。
+    // 首次加载没有列表：文案改成「首次抓取」的口吻。
+    const first = snap.repos.length === 0;
+    return h(
+      "p",
+      { className: "gt-notice gt-running", role: "status", "aria-live": "polite" },
+      h("span", { className: "gt-spinner", "aria-hidden": "true" }),
+      h("span", { className: "gt-running-text" }, first ? "正在抓取 GitHub…" : "正在刷新榜单…"),
+    );
+  }
   if (snap.httpError) {
     const cacheHint = snap.repos.length > 0;
     return h(
@@ -968,6 +981,31 @@ function StatusLine({ snap }) {
     snap.view === "trending" && snap.settings.language ? " · " + snap.settings.language : "",
     snap.isFirstRun ? " · 首次抓取，下次刷新可看到排名变化" : "",
   );
+}
+
+/** 骨架屏：条数与真实榜单接近，让加载完的落位不跳。 */
+function SkeletonList() {
+  const h = appCtx.react.createElement;
+  // 6 行刚好铺满常见窗口高度，又不会撑出滚动条；
+  // 骨架屏加载完就撤掉，行数与真实榜单不必一致。
+  const rows = [];
+  for (let i = 0; i < 6; i += 1) {
+    rows.push(
+      h(
+        "li",
+        { className: "gt-skel", "aria-hidden": "true" },
+        h("span", { className: "gt-skel-badge" }),
+        h(
+          "span",
+          { className: "gt-skel-body" },
+          h("span", { className: "gt-skel-line gt-skel-line--title" }),
+          h("span", { className: "gt-skel-line gt-skel-line--desc" }),
+          h("span", { className: "gt-skel-line gt-skel-line--meta" }),
+        ),
+      ),
+    );
+  }
+  return h("ul", { className: "gt-skel-list" }, rows);
 }
 
 function DigestPanel({ snap }) {
@@ -1016,9 +1054,11 @@ function MainTab() {
       { className: "gt-scroll" },
       snap.repos.length > 0
         ? h("ol", { className: "gt-list" }, snap.repos.map((row) => h(RepoRow, { key: row.repo, row })))
-        : !snap.loading && snap.loaded
-          ? h("p", { className: "gt-empty" }, snap.errorKind ? "没有可显示的数据" : "榜单为空")
-          : null,
+        : snap.loading
+          ? h(SkeletonList, null)
+          : snap.loaded
+            ? h("p", { className: "gt-empty" }, snap.errorKind ? "没有可显示的数据" : "榜单为空")
+            : null,
       snap.view === "trending" && snap.dropped.length > 0
         ? h(
             "section",
@@ -1506,6 +1546,8 @@ const CSS = `
   --gt-text: #0a0a0a; --gt-muted: #6b6b6b;
   --gt-border: #e6e6e6; --gt-surface: #ffffff; --gt-raised: #f6f7f9;
   --gt-accent: #1d5fbf; --gt-positive: #2e7d32; --gt-negative: #c4242a;
+  /* 骨架屏色块单独一档：raised 压在白色底上几乎看不见，会显得「没反应」 */
+  --gt-skel: #e4e7ec;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -1518,15 +1560,18 @@ const CSS = `
 .dark .gt-root {
   --gt-text: #f2f3f5; --gt-muted: #a3a7ad;
   --gt-border: #2a2d32; --gt-surface: #17191c; --gt-raised: #1d2024;
+  --gt-skel: #2b2f35;
   --gt-accent: #5b9bf0; --gt-positive: #4fc27a; --gt-negative: #e5566f;
 }
 @media (prefers-color-scheme: dark) {
   .gt-root { --gt-text: #f2f3f5; --gt-muted: #a3a7ad; --gt-border: #2a2d32;
-    --gt-surface: #17191c; --gt-raised: #1d2024; --gt-accent: #5b9bf0;
+    --gt-surface: #17191c; --gt-raised: #1d2024; --gt-skel: #2b2f35;
+    --gt-accent: #5b9bf0;
     --gt-positive: #4fc27a; --gt-negative: #e5566f; }
   .light .gt-root, html.light .gt-root {
     --gt-text: #0a0a0a; --gt-muted: #6b6b6b; --gt-border: #e6e6e6;
-    --gt-surface: #ffffff; --gt-raised: #f6f7f9; --gt-accent: #1d5fbf;
+    --gt-surface: #ffffff; --gt-raised: #f6f7f9; --gt-skel: #e4e7ec;
+    --gt-accent: #1d5fbf;
     --gt-positive: #2e7d32; --gt-negative: #c4242a;
   }
 }
@@ -1546,8 +1591,13 @@ const CSS = `
   background: transparent;
   color: inherit;
   cursor: pointer;
+  white-space: nowrap;
   transition: background-color 120ms ease, border-color 120ms ease;
 }
+.gt-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+/* 「刷新 / 刷新中…」来回切时宽度不跳，右边的按钮不会跟着挪。
+ * 转圈 12px + 间距 6px + 「刷新中…」实测 63px，加内边距 20 刚好 86px。 */
+.gt-btn--refresh { min-width: 86px; }
 .gt-chip:hover, .gt-btn:hover { background: var(--gt-raised); }
 .gt-chip--on {
   background: var(--gt-raised);
@@ -1556,6 +1606,10 @@ const CSS = `
 }
 .gt-btn--primary { border-color: var(--gt-accent); font-weight: 600; }
 .gt-chip:disabled, .gt-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+/* 抓取中按钮不能用 opacity:.45 冒充禁用：那样转圈也被一起淡掉了。
+ * 底色压暗、光标改成等待，转圈保持不透明。放在 disabled 之后才盖得住。 */
+.gt-btn--busy:disabled { opacity: 1; cursor: progress; background: var(--gt-raised); }
+.gt-btn--busy .gt-spinner { border-color: var(--gt-border); border-top-color: var(--gt-accent); }
 .gt-chip:focus-visible, .gt-btn:focus-visible, .gt-input:focus-visible, .gt-repo:focus-visible {
   outline: 2px solid var(--gt-accent);
   outline-offset: 2px;
@@ -1564,8 +1618,57 @@ const CSS = `
 .gt-notice { margin: 0; font-size: 12px; opacity: 0.7; }
 .gt-notice--error { color: var(--gt-negative); opacity: 1; display: flex; gap: 6px; flex-wrap: wrap; }
 .gt-notice-hint { opacity: 0.7; }
+/* 抓取中：提示行里放一枚转圈，用户能确认进程还活着，而不是页面卡住了 */
+.gt-notice.gt-running {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  transition: opacity 120ms ease;
+}
+.gt-running-text { flex: none; }
+
+@keyframes gt-spin { to { transform: rotate(360deg); } }
+.gt-spinner {
+  flex: none; display: inline-block; width: 12px; height: 12px; box-sizing: border-box;
+  border: 2px solid var(--gt-border); border-top-color: var(--gt-accent);
+  border-radius: 50%; animation: gt-spin 0.8s linear infinite;
+}
+
+/* 第一次加载没有旧数据可看：用骨架屏占住列表高度，
+ * 避免「一行灰字 → 突然长出一整屏卡片」的跳动。 */
+.gt-skel-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.gt-skel {
+  position: relative; overflow: hidden;
+  display: flex; gap: 12px; padding: 11px 14px; border-radius: 10px;
+  background: var(--gt-surface); border: 1px solid var(--gt-border);
+}
+.gt-skel-badge { flex: none; width: 22px; height: 22px; border-radius: 6px; background: var(--gt-skel); }
+.gt-skel-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+.gt-skel-line { height: 11px; border-radius: 5px; background: var(--gt-skel); }
+.gt-skel-line--title { width: 42%; height: 13px; }
+.gt-skel-line--desc { width: 78%; }
+.gt-skel-line--meta { width: 30%; }
+/* 只有一道高光从左往右扫，色块本身不呼吸：比整块脉冲安静得多 */
+.gt-skel::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image: linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.75) 50%, transparent 70%);
+  background-size: 240% 100%; background-position: 140% 0;
+  animation: gt-sweep 1.5s ease-in-out infinite;
+}
+.dark .gt-skel::after {
+  background-image: linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.05) 50%, transparent 70%);
+}
+@keyframes gt-sweep { to { background-position: -140% 0; } }
+
+/* 新榜单落位时轻轻淡入，替代“整块内容瞬间替换” */
+@keyframes gt-fade-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .gt-spinner { animation: none; }
+  .gt-skel::after { animation: none; opacity: 0; }
+  .gt-list { animation: none; }
+  .gt-row, .gt-chip, .gt-btn { transition: none; }
+}
 .gt-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 18px; }
-.gt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.gt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; animation: gt-fade-in 180ms ease; }
 .gt-row {
   display: flex; gap: 12px; padding: 11px 14px; border-radius: 10px;
   background: var(--gt-surface); border: 1px solid var(--gt-border);

@@ -73,6 +73,9 @@ async function renderWithEffects(component) {
   return render(fakeReact.createElement(component, {}));
 }
 
+/** 让 Trending 请求一直挂起，用来抓「正在抓取」这一刻的界面。 */
+let holdTrending = false;
+
 const now = Date.now();
 const ctx = {
   react: fakeReact,
@@ -124,7 +127,10 @@ const ctx = {
   },
   bridge: {
     invoke: async (_cmd, args) => {
-      if (String(args.url).includes("/trending")) return { status: 200, body: TRENDING_HTML() };
+      if (String(args.url).includes("/trending")) {
+        if (holdTrending) await new Promise(() => {});
+        return { status: 200, body: TRENDING_HTML() };
+      }
       return { status: 200, body: JSON.stringify({ total_count: 0, items: [] }) };
     },
   },
@@ -173,6 +179,32 @@ const tabHtml = await renderWithEffects(injected.tab.component);
 // 设置页的 effect 会拉引擎与工作区，同样需要跑一遍
 const settingsHtml = await renderWithEffects(injected.settings.component);
 
+/* 抓取中的样子：另开一份模块实例（独立 store），让 Trending 请求一直挂起，
+ * 这样就能抓到「第一次打开、还没数据」的那一屏。 */
+holdTrending = true;
+let loadingTab = null;
+const loadingMod = await import(pathToFileURL(path.join(ROOT, "main.js")).href + "?loading=1");
+const noopUi = {
+  registerCenterTab: (d) => {
+    loadingTab = d;
+    return () => {};
+  },
+  registerSidebarNav: () => () => {},
+  registerSettingsSection: () => () => {},
+  registerCommand: () => () => {},
+  openCenterTab: () => {},
+  openSettings: () => {},
+};
+loadingMod.default(Object.assign({}, ctx, { ui: noopUi }));
+await new Promise((r) => setTimeout(r, 60));
+const loadingHtml = await renderWithEffects(loadingTab.component);
+holdTrending = false;
+
+/* 深色一份：骨架屏、转圈、涨跌色都必须在深色下确认过 */
+const asDark = (s) => s.replace(/class="gt-root"/g, 'class="gt-root dark"');
+const darkLoadingHtml = asDark(loadingHtml);
+const darkTabHtml = asDark(tabHtml);
+
 if (process.argv.includes("--dump")) {
   process.stdout.write(tabHtml + "\n");
 }
@@ -190,20 +222,31 @@ const html = `<!doctype html>
   .frame > h2 { font-size: 13px; font-weight: 600; color: #8a8a8a; margin: 40px 0 12px; text-transform: uppercase; letter-spacing: .04em; }
   .tab-host { height: 720px; display: flex; border: 1px solid #e6e6e6; border-radius: 12px; overflow: hidden; background: #fff; }
   .tab-host > * { flex: 1; min-width: 0; }
+  .tab-host.dark { background: #101214; border-color: #2a2d32; }
+  .dark .tab-host { background: #101214; border-color: #2a2d32; }
   ${css}
 </style>
 </head>
 <body>
 <div class="frame">
   <h1>每日热点 · 样式预览（真实组件 + 真实 CSS）</h1>
+  <h2>中心页签 · 首次抓取中</h2>
+  <div class="tab-host" id="tab-loading"></div>
   <h2>中心页签 · 榜单</h2>
   <div class="tab-host" id="tab-host"></div>
+  <h2>中心页签 · 首次抓取中（深色）</h2>
+  <div class="tab-host dark" id="tab-loading-dark"></div>
+  <h2>中心页签 · 榜单（深色）</h2>
+  <div class="tab-host dark" id="tab-host-dark"></div>
   <h2>设置页</h2>
   ${settingsHtml}
 </div>
 <script>
   // 主面板数据靠组件挂载后的 effect 拉取；预览里没有网络，直接把渲染结果塞进去。
   document.getElementById("tab-host").innerHTML = ${JSON.stringify(tabHtml)};
+  document.getElementById("tab-loading").innerHTML = ${JSON.stringify(loadingHtml)};
+  document.getElementById("tab-host-dark").innerHTML = ${JSON.stringify(darkTabHtml)};
+  document.getElementById("tab-loading-dark").innerHTML = ${JSON.stringify(darkLoadingHtml)};
 </script>
 </body>
 </html>`;
