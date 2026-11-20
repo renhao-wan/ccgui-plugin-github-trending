@@ -22,34 +22,22 @@ test("显式 true 才请求只读", () => {
   assert.equal(supportsReadOnly({ readOnly: true }), true);
 });
 
-test("用户显式设置的 cwd 优先于一切", () => {
-  assert.equal(
-    pickWorkspace({ workspacePath: "/proj/mine" }, "/data/github-trending", [{ path: "/proj/other" }]),
-    "/proj/mine",
-  );
+test("用户显式选择的 cwd 优先于插件数据目录", () => {
+  assert.equal(pickWorkspace({ workspacePath: "/proj/mine" }, "/data/github-trending"), "/proj/mine");
 });
 
-test("没设置时落在插件数据目录，而不是侧栏第一个工作区", () => {
+test("没设置时落在插件数据目录", () => {
   // 挂到真实项目名下，解读会话会被那个项目的会话历史记成工作产出。
-  assert.equal(
-    pickWorkspace({ workspacePath: "" }, "/data/github-trending", [{ path: "/proj/other" }]),
-    "/data/github-trending",
-  );
+  assert.equal(pickWorkspace({ workspacePath: "" }, "/data/github-trending"), "/data/github-trending");
 });
 
-test("拿不到插件数据目录时才回退到侧栏工作区", () => {
-  assert.equal(pickWorkspace({ workspacePath: "" }, "", [{ path: "/proj/other" }]), "/proj/other");
+test("两者都拿不到时返回空串，由调用方报错", () => {
+  assert.equal(pickWorkspace({}, ""), "");
+  assert.equal(pickWorkspace(null, null), "");
+  assert.equal(pickWorkspace(undefined, undefined), "");
 });
 
-test("全都拿不到时返回空串，由调用方报错", () => {
-  assert.equal(pickWorkspace({}, "", []), "");
-  assert.equal(pickWorkspace(null, null, null), "");
-});
-
-test("工作区列表里的坏行被跳过", () => {
-  assert.equal(pickWorkspace({}, "", [null, { path: 42 }, { path: "  " }, { path: "/ok" }]), "/ok");
-});
-
-test("空白设置不算显式设置", () => {
-  assert.equal(pickWorkspace({ workspacePath: "   " }, "/data/x", []), "/data/x");
+test("空白设置不算显式选择", () => {
+  assert.equal(pickWorkspace({ workspacePath: "   " }, "/data/x"), "/data/x");
+  assert.equal(pickWorkspace({ workspacePath: " /proj/a " }, "/data/x"), "/proj/a");
 });

@@ -26,9 +26,8 @@
 |---|---|
 | `network:github.com` | 抓 `github.com/trending` 公开页面（不占 API 配额） |
 | `network:api.github.com` | 新星库搜索；可选 Token 只发给这个域名 |
-| `agent` | 「生成解读」时起一个只读的后台轮次 |
-| `host:workspace` | 解析默认工作区（agent 进程的工作目录） |
-| `host:models` | 设置页的引擎 / 模型下拉 |
+| `agent` | 「生成解读」时起一个只读的后台轮次；引擎清单来自宿主的 `agent.catalog()` |
+| `assets:directory` | 设置页里用系统文件夹选择器指定解读用的工作区 |
 | `ui:center-tab` / `ui:sidebar-entry` / `ui:settings-section` / `ui:command` | 界面入口 |
 | `storage` / `plugin.storage` | 设置与历史快照 |
 | `theme` / `events` | 注入样式、接收 agent 事件流 |
@@ -40,6 +39,7 @@
 - 只访问 `github.com` 与 `api.github.com` 两个域名。
 - 榜单与解读只在本机显示；解读不会自动写入任何文件。
 - 历史快照存在插件数据目录（默认 `plugin-data/github-trending/history/`），随时可在插件详情页清空。
+- 「生成解读」的模型进程也默认在这个目录下运行（设置页可改成别的目录），因此不会把解读记录混进某个真实项目的工作区历史。
 - GitHub Token 存在本机插件数据里，只作为 `Authorization` 头发给 `api.github.com`；不填也能用（未认证时搜索接口 10 次/分钟）。
 
 ## 已知限制
@@ -70,6 +70,7 @@ src/lib/parse.mjs     # Trending HTML → 结构化仓库
 src/lib/rising.mjs    # Search API → 结构化仓库
 src/lib/diff.mjs      # 快照对比：新上榜 / 掉榜 / 排名变化
 src/lib/prompt.mjs    # 解读 prompt 与事实预算
+src/lib/catalog.mjs   # 宿主引擎清单 → agent.start 参数（readOnly / 工作区）
 scripts/build.mjs     # 内联构建（剥掉 export 前缀）
 scripts/smoke.mjs     # 假宿主冒烟
 scripts/validate-manifest.mjs

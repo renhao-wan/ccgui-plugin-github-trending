@@ -473,27 +473,23 @@ function supportsReadOnly(entry) {
 }
 
 /**
- * 决定引擎进程的 cwd。优先级：用户显式设置 > 插件数据目录 > 侧栏第一个工作区。
+ * 决定引擎进程的 cwd。优先级：用户显式选择 > 插件数据目录。
  *
- * 中间这层不是可有可无的兜底：agent 跑一轮会在 ~/.claude/projects 留下会话
+ * 默认值这层不是可有可无的兜底：agent 跑一轮会在 ~/.claude/projects 留下会话
  * 记录，cwd 就是这里传的值。挂在真实项目名下，「生成热点解读」这个动作本身
  * 会被那个项目的会话历史记成一次工作产出。
  *
+ * 故意没有第三层「侧栏第一个工作区」：留空就该是插件目录，不能悄悄跑到用户的
+ * 真实项目里——那样「什么都没选」和「选了项目 A」行为一样，没人能预料 cwd 在哪。
+ *
  * @param {{ workspacePath?: unknown }} settings
  * @param {string} ownDir 插件数据目录（拿不到时为空串）
- * @param {Array<{ path?: unknown }>} workspaceRows 宿主侧栏的工作区列表
- * @returns {string}
+ * @returns {string} 空串表示两者都拿不到，由调用方报错
  */
-function pickWorkspace(settings, ownDir, workspaceRows) {
+function pickWorkspace(settings, ownDir) {
   const configured = String((settings && settings.workspacePath) || "").trim();
   if (configured) return configured;
-
-  const own = String(ownDir || "").trim();
-  if (own) return own;
-
-  const rows = Array.isArray(workspaceRows) ? workspaceRows : [];
-  const first = rows.find((row) => row && typeof row.path === "string" && row.path.trim());
-  return first ? first.path : "";
+  return String(ownDir || "").trim();
 }
 
 
@@ -550,8 +546,6 @@ const DEFAULT_STATE = {
   catalogLoaded: false,
   modelsLoading: false,
   modelsError: "",
-  workspaces: [],
-  workspacesLoaded: false,
   /** 插件数据目录的绝对路径；生成解读时的默认 cwd。 */
   storagePath: "",
 };
@@ -983,22 +977,20 @@ async function pluginDataDir(ctx) {
 /**
  * 生成解读时引擎进程的 cwd。
  *
- * 顺序：用户显式设置 > 插件数据目录 > 侧栏第一个工作区。
- * 中间这层是默认值，不是可有可无的兜底：agent 跑一轮会在 ~/.claude/projects
- * 留下会话记录，cwd 就是这里传的值。挂在真实项目名下，「生成热点解读」这个
- * 动作本身会被那个项目的会话历史记成一次工作产出。收到插件目录后，
- * 这类会话归在 plugin-data/github-trending 下，谁产生的也一眼看得出。
+ * 顺序：用户显式选择 > 插件数据目录。
+ *
+ * 默认值不是可有可无的兜底：agent 跑一轮会在 ~/.claude/projects 留下会话记录，
+ * cwd 就是这里传的值。挂在真实项目名下，「生成热点解读」这个动作本身会被那个
+ * 项目的会话历史记成一次工作产出。收到插件目录后，这类会话归在
+ * plugin-data/github-trending 下，谁产生的也一眼看得出。
+ *
+ * 没有第三层「侧栏第一个工作区」：留空就该是插件目录，不能悄悄跑到用户的
+ * 真实项目里——那样「我什么都没选」和「我选了项目 A」的行为一模一样，没人能
+ * 预料 cwd 到底在哪。宿主的 documentStorage 不可用时返回空串，由调用方报错
+ * 让用户自己用「选择…」指定。
  */
 async function resolveWorkspace(ctx, settings) {
-  const own = await pluginDataDir(ctx);
-  if (String(settings.workspacePath || "").trim()) return pickWorkspace(settings, own, []);
-  let rows = [];
-  try {
-    rows = await ctx.workspaces.list();
-  } catch {
-    /* 没有工作区授权或列表为空：交给 pickWorkspace 返回空串 */
-  }
-  return pickWorkspace(settings, own, rows);
+  return pickWorkspace(settings, await pluginDataDir(ctx));
 }
 
 /** 界面展示统一用本机分隔符；传给宿主与存储的仍是原始路径。 */
@@ -1006,21 +998,6 @@ function displayPath(p) {
   const s = String(p || "").trim();
   if (!s) return "";
   return /^[A-Za-z]:[\\/]|^\\\\/.test(s) ? s.replace(/\//g, "\\") : s.replace(/\\/g, "/");
-}
-
-/** 侧栏工作区列表：设置页直接选，避免让用户手打路径（手打的路径没有授权）。 */
-async function loadWorkspaces(ctx) {
-  if (store.snap.workspacesLoaded) return;
-  try {
-    const rows = await ctx.workspaces.list();
-    const list = (Array.isArray(rows) ? rows : [])
-      .filter((row) => row && typeof row.path === "string" && row.path.trim())
-      .sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0));
-    set({ workspaces: list, workspacesLoaded: true });
-  } catch {
-    // 宿主不支持或读取失败：设置页退化为「自动」，不阻塞其他设置。
-    set({ workspaces: [], workspacesLoaded: true });
-  }
 }
 
 /**
@@ -1221,7 +1198,7 @@ async function generateDigest(ctx) {
 
   const workspace = await resolveWorkspace(ctx, settings);
   if (seq !== digestSeq || session.cancelled) return bailed("");
-  if (!workspace) return bailed("还没有可用工作区：请先在设置里填写 agent 的工作区路径");
+  if (!workspace) return bailed("读不到插件数据目录，请到设置里点「选择…」指定一个工作区");
 
   // 中央页签不会先打开设置页，引擎目录要在这里按需补一次。
   if (!store.snap.catalogLoaded) {
@@ -1789,8 +1766,37 @@ function SettingsSection() {
 
   R.useEffect(() => {
     if (!snap.catalogLoaded) void loadCatalog(ctx);
-    void loadWorkspaces(ctx);
+    void pluginDataDir(ctx);
   }, []);
+
+  const [flashMsg, setFlashMsg] = R.useState("");
+  const flashTimer = R.useRef(null);
+  const flash = (text) => {
+    setFlashMsg(text);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlashMsg(""), 2600);
+  };
+  R.useEffect(() => () => {
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+  }, []);
+
+  // 路径只能来自宿主的系统文件夹选择器，不接受手填：手打的路径没有对应 grant，
+  // 引擎跑起来会因为没授权而失败。
+  async function chooseWorkspace() {
+    if (!ctx.assets || typeof ctx.assets.grantDirectory !== "function") {
+      flash("当前宿主不支持目录选择");
+      return;
+    }
+    try {
+      const grant = await ctx.assets.grantDirectory();
+      const picked = grant && grant.path ? String(grant.path) : "";
+      if (!picked) return;
+      patch("workspacePath", picked);
+      flash("已选择 " + displayPath(picked));
+    } catch {
+      /* 用户取消选择：按正常操作静默处理 */
+    }
+  }
 
   R.useEffect(() => {
     if (!form) return;
@@ -1864,17 +1870,56 @@ function SettingsSection() {
     return prefix + "留空则用该引擎的第一个可用模型。";
   };
 
-  // 工作区直接选侧栏里已有的：手打的路径没有对应授权，后续会失败。
-  // 「自动」= 插件自己的数据目录；把真实路径写进选项，用户才知道进程会在哪跑。
+  // 工作区只读展示 + 文件夹选择按钮（与工作志同一套）：路径只能由系统选择器
+  // 产生。手打的路径没有对应 grant，引擎跑起来会因为没授权而失败。
+  // 没设置时显示插件数据目录的真实路径——只写「默认」等于没说 cwd 在哪。
   const ownDataDir = snap.storagePath || "";
-  const autoLabel = ownDataDir ? "自动（插件数据目录：" + displayPath(ownDataDir) + "）" : "自动（插件数据目录）";
-  const workspaceItems = [{ value: "", label: autoLabel }];
-  for (const row of snap.workspaces) {
-    workspaceItems.push({ value: row.path, label: row.name || row.path });
-  }
-  if (form.workspacePath && !snap.workspaces.some((r) => r.path === form.workspacePath)) {
-    workspaceItems.push({ value: form.workspacePath, label: form.workspacePath });
-  }
+  const workspaceShown = form.workspacePath
+    ? displayPath(form.workspacePath)
+    : ownDataDir
+      ? displayPath(ownDataDir)
+      : "";
+  const workspaceValue = h(
+    "span",
+    {
+      className:
+        "gt-path-value" + (form.workspacePath ? "" : ownDataDir ? " is-default" : " is-empty"),
+      title: form.workspacePath
+        ? workspaceShown
+        : ownDataDir
+          ? "默认值，即插件数据目录：" + displayPath(ownDataDir)
+          : "正在读取插件数据目录…",
+    },
+    workspaceShown || "插件数据目录（正在读取…）",
+  );
+  const workspaceControl = h(
+    "div",
+    { className: "gt-path gt-workspace-path" },
+    workspaceValue,
+    h(
+      "button",
+      {
+        type: "button",
+        className: "gt-btn gt-path-pick",
+        title: "打开系统文件夹选择器",
+        onClick: () => void chooseWorkspace(),
+      },
+      "选择…",
+    ),
+    // 空值本来就是「用默认」，没有可清除的东西时就不渲染
+    form.workspacePath
+      ? h(
+          "button",
+          {
+            type: "button",
+            className: "gt-btn ghost gt-path-pick",
+            title: "清除并回到默认行为",
+            onClick: () => patch("workspacePath", ""),
+          },
+          "默认",
+        )
+      : null,
+  );
 
   const periodItems = PERIODS.map((p) => ({ value: p.key, label: p.label }));
   const starItems = [
@@ -2042,14 +2087,10 @@ function SettingsSection() {
         ),
         segField(
           "解读用的工作区",
-          h(Dropdown, {
-            items: workspaceItems,
-            value: form.workspacePath,
-            onChange: (v) => patch("workspacePath", v),
-            emptyText: "侧栏还没有工作区",
-          }),
+          workspaceControl,
           "模型进程在这个目录下运行。解读内容来自当前榜单、不读这里的文件；"
-            + "默认落在插件数据目录，免得解读会话混进某个项目的会话历史。",
+            + "默认落在插件数据目录，免得解读会话混进某个项目的会话历史。"
+            + (flashMsg ? " " + flashMsg : ""),
         ),
       ),
     ),
@@ -2318,6 +2359,19 @@ const CSS = `
 .gt-settings .gt-btn.ghost { border-color: transparent; background: transparent; color: var(--gt-muted); }
 .gt-settings .gt-btn.ghost:hover:not(:disabled) { background: var(--gt-raised); color: var(--gt-text); }
 .gt-settings .gt-path-pick { flex: none; }
+/* 路径字段：只读展示 + 文件夹选择按钮，路径只能通过系统选择器产生 */
+.gt-settings .gt-path-value {
+  flex: 1 1 auto; min-width: 0; height: 36px; box-sizing: border-box;
+  display: block; padding: 0 12px; line-height: 34px;
+  border: 1px solid var(--gt-control); border-radius: 6px;
+  background: var(--gt-raised); color: var(--gt-text); font-size: 13px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gt-settings .gt-path-value.is-empty { color: var(--gt-muted); }
+/* 没设置时显示的默认路径：虚框表示「这不是你选的，是插件自己的目录」 */
+.gt-settings .gt-path-value.is-default {
+  color: var(--gt-text); border-style: dashed; background: transparent;
+}
 
 /* 自绘下拉 */
 .gt-dd { position: relative; width: 100%; }
@@ -2464,7 +2518,7 @@ export default function activate(ctx) {
   })();
 
   // 数据目录既是快照的落盘位置，也是解读默认的 cwd。早点读到，设置页才能
-  // 把真实路径显示出来；读不到不影响任何功能，届时回退到侧栏第一个工作区。
+  // 把真实路径显示出来；读不到不影响刷新榜单，只影响解读能不能跑。
   void pluginDataDir(ctx);
 
   const dispose = () => {

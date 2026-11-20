@@ -209,6 +209,8 @@ function countByClass(node, cls) {
 /* ------------------------------------------------------------ 假宿主 */
 
 const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), "gt-smoke-"));
+/** 假文件夹选择器返回的目录；单独建一个，才能区分「选中了」和「回落到默认」。 */
+const pickedWorkspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "gt-picked-"));
 const kv = new Map();
 const httpCalls = [];
 const agentStarts = [];
@@ -337,8 +339,10 @@ const ctx = {
     },
     emit: () => {},
   },
-  workspaces: {
-    list: async () => [{ path: os.tmpdir() }],
+  // 路径只能来自系统文件夹选择器：假的 grantDirectory 返回一个固定目录，
+  // 用来验证「选择…」把结果写进设置，且设置里存的是原始路径不是展示形式。
+  assets: {
+    grantDirectory: async () => ({ grantId: "g-1", path: pickedWorkspaceDir }),
   },
   agent: {
     // 与宿主真实契约一致：PluginAgentCatalogEntry[]
@@ -684,20 +688,100 @@ await check("设置页：时间档与阈值用下拉而不是手填", async () =
   assert.equal(numberInputs, 0, "阈值不应是手填数字框");
 });
 
-await check("设置页：工作区从侧栏列表选，不需要手打路径", async () => {
+await check("设置页：工作区用只读路径 + 选择按钮，不是下拉也不是手填", async () => {
   renderFresh(settingsDef.component, {}, { effects: true });
-  // 假宿主不提供 workspaces，这里只验证「自动」这一项存在、且没有路径输入框
-  assert.ok(await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("自动")));
-  // 「自动」要写清楚默认落在哪：只说「自动」等于没告诉用户 cwd 是什么。
-  const text = textOf(renderFresh(settingsDef.component));
-  assert.match(text, /自动（插件数据目录/, "默认项应写明插件数据目录");
+  assert.ok(
+    await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("选择…")),
+    2000,
+  );
+  const tree = renderFresh(settingsDef.component);
+  const text = textOf(tree);
+
+  // 与工作志同一套控件：只读路径 + 「选择…」，路径只能由系统选择器产生。
+  assert.equal(findByText(tree, "选择…") !== null, true, "应有文件夹选择按钮");
+  // 没设置时直接把默认目录的真实路径写出来：只写「默认」等于没说 cwd 在哪。
+  let defaultValue = null;
+  walk(tree, (n) => {
+    if (n.props && typeof n.props.className === "string" && n.props.className.includes("gt-path-value")) {
+      defaultValue = n;
+    }
+  });
+  assert.ok(defaultValue, "应有只读路径展示");
+  assert.match(String(defaultValue.props.className), /is-default/, "未设置时应标为默认值");
+  assert.match(textOf(defaultValue), /github-trending|gt-smoke-/, "应显示数据目录的真实路径");
+
+  // 不能退回成下拉：下拉会把「选过的路径」和「默认」混成一个列表，
+  // 而路径本来就只能来自系统选择器。只看工作区这一栏——引擎和模型仍是下拉。
+  let workspaceField = null;
+  walk(tree, (n) => {
+    if (n.props && typeof n.props.className === "string" && n.props.className.includes("gt-workspace-path")) {
+      workspaceField = n;
+    }
+  });
+  assert.ok(workspaceField, "应有路径栏");
+  assert.match(textOf(workspaceField), /选择…/, "路径栏里应是选择按钮");
+  walk(workspaceField, (n) => {
+    if (n.props && typeof n.props.className === "string" && /gt-dd-trigger/.test(n.props.className)) {
+      throw new Error("工作区不应使用下拉控件");
+    }
+  });
   let pathInputs = 0;
-  walk(renderFresh(settingsDef.component), (n) => {
+  walk(tree, (n) => {
     if (n.type === "input" && n.props && n.props.placeholder && /工作区路径|D:\\\\|example/.test(n.props.placeholder)) {
       pathInputs += 1;
     }
   });
   assert.equal(pathInputs, 0, "不应有手填工作区路径的输入框");
+});
+
+await check("设置页：选完目录后路径不再是默认态，并写进设置", async () => {
+  // 用 renderKeep：点「选择…」改的是组件内部 state，renderFresh 会把它重置掉，
+  // 那样永远看不到变化（和下拉展开同一个陷阱）。
+  renderFresh(settingsDef.component, {}, { effects: true });
+
+  // 只能在工作区那一栏的子树里找：整棵树上「默认」还命中「50（默认）」这个
+  // 下拉标签，排在前面，findByText 会先抓到它，点下去只是展开下拉。
+  const workspaceField = () => {
+    let hit = null;
+    walk(renderKeep(settingsDef.component, {}), (n) => {
+      if (!hit && n.props && typeof n.props.className === "string" && n.props.className.includes("gt-workspace-path")) {
+        hit = n;
+      }
+    });
+    return hit;
+  };
+  const buttonInField = (text) => {
+    const field = workspaceField();
+    return field ? findByText(field, text) : null;
+  };
+  const pathClass = () => {
+    const field = workspaceField();
+    if (!field) return "";
+    let hit = "";
+    walk(field, (n) => {
+      if (!hit && n.props && typeof n.props.className === "string" && n.props.className.includes("gt-path-value")) {
+        hit = String(n.props.className);
+      }
+    });
+    return hit;
+  };
+
+  const pick = buttonInField("选择…");
+  assert.ok(pick, "应有选择按钮");
+  pick.props.onClick();
+  assert.ok(await waitFor(() => !/is-default/.test(pathClass()), 2000), "选完目录后应不再是默认态");
+  assert.match(textOf(workspaceField()), /gt-picked-/, "应显示选中的目录");
+  // 存进设置的是原始路径，不是加了分隔符转换或缩写的展示值
+  assert.ok(await waitFor(() => {
+    const saved = kv.get("settings");
+    return saved && saved.workspacePath === pickedWorkspaceDir;
+  }, 2000), "设置里应存原始路径");
+  // 「默认」按钮只在设了值之后出现，用来回到插件数据目录
+  const reset = buttonInField("默认");
+  assert.ok(reset, "设了值之后应能回到默认");
+  reset.props.onClick();
+  assert.ok(await waitFor(() => /is-default/.test(pathClass()), 2000), "点默认后应回到插件数据目录");
+  assert.ok(!buttonInField("默认"), "回到默认后不该再有「默认」按钮");
 });
 
 await check("卸载会中断在跑的 agent 并复位状态", async () => {
@@ -911,6 +995,7 @@ for (const r of results) {
 console.log(`\nRESULT=${failed === 0 ? "SMOKE_OK" : "SMOKE_FAIL"} passed=${results.length - failed} failed=${failed}`);
 try {
   fs.rmSync(storageDir, { recursive: true, force: true });
+  fs.rmSync(pickedWorkspaceDir, { recursive: true, force: true });
 } catch {
   /* 清理失败不影响结果 */
 }

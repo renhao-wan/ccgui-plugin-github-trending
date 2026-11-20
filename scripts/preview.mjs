@@ -113,16 +113,19 @@ const ctx = {
     openCenterTab: () => {},
     openSettings: () => {},
   },  events: { on: () => () => {}, emit: () => {} },
-  workspaces: {
-    list: async () => [
-      { id: "1", path: "D:/projects/claudecode-plugings/cc-wrapped", name: "cc-wrapped", lastOpenedAt: now },
-      { id: "2", path: "D:/projects/claudecode-plugings/ccgui-plugin-worklog", name: "ccgui-plugin-worklog", lastOpenedAt: now - 1000 },
-      { id: "3", path: "D:/projects/school/compiler", name: "compiler", lastOpenedAt: now - 5000 },
-    ],
+  // 路径只能来自系统文件夹选择器（和真实宿主一致）。预览里点「选择…」会
+  // 直接拿到这个目录，用来肉眼看选中后的形态。
+  assets: {
+    grantDirectory: async () => ({
+      grantId: "preview-grant",
+      path: "D:/projects/school/compiler",
+    }),
   },
   agent: {
     catalog: async () => [
-      { engine: "claude", label: "Claude Code", available: true, readOnly: true, providers: [],
+      // readOnly 照实写：claude 在真实宿主里不支持隔离只读运行，全写 true
+      // 会把这个差异藏起来，看不出「请求只读」和「引擎能不能只读」的区别。
+      { engine: "claude", label: "Claude Code", available: true, readOnly: false, providers: [],
         models: [{ id: "claude-sonnet-5", label: "Sonnet 5" }, { id: "claude-opus-5", label: "Opus 5" }], efforts: ["low", "medium", "high"] },
       { engine: "codex", label: "Codex", available: true, readOnly: true, providers: [],
         models: [{ id: "gpt-5", label: "GPT-5" }], efforts: [] },
