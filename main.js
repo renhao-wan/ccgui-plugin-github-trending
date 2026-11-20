@@ -500,6 +500,8 @@ const DEFAULT_STATE = {
   engineModels: [],
   modelsLoading: false,
   modelsError: "",
+  workspaces: [],
+  workspacesLoaded: false,
 };
 
 const store = { snap: { ...DEFAULT_STATE }, listeners: new Set() };
@@ -904,6 +906,21 @@ async function resolveWorkspace(ctx, settings) {
     /* 没有工作区授权或列表为空都走下面的失败路径 */
   }
   return "";
+}
+
+/** 侧栏工作区列表：设置页直接选，避免让用户手打路径（手打的路径没有授权）。 */
+async function loadWorkspaces(ctx) {
+  if (store.snap.workspacesLoaded) return;
+  try {
+    const rows = await ctx.workspaces.list();
+    const list = (Array.isArray(rows) ? rows : [])
+      .filter((row) => row && typeof row.path === "string" && row.path.trim())
+      .sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0));
+    set({ workspaces: list, workspacesLoaded: true });
+  } catch {
+    // 宿主不支持或读取失败：设置页退化为「自动」，不阻塞其他设置。
+    set({ workspaces: [], workspacesLoaded: true });
+  }
 }
 
 async function loadEngines(ctx) {
@@ -1396,158 +1413,459 @@ function MainTab() {
   );
 }
 
-function field(h, label, control, hint) {
+/* ---------- 设置页 ---------- */
+
+/**
+ * 自绘下拉：原生 <select> 的展开层由系统绘制，不跟宿主的深浅色主题。
+ * 键盘、方向键、Esc、点击外部关闭都对齐宿主习惯。
+ */
+function Dropdown(props) {
+  const R = appCtx.react;
+  const h = R.createElement;
+  const openState = R.useState(false);
+  const open = openState[0];
+  const setOpen = openState[1];
+  const focusState = R.useState(-1);
+  const focusIdx = focusState[0];
+  const setFocusIdx = focusState[1];
+  // 触发器下方空间不够时向上弹，避免菜单被视口底部裁掉
+  const upState = R.useState(false);
+  const up = upState[0];
+  const setUp = upState[1];
+  const triggerRef = R.useRef(null);
+  const itemRefs = R.useRef([]);
+
+  const items = Array.isArray(props.items) ? props.items : [];
+  const value = props.value == null ? "" : String(props.value);
+  const selectedIdx = items.findIndex((it) => String(it.value) === value);
+  const selected = selectedIdx >= 0 ? items[selectedIdx] : null;
+  const placeholder = props.placeholder || "请选择";
+
+  R.useEffect(() => {
+    if (!open) return;
+    const el = itemRefs.current[focusIdx];
+    if (el && typeof el.focus === "function") el.focus();
+  }, [open, focusIdx]);
+
+  const openMenu = () => {
+    if (props.disabled || items.length === 0) return;
+    let i = selectedIdx;
+    if (i < 0) i = items.findIndex((it) => !it.disabled);
+    setFocusIdx(i < 0 ? 0 : i);
+    const est = Math.min(260, items.length * 32 + 8);
+    const el = triggerRef.current;
+    if (el && typeof el.getBoundingClientRect === "function" && typeof window !== "undefined") {
+      const rect = el.getBoundingClientRect();
+      const below = (window.innerHeight || 800) - rect.bottom;
+      setUp(below < est + 12 && rect.top > below);
+    }
+    setOpen(true);
+  };
+
+  const choose = (item) => {
+    if (!item || item.disabled) return;
+    setOpen(false);
+    if (String(item.value) !== value) props.onChange(item.value);
+  };
+
+  const move = (step) => {
+    if (!items.length) return;
+    let i = focusIdx;
+    for (let n = 0; n < items.length; n += 1) {
+      i = (i + step + items.length) % items.length;
+      if (!items[i].disabled) break;
+    }
+    setFocusIdx(i);
+  };
+
+  const onTriggerKeyDown = (ev) => {
+    if (props.disabled) return;
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (!open) openMenu();
+      else move(ev.key === "ArrowDown" ? 1 : -1);
+    } else if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      if (open) choose(items[focusIdx]);
+      else openMenu();
+    } else if (ev.key === "Escape" && open) {
+      ev.preventDefault();
+      setOpen(false);
+    }
+  };
+
   return h(
-    "label",
+    "div",
+    { className: "gt-dd" + (open ? " is-open" : "") + (up ? " is-up" : "") },
+    h(
+      "button",
+      {
+        type: "button",
+        className: "gt-dd-trigger",
+        ref: triggerRef,
+        disabled: props.disabled,
+        "aria-haspopup": "listbox",
+        "aria-expanded": open,
+        onClick: () => (open ? setOpen(false) : openMenu()),
+        onKeyDown: onTriggerKeyDown,
+      },
+      h("span", { className: "gt-dd-value" + (selected ? "" : " is-empty") }, selected ? selected.label : placeholder),
+      h("span", { className: "gt-dd-caret", "aria-hidden": "true" }),
+    ),
+    open ? h("div", { className: "gt-dd-scrim", onClick: () => setOpen(false) }) : null,
+    open
+      ? h(
+          "div",
+          { className: "gt-dd-menu", role: "listbox" },
+          items.length
+            ? items.map((item, i) =>
+                h(
+                  "div",
+                  {
+                    key: String(item.value) + ":" + i,
+                    ref: (el) => {
+                      itemRefs.current[i] = el;
+                    },
+                    className:
+                      "gt-dd-item" +
+                      (i === focusIdx ? " is-active" : "") +
+                      (item.disabled ? " is-disabled" : ""),
+                    role: "option",
+                    "aria-selected": String(item.value) === value,
+                    "aria-disabled": item.disabled ? true : undefined,
+                    tabIndex: -1,
+                    onClick: () => choose(item),
+                    onMouseEnter: () => {
+                      if (!item.disabled) setFocusIdx(i);
+                    },
+                  },
+                  h("span", { className: "gt-dd-label" }, item.label),
+                  h("span", { className: "gt-dd-check", "aria-hidden": "true" }, "✓"),
+                ),
+              )
+            : h("div", { className: "gt-dd-empty" }, props.emptyText || "没有可选项"),
+        )
+      : null,
+  );
+}
+
+function segField(label, control, hint) {
+  const h = appCtx.react.createElement;
+  return h(
+    "div",
     { className: "gt-field" },
-    h("span", { className: "gt-field-label" }, label),
+    h("label", null, label),
     control,
-    hint ? h("span", { className: "gt-field-hint" }, hint) : null,
+    hint ? h("span", { className: "gt-hint" }, hint) : null,
   );
 }
 
 function SettingsSection() {
-  const h = appCtx.react.createElement;
+  const R = appCtx.react;
+  const h = R.createElement;
   const ctx = appCtx;
   const snap = useSnap();
 
-  appCtx.react.useEffect(() => {
+  const formState = R.useState(null);
+  const form = formState[0] || snap.settings;
+  const setForm = formState[1];
+  // "" -> "saving" -> "saved"/"error"；改动即生效，不需要用户记得点保存。
+  const saveState = R.useState("");
+  const saveStatus = saveState[0];
+  const setSaveStatus = saveState[1];
+  const baseline = R.useRef("");
+  const saveTimer = R.useRef(null);
+  const ready = R.useRef(false);
+
+  const patch = (key, value) => {
+    setForm((prev) => Object.assign({}, prev || snap.settings, { [key]: value }));
+  };
+
+  R.useEffect(() => {
     if (snap.engines.length === 0) void loadEngines(ctx);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    void loadWorkspaces(ctx);
   }, []);
 
-  const save = (patch) => void persistSettings(ctx, patch);
+  R.useEffect(() => {
+    if (!form) return;
+    const key = JSON.stringify(form);
+    if (!ready.current) {
+      ready.current = true;
+      baseline.current = key;
+      return;
+    }
+    if (key === baseline.current) return;
+    setSaveStatus("saving");
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(() => {
+      void (async () => {
+        const ok = await persistSettings(ctx, form);
+        if (ok) {
+          baseline.current = key;
+          setSaveStatus("saved");
+        } else {
+          setSaveStatus("error");
+        }
+      })();
+    }, 500);
+  }, [form]);
 
-  const engineOptions = snap.engines.length
-    ? snap.engines
-    : [
-        {
-          id: "",
-          name: snap.modelsLoading
-            ? "读取引擎列表中…"
-            : snap.modelsError || "（没有可用引擎）",
-        },
-      ];
-  const modelOptions = snap.engineModels.length ? snap.engineModels : [""];
+  R.useEffect(
+    () => () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    },
+    [],
+  );
+
+  const engineItems = [{ value: "", label: "自动（第一个可用引擎）" }];
+  for (const e of snap.engines) engineItems.push({ value: e.id, label: e.name || e.id });
+  if (snap.modelsLoading && snap.engines.length === 0) {
+    engineItems.push({ value: "", label: "读取引擎列表中…", disabled: true });
+  }
+
+  const modelItems = [{ value: "", label: "自动（该引擎的第一个模型）" }];
+  for (const m of snap.engineModels) modelItems.push({ value: m, label: m });
+  if (form.model && !snap.engineModels.includes(form.model)) {
+    modelItems.push({ value: form.model, label: form.model });
+  }
+
+  // 工作区直接选侧栏里已有的：手打的路径没有对应授权，后续会失败。
+  const workspaceItems = [{ value: "", label: "自动（最近打开的工作区）" }];
+  for (const row of snap.workspaces) {
+    workspaceItems.push({ value: row.path, label: row.name || row.path });
+  }
+  if (form.workspacePath && !snap.workspaces.some((r) => r.path === form.workspacePath)) {
+    workspaceItems.push({ value: form.workspacePath, label: form.workspacePath });
+  }
+
+  const periodItems = PERIODS.map((p) => ({ value: p.key, label: p.label }));
+  const starItems = [
+    { value: 10, label: "10（很宽）" },
+    { value: 50, label: "50（默认）" },
+    { value: 200, label: "200" },
+    { value: 500, label: "500" },
+    { value: 1000, label: "1000（很严）" },
+  ];
+
+  const languageControl = h(
+    "div",
+    { className: "gt-path" },
+    h("input", {
+      className: "gt-input",
+      value: form.language || "",
+      placeholder: "留空 = 全部语言",
+      spellCheck: false,
+      onChange: (e) => patch("language", e.target.value.trim().toLowerCase()),
+    }),
+    form.language
+      ? h(
+          "button",
+          {
+            type: "button",
+            className: "gt-btn ghost gt-path-pick",
+            title: "回到全部语言",
+            onClick: () => patch("language", ""),
+          },
+          "全部",
+        )
+      : null,
+  );
+
+  const tokenControl = h(
+    "details",
+    { className: "gt-disclosure" },
+    h("summary", null, "限流了再加 Token（可选）"),
+    h(
+      "div",
+      { className: "gt-disclosure-body" },
+      h(
+        "p",
+        { className: "gt-hint" },
+        "不填也能正常使用：未认证时搜索接口 10 次/分钟，一般够每天刷新一两次。Token 只存在本机，只发给 api.github.com。",
+      ),
+      h(
+        "div",
+        { className: "gt-path" },
+        h("input", {
+          className: "gt-input",
+          type: "password",
+          value: form.token || "",
+          placeholder: "ghp_… / github_pat_…",
+          spellCheck: false,
+          onChange: (e) => patch("token", e.target.value.trim()),
+        }),
+        form.token
+          ? h(
+              "button",
+              {
+                type: "button",
+                className: "gt-btn ghost gt-path-pick",
+                onClick: () => patch("token", ""),
+              },
+              "清除",
+            )
+          : null,
+      ),
+    ),
+  );
+
+  const saveHint =
+    saveStatus === "saving"
+      ? "保存中…"
+      : saveStatus === "saved"
+        ? "已保存"
+        : saveStatus === "error"
+          ? "保存失败，请重试"
+          : "改动会自动保存";
 
   return h(
     "div",
     { className: "gt-settings" },
-    h("h3", null, "显示"),
-    field(
-      h,
-      "默认时间档",
+    h("p", { className: "gt-settings-intro" }, "榜单与解读只在这台机器上处理，插件不上传任何内容。"),
+
+    h(
+      "section",
+      { className: "gt-section" },
       h(
-        "select",
-        {
-          className: "gt-input",
-          value: snap.settings.period,
-          onChange: (e) => save({ period: e.target.value }),
-        },
-        PERIODS.map((p) => h("option", { key: p.key, value: p.key }, p.label)),
+        "div",
+        { className: "gt-section-label" },
+        h("h2", null, "显示"),
+        h("p", null, "打开面板时看到的默认视图与时间档。"),
       ),
-    ),
-    field(
-      h,
-      "语言筛选",
-      h("input", {
-        className: "gt-input",
-        value: snap.settings.language,
-        placeholder: "留空 = 全部语言，例如 python",
-        onBlur: (e) => save({ language: e.target.value.trim().toLowerCase() }),
-        onChange: (e) => setSettings({ language: e.target.value }),
-      }),
-      "对应 github.com/trending/<语言>，填英文语言名；离开输入框后保存。",
-    ),
-    field(
-      h,
-      "新星库 star 阈值",
-      h("input", {
-        className: "gt-input",
-        type: "number",
-        min: 1,
-        value: snap.settings.minStars,
-        onChange: (e) => setSettings({ minStars: normaliseMinStars(e.target.value) }),
-        onBlur: (e) => save({ minStars: normaliseMinStars(e.target.value) }),
-      }),
-      "近 7 天创建、star 不少于该值的仓库。",
+      h(
+        "div",
+        { className: "gt-section-panel" },
+        segField(
+          "默认时间档",
+          h(Dropdown, { items: periodItems, value: form.period, onChange: (v) => patch("period", v) }),
+          "Trending 榜按天 / 周 / 月统计，切换后立刻重新抓取。",
+        ),
+        segField(
+          "语言筛选",
+          languageControl,
+          "对应 github.com/trending/<语言>，填英文语言名，例如 python、rust、typescript。",
+        ),
+        segField(
+          "新星库 star 阈值",
+          h(Dropdown, {
+            items: starItems,
+            value: form.minStars,
+            onChange: (v) => patch("minStars", normaliseMinStars(v)),
+          }),
+          "「新星库」只看近 7 天创建、star 达到这个数的仓库。",
+        ),
+      ),
     ),
 
-    h("h3", null, "解读"),
-    field(
-      h,
-      "引擎",
+    h(
+      "section",
+      { className: "gt-section" },
       h(
-        "select",
-        {
-          className: "gt-input",
-          value: snap.settings.engine,
-          onChange: (e) => {
-            const engine = e.target.value;
-            save({ engine, model: "" });
-            void loadModels(ctx, engine);
-          },
-        },
-        engineOptions.map((e) => h("option", { key: e.id, value: e.id }, e.name || e.id)),
+        "div",
+        { className: "gt-section-label" },
+        h("h2", null, "中文解读"),
+        h("p", null, "只有点「生成解读」时才调用模型，其余时间不耗 token。"),
       ),
-    ),
-    field(
-      h,
-      "模型",
       h(
-        "select",
-        {
-          className: "gt-input",
-          value: snap.settings.model,
-          onChange: (e) => save({ model: e.target.value }),
-        },
-        modelOptions.map((m) => h("option", { key: m, value: m }, m || "（引擎默认）")),
+        "div",
+        { className: "gt-section-panel" },
+        segField(
+          "引擎",
+          h(Dropdown, {
+            items: engineItems,
+            value: form.engine,
+            onChange: (v) => {
+              patch("engine", v);
+              patch("model", "");
+              void loadModels(ctx, v);
+            },
+            disabled: snap.engines.length === 0,
+          }),
+          snap.modelsError ? snap.modelsError : "选项来自宿主当前可用的引擎。",
+        ),
+        segField(
+          "模型",
+          h(Dropdown, {
+            items: modelItems,
+            value: form.model,
+            onChange: (v) => patch("model", v),
+            disabled: !form.engine,
+            emptyText: form.engine ? "该引擎未报告可用模型" : "先选引擎",
+          }),
+          form.engine ? "留空则用该引擎的第一个可用模型。" : "先选引擎，模型列表会跟着变。",
+        ),
+        segField(
+          "解读用的工作区",
+          h(Dropdown, {
+            items: workspaceItems,
+            value: form.workspacePath,
+            onChange: (v) => patch("workspacePath", v),
+            emptyText: "侧栏还没有工作区",
+          }),
+          "模型进程在这个工作区目录下运行。解读内容来自当前榜单，不读这里的文件。",
+        ),
       ),
-      snap.modelsLoading ? "读取模型列表中…" : "",
-    ),
-    field(
-      h,
-      "agent 工作区",
-      h("input", {
-        className: "gt-input",
-        value: snap.settings.workspacePath,
-        placeholder: "留空 = 侧栏第一个工作区",
-        onBlur: (e) => save({ workspacePath: e.target.value.trim() }),
-        onChange: (e) => setSettings({ workspacePath: e.target.value }),
-      }),
-      "只作为 agent 进程的工作目录，解读内容来自当前榜单，不读该目录里的文件。",
     ),
 
-    h("h3", null, "网络"),
-    field(
-      h,
-      "GitHub Token（可选）",
-      h("input", {
-        className: "gt-input",
-        type: "password",
-        value: snap.settings.token,
-        placeholder: "仅用于新星库搜索，提高限流额度",
-        onBlur: (e) => save({ token: e.target.value.trim() }),
-        onChange: (e) => setSettings({ token: e.target.value }),
-      }),
-      "不填也能用：未认证时搜索接口 10 次/分钟。Token 只存本机插件数据，只发给 api.github.com。",
+    h(
+      "section",
+      { className: "gt-section" },
+      h(
+        "div",
+        { className: "gt-section-label" },
+        h("h2", null, "网络"),
+        h("p", null, "只访问 github.com 与 api.github.com。"),
+      ),
+      h(
+        "div",
+        { className: "gt-section-panel" },
+        h(
+          "p",
+          { className: "gt-note-line" },
+          "榜单来自 ",
+          h("code", null, "github.com/trending"),
+          " 的公开页面，不占 API 配额；新星库走 GitHub 搜索接口，未认证时 10 次/分钟。",
+        ),
+        tokenControl,
+      ),
     ),
-    h("p", { className: "gt-settings-foot" }, "版本 " + ctx.version + " · 只访问 github.com 与 api.github.com"),
+
+    h("p", { className: "gt-settings-foot" }, "版本 " + ctx.version + " · " + saveHint),
   );
 }
 
 /* ---------- CSS ---------- */
 
 const CSS = `
+/* 一套自足的 token：不依赖宿主变量名（各版本命名不保证稳定），
+ * 也保证浅色/深色在任何宿主下都读得清。 */
 .gt-root {
+  --gt-text: #0a0a0a; --gt-muted: #6b6b6b;
+  --gt-border: #e6e6e6; --gt-surface: #ffffff; --gt-raised: #f6f7f9;
+  --gt-accent: #1d5fbf; --gt-positive: #2e7d32; --gt-negative: #c4242a;
   display: flex;
   flex-direction: column;
   height: 100%;
   min-height: 0;
   gap: 10px;
   padding: 16px 18px 0;
-  color: var(--text-primary, inherit);
+  color: var(--gt-text);
   container-type: inline-size;
+}
+.dark .gt-root {
+  --gt-text: #f2f3f5; --gt-muted: #a3a7ad;
+  --gt-border: #2a2d32; --gt-surface: #17191c; --gt-raised: #1d2024;
+  --gt-accent: #5b9bf0; --gt-positive: #4fc27a; --gt-negative: #e5566f;
+}
+@media (prefers-color-scheme: dark) {
+  .gt-root { --gt-text: #f2f3f5; --gt-muted: #a3a7ad; --gt-border: #2a2d32;
+    --gt-surface: #17191c; --gt-raised: #1d2024; --gt-accent: #5b9bf0;
+    --gt-positive: #4fc27a; --gt-negative: #e5566f; }
+  .light .gt-root, html.light .gt-root {
+    --gt-text: #0a0a0a; --gt-muted: #6b6b6b; --gt-border: #e6e6e6;
+    --gt-surface: #ffffff; --gt-raised: #f6f7f9; --gt-accent: #1d5fbf;
+    --gt-positive: #2e7d32; --gt-negative: #c4242a;
+  }
 }
 .gt-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .gt-title { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
@@ -1561,27 +1879,27 @@ const CSS = `
   line-height: 1;
   padding: 6px 10px;
   border-radius: 7px;
-  border: 1px solid var(--separator-border, rgba(127,127,127,0.28));
+  border: 1px solid var(--gt-border);
   background: transparent;
   color: inherit;
   cursor: pointer;
   transition: background-color 120ms ease, border-color 120ms ease;
 }
-.gt-chip:hover, .gt-btn:hover { background: var(--background-secondary-hover, rgba(127,127,127,0.12)); }
+.gt-chip:hover, .gt-btn:hover { background: var(--gt-raised); }
 .gt-chip--on {
-  background: var(--background-secondary-hover, rgba(127,127,127,0.16));
-  border-color: var(--border-focus-ring, currentColor);
+  background: var(--gt-raised);
+  border-color: var(--gt-accent);
   font-weight: 600;
 }
-.gt-btn--primary { border-color: var(--border-focus-ring, currentColor); font-weight: 600; }
+.gt-btn--primary { border-color: var(--gt-accent); font-weight: 600; }
 .gt-chip:disabled, .gt-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .gt-chip:focus-visible, .gt-btn:focus-visible, .gt-input:focus-visible, .gt-repo:focus-visible {
-  outline: 2px solid var(--border-focus-ring, currentColor);
+  outline: 2px solid var(--gt-accent);
   outline-offset: 2px;
 }
 .gt-stamp { font-size: 11px; opacity: 0.55; white-space: nowrap; }
 .gt-notice { margin: 0; font-size: 12px; opacity: 0.7; }
-.gt-notice--error { color: var(--text-error-primary, #c0392b); opacity: 1; display: flex; gap: 6px; flex-wrap: wrap; }
+.gt-notice--error { color: var(--gt-negative); opacity: 1; display: flex; gap: 6px; flex-wrap: wrap; }
 .gt-notice-hint { opacity: 0.7; }
 .gt-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 18px; }
 .gt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
@@ -1589,7 +1907,7 @@ const CSS = `
   display: flex; gap: 10px; padding: 9px 10px; border-radius: 9px;
   border: 1px solid transparent; transition: background-color 120ms ease, border-color 120ms ease;
 }
-.gt-row:hover { background: var(--background-secondary-hover, rgba(127,127,127,0.09)); border-color: var(--separator-border, rgba(127,127,127,0.2)); }
+.gt-row:hover { background: var(--gt-raised); border-color: var(--gt-border); }
 .gt-row-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
 .gt-row-title { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
 .gt-rank { font-size: 11px; min-width: 16px; opacity: 0.42; font-variant-numeric: tabular-nums; }
@@ -1597,8 +1915,8 @@ const CSS = `
 .gt-repo:hover { text-decoration: underline; }
 .gt-repo-owner { font-weight: 400; opacity: 0.6; }
 .gt-sep { white-space: pre; }
-.gt-move { font-size: 10.5px; padding: 1px 5px; border-radius: 5px; background: var(--background-secondary-default, rgba(127,127,127,0.14)); opacity: 0.8; font-variant-numeric: tabular-nums; }
-.gt-move--new { background: var(--accent-300, rgba(46,160,67,0.2)); font-weight: 600; opacity: 1; }
+.gt-move { font-size: 10.5px; padding: 1px 5px; border-radius: 5px; background: var(--gt-raised); opacity: 0.8; font-variant-numeric: tabular-nums; }
+.gt-move--new { background: rgba(46,160,67,0.18); font-weight: 600; opacity: 1; }
 .gt-desc { margin: 0; font-size: 12.5px; line-height: 1.55; opacity: 0.75; }
 .gt-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 11.5px; opacity: 0.66; }
 .gt-lang { display: inline-flex; align-items: center; gap: 5px; }
@@ -1606,27 +1924,137 @@ const CSS = `
 .gt-gain { font-variant-numeric: tabular-nums; }
 .gt-stat { font-variant-numeric: tabular-nums; }
 .gt-empty { font-size: 12.5px; opacity: 0.6; padding: 24px 4px; }
-.gt-dropped { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--separator-border, rgba(127,127,127,0.2)); }
+.gt-dropped { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--gt-border); }
 .gt-dropped h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; opacity: 0.7; }
 .gt-dropped p { margin: 0; font-size: 12px; opacity: 0.6; word-break: break-all; }
-.gt-digest { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--separator-border, rgba(127,127,127,0.2)); }
+.gt-digest { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--gt-border); }
 .gt-digest-head { display: flex; align-items: baseline; gap: 10px; }
 .gt-digest h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
 .gt-digest-body {
   margin: 0; white-space: pre-wrap; word-break: break-word;
   font: inherit; font-size: 13px; line-height: 1.7;
 }
-.gt-settings { display: flex; flex-direction: column; gap: 14px; max-width: 560px; }
-.gt-settings h3 { margin: 6px 0 0; font-size: 13px; font-weight: 600; opacity: 0.8; }
-.gt-field { display: flex; flex-direction: column; gap: 5px; }
-.gt-field-label { font-size: 12.5px; font-weight: 500; }
-.gt-field-hint { font-size: 11.5px; opacity: 0.6; line-height: 1.5; }
-.gt-input {
-  font: inherit; font-size: 13px; padding: 7px 9px; border-radius: 7px;
-  border: 1px solid var(--separator-border, rgba(127,127,127,0.3));
-  background: var(--background-primary-default, transparent); color: inherit;
+.gt-settings {
+  --gt-control: #d4d4d4;
+  --gt-text: #0a0a0a; --gt-muted: #6b6b6b; --gt-border: #e6e6e6;
+  --gt-surface: #ffffff; --gt-raised: #f6f7f9; --gt-accent: #1d5fbf;
+  max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column;
+  color: var(--gt-text); font-size: 14px; line-height: 1.6;
+  container-type: inline-size;
 }
-.gt-settings-foot { font-size: 11.5px; opacity: 0.5; margin: 4px 0 0; }
+.dark .gt-settings, .dark.gt-settings {
+  --gt-text: #f2f3f5; --gt-muted: #a3a7ad; --gt-border: #2a2d32;
+  --gt-surface: #17191c; --gt-raised: #1d2024; --gt-control: #3a3e44;
+  --gt-accent: #5b9bf0;
+}
+@media (prefers-color-scheme: dark) {
+  .gt-settings {
+    --gt-text: #f2f3f5; --gt-muted: #a3a7ad; --gt-border: #2a2d32;
+    --gt-surface: #17191c; --gt-raised: #1d2024; --gt-control: #3a3e44;
+    --gt-accent: #5b9bf0;
+  }
+}
+.gt-settings-intro { margin: 0 0 8px; font-size: 13px; color: var(--gt-muted); }
+.gt-section {
+  display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 32px;
+  padding: 26px 0; border-top: 1px solid var(--gt-border);
+}
+.gt-section:first-of-type { border-top: 0; padding-top: 8px; }
+.gt-section-label h2 { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.4; }
+.gt-section-label p { margin: 6px 0 0; font-size: 13px; line-height: 1.55; color: var(--gt-muted); }
+.gt-section-panel {
+  display: flex; flex-direction: column; gap: 18px;
+  background: var(--gt-surface); border: 1px solid var(--gt-border);
+  border-radius: 12px; padding: 18px;
+}
+.gt-field { display: flex; flex-direction: column; gap: 6px; }
+.gt-field > label { font-size: 14px; font-weight: 500; }
+.gt-field .gt-hint { font-size: 12px; line-height: 1.5; color: var(--gt-muted); }
+.gt-settings .gt-input {
+  width: 100%; height: 36px; box-sizing: border-box; font: inherit; font-size: 13px;
+  padding: 0 12px; border-radius: 6px;
+  border: 1px solid var(--gt-control); background: var(--gt-surface); color: var(--gt-text);
+}
+.gt-settings .gt-input::placeholder { color: var(--gt-muted); }
+.gt-settings .gt-input:focus { outline: 2px solid var(--gt-accent); outline-offset: -1px; }
+.gt-settings .gt-path { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.gt-settings .gt-btn {
+  height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;
+  border: 1px solid var(--gt-control); background: var(--gt-surface); color: var(--gt-text);
+}
+.gt-settings .gt-btn:hover:not(:disabled) { background: var(--gt-raised); }
+.gt-settings .gt-btn.ghost { border-color: transparent; background: transparent; color: var(--gt-muted); }
+.gt-settings .gt-btn.ghost:hover:not(:disabled) { background: var(--gt-raised); color: var(--gt-text); }
+.gt-settings .gt-path-pick { flex: none; }
+
+/* 自绘下拉 */
+.gt-dd { position: relative; width: 100%; }
+.gt-dd-trigger {
+  width: 100%; height: 36px; box-sizing: border-box; padding: 0 12px;
+  display: flex; align-items: center; gap: 8px; cursor: pointer;
+  font: inherit; font-size: 13px; text-align: left;
+  border: 1px solid var(--gt-control); border-radius: 6px;
+  background: var(--gt-surface); color: var(--gt-text);
+}
+.gt-dd-trigger:hover:not(:disabled) { border-color: var(--gt-muted); }
+.gt-dd-trigger:focus-visible { outline: 2px solid var(--gt-accent); outline-offset: -1px; }
+.gt-dd-trigger:disabled { opacity: 0.55; cursor: not-allowed; }
+.gt-dd.is-open .gt-dd-trigger { border-color: var(--gt-accent); }
+.gt-dd-value { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gt-dd-value.is-empty { color: var(--gt-muted); }
+.gt-dd-caret {
+  flex: none; width: 7px; height: 7px; margin-top: -4px;
+  border-right: 1.5px solid var(--gt-muted); border-bottom: 1.5px solid var(--gt-muted);
+  transform: rotate(45deg); transition: transform 120ms ease;
+}
+.gt-dd.is-open .gt-dd-caret { transform: rotate(-135deg); margin-top: 3px; }
+.gt-dd-scrim { position: fixed; inset: 0; z-index: 80; }
+.gt-dd-menu {
+  position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 81;
+  max-height: 260px; overflow-y: auto; padding: 4px;
+  background: var(--gt-surface); border: 1px solid var(--gt-border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+.gt-dd.is-up .gt-dd-menu { top: auto; bottom: calc(100% + 6px); }
+.gt-dd-item {
+  display: flex; align-items: center; gap: 8px; padding: 7px 9px;
+  border-radius: 5px; font-size: 13px; cursor: pointer; outline: none;
+}
+.gt-dd-item.is-active { background: var(--gt-raised); }
+.gt-dd-item.is-disabled { opacity: 0.45; cursor: default; }
+.gt-dd-item.is-disabled.is-active { background: transparent; }
+.gt-dd-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gt-dd-check { flex: none; font-size: 12px; color: var(--gt-accent); opacity: 0; }
+.gt-dd-item[aria-selected="true"] .gt-dd-check { opacity: 1; }
+.gt-dd-empty { padding: 8px 10px; font-size: 12px; color: var(--gt-muted); }
+
+/* 可折叠的次要项：Token 之类默认收起来 */
+.gt-disclosure { border-top: 1px solid var(--gt-border); padding-top: 14px; }
+.gt-disclosure:last-child { padding-bottom: 0; }
+.gt-disclosure > summary {
+  cursor: pointer; font-size: 13px; color: var(--gt-muted); list-style: none;
+  display: flex; align-items: center; gap: 6px; padding: 2px 0;
+}
+.gt-disclosure > summary::-webkit-details-marker { display: none; }
+.gt-disclosure > summary::before { content: "▸"; font-size: 10px; line-height: 1; }
+.gt-disclosure[open] > summary::before { content: "▾"; }
+.gt-disclosure > summary:hover { color: var(--gt-text); }
+.gt-disclosure-body { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.gt-disclosure-body .gt-hint { margin: 0; font-size: 12px; line-height: 1.6; color: var(--gt-muted); }
+
+/* 只放一段说明的卡片：别留出字段间距那么大的尾部空白 */
+.gt-section-panel > .gt-note-line:last-child { margin-bottom: 0; }
+
+.gt-note-line { margin: 0; font-size: 13px; line-height: 1.6; color: var(--gt-muted); }
+.gt-note-line code {
+  padding: 1px 5px; border-radius: 4px; font-size: 12px;
+  background: var(--gt-raised); border: 1px solid var(--gt-border);
+}
+.gt-settings-foot { font-size: 12px; color: var(--gt-muted); margin: 16px 0 0; }
+
+@container (max-width: 720px) {
+  .gt-section { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 20px 0; }
+}
 @container (max-width: 520px) {
   .gt-group--end { margin-left: 0; width: 100%; }
   .gt-row { padding: 8px 6px; }

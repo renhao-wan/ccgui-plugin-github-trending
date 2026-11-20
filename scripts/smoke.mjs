@@ -60,9 +60,11 @@ const day2 = [
 /* ------------------------------------------------------------ React 替身 */
 
 let stateSlots = new Map();
+let refSlots = new Map();
 const effectStores = new WeakMap();
 let effectStore = new Map();
 let stateIdx = 0;
+let refIdx = 0;
 let effectIdx = 0;
 const pendingEffects = [];
 
@@ -78,7 +80,13 @@ const fakeReact = {
   },
   useMemo: (fn) => fn(),
   useCallback: (fn) => fn,
-  useRef: (init) => ({ current: init === undefined ? null : init }),
+  useRef: (init) => {
+    // ref 必须跨渲染保持同一个对象：防抖定时器、baseline 都挂在 ref 上，
+    // 每次返回新对象会让「改动即自动保存」永远走首次渲染分支。
+    const i = refIdx++;
+    if (!refSlots.has(i)) refSlots.set(i, { current: init === undefined ? null : init });
+    return refSlots.get(i);
+  },
   useSyncExternalStore: (subscribe, getSnapshot) => {
     subscribe(() => {});
     return getSnapshot();
@@ -124,14 +132,32 @@ function expand(node) {
 
 function renderFresh(comp, props, opts) {
   stateSlots = new Map();
+  refSlots = new Map();
   effectStore = new Map();
   effectStores.set(comp, effectStore);
   stateIdx = 0;
+  refIdx = 0;
   effectIdx = 0;
   pendingEffects.length = 0;
   const tree = expand(comp(props || {}));
   if (opts && opts.effects) flushEffects();
   else pendingEffects.length = 0;
+  return tree;
+}
+
+/**
+ * 保留组件内部状态的渲染：下拉展开、输入框内容这类局部状态要跨渲染存在，
+ * 否则「点了展开再看菜单」永远看不到菜单。effect 照常在依赖变化时重跑。
+ */
+function renderKeep(comp, props) {
+  effectStore = effectStores.get(comp) || new Map();
+  effectStores.set(comp, effectStore);
+  stateIdx = 0;
+  refIdx = 0;
+  effectIdx = 0;
+  pendingEffects.length = 0;
+  const tree = expand(comp(props || {}));
+  flushEffects();
   return tree;
 }
 
@@ -511,25 +537,87 @@ await check("页面结构变化时给出明确提示而不是空榜单", async (
   assert.ok(await waitFor(() => textOf(render()).includes("页面结构可能已变化")), "应提示结构变化");
 });
 
-await check("设置页：引擎列表过滤未启用项，改动会持久化", async () => {
+/** 找到文本匹配的下拉触发器（Dropdown 未展开时不渲染选项）。 */
+function findTrigger(node, label) {
+  let hit = null;
+  walk(node, (n) => {
+    if (hit) return;
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-dd-trigger") && textOf(n).includes(label)) hit = n;
+  });
+  return hit;
+}
+
+await check("设置页：分节布局，改动自动保存", async () => {
   renderFresh(settingsDef.component, {}, { effects: true });
-  assert.ok(await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("Claude")));
+  await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("中文解读"));
 
   const text = textOf(renderFresh(settingsDef.component));
-  assert.match(text, /Claude/);
-  assert.match(text, /Codex/);
-  assert.doesNotMatch(text, /Off/, "未启用引擎不应出现");
+  // 三节结构
+  assert.match(text, /显示/);
+  assert.match(text, /中文解读/);
+  assert.match(text, /网络/);
+  // Token 默认折叠，不占版面
+  assert.match(text, /限流了再加 Token/);
+  assert.match(text, /自动保存|已保存/);
 
-  // 语言筛选在失焦时保存
+  // 语言筛选仍是文本输入（自由填英文语言名），改动后防抖自动保存
   const inputs = [];
-  walk(renderFresh(settingsDef.component), (n) => {
-    if (n.type === "input" && n.props && n.props.placeholder && /python/.test(n.props.placeholder)) inputs.push(n);
+  walk(renderFresh(settingsDef.component, {}, { effects: true }), (n) => {
+    if (n.type === "input" && n.props && n.props.placeholder && /全部语言/.test(n.props.placeholder)) inputs.push(n);
   });
   assert.equal(inputs.length, 1, "应只有一个语言筛选输入框");
   inputs[0].props.onChange({ target: { value: "rust" } });
-  inputs[0].props.onBlur({ target: { value: "rust" } });
-  assert.ok(await waitFor(() => kv.has("settings")), "设置应已保存");
+  // onChange 只更新表单，防抖 500ms 后才写盘；这里轮询渲染推进 effect
+  for (let i = 0; i < 40 && !kv.has("settings"); i += 1) {
+    renderKeep(settingsDef.component, {});
+    await sleep(40);
+  }
+  assert.ok(kv.has("settings"), "设置应被自动保存");
   assert.equal(kv.get("settings").language, "rust");
+});
+
+await check("设置页：引擎下拉展开后列出可用引擎，过滤未启用项", async () => {
+  renderFresh(settingsDef.component, {}, { effects: true });
+  // 等引擎列表加载完成（触发器存在且可展开）
+  assert.ok(await waitFor(() => !!findTrigger(renderFresh(settingsDef.component, {}, { effects: true }), "自动"), 1500));
+
+  const engineTrigger = findTrigger(renderKeep(settingsDef.component, {}), "自动（第一个可用引擎）");
+  assert.ok(engineTrigger, "应有引擎下拉触发器");
+  engineTrigger.props.onClick();
+
+  const opened = textOf(renderKeep(settingsDef.component, {}));
+  assert.match(opened, /Claude/, "展开后应列出 Claude");
+  assert.match(opened, /Codex/, "展开后应列出 Codex");
+  assert.doesNotMatch(opened, /Off/, "未启用的引擎不应出现");
+});
+
+await check("设置页：时间档与阈值用下拉而不是手填", async () => {
+  renderFresh(settingsDef.component, {}, { effects: true });
+  assert.ok(await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("今日")));
+  const text = textOf(renderFresh(settingsDef.component));
+  // 下拉触发器显示当前值，而不是空输入框
+  assert.match(text, /今日/, "时间档应显示当前值");
+  assert.match(text, /50（默认）/, "阈值应显示为带说明的选项");
+  // 不应再出现手填的数字输入框
+  let numberInputs = 0;
+  walk(renderFresh(settingsDef.component), (n) => {
+    if (n.type === "input" && n.props && n.props.type === "number") numberInputs += 1;
+  });
+  assert.equal(numberInputs, 0, "阈值不应是手填数字框");
+});
+
+await check("设置页：工作区从侧栏列表选，不需要手打路径", async () => {
+  renderFresh(settingsDef.component, {}, { effects: true });
+  // 假宿主不提供 workspaces，这里只验证「自动」这一项存在、且没有路径输入框
+  assert.ok(await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("自动")));
+  let pathInputs = 0;
+  walk(renderFresh(settingsDef.component), (n) => {
+    if (n.type === "input" && n.props && n.props.placeholder && /工作区路径|D:\\\\|example/.test(n.props.placeholder)) {
+      pathInputs += 1;
+    }
+  });
+  assert.equal(pathInputs, 0, "不应有手填工作区路径的输入框");
 });
 
 await check("卸载会中断在跑的 agent 并复位状态", async () => {
