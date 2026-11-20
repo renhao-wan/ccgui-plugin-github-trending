@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "每日热点：GitHub Trending 与近 7 天新星库",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/renhao-wan/ccgui-plugin-github-trending.git"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test test/",
