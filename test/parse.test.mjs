@@ -78,6 +78,36 @@ test("parseTrending 支持周榜/月榜的增量文案", () => {
   assert.equal(parseTrending(monthly).repos[0].gainPeriod, "monthly");
 });
 
+test("星数锚点带长 svg path 时仍能解析", () => {
+  // 真实页面的 svg path 约 150 字符；GitHub 加大 badge 时会更长。
+  // 旧实现写死 2000 字符窗口，超窗时星数会静默变 null。
+  const html = `<article class="Box-row"><h2><a href="/a/b">x</a></h2>
+<a href="/a/b/stargazers" class="Link"><svg>${"M8 1.5 ".repeat(400)}</svg> 12,687</a></article>`;
+  assert.equal(parseTrending(html).repos[0].stars, 12687);
+});
+
+test("描述里的「N stars today」不会抢走真实增量", () => {
+  const html = `<article class="Box-row"><h2><a href="/a/b">x</a></h2>
+<p class="col-9 color-fg-muted">We got 999 stars today, wow</p>
+<div class="f6"><span>5 stars today</span></div></article>`;
+  assert.equal(parseTrending(html).repos[0].gain, 5);
+});
+
+test("未闭合的 article 不会拖住主线程", () => {
+  // O(n²) 正则在 2MB 未闭合输入上会卡数秒；线性切分应在毫秒级返回。
+  const bad = ('<article class="Box-row">' + "y".repeat(100)).repeat(16000);
+  const t0 = Date.now();
+  const out = parseTrending(bad);
+  const elapsed = Date.now() - t0;
+  assert.equal(out.error, "no_rows");
+  assert.ok(elapsed < 500, `解析耗时 ${elapsed}ms，应保持线性`);
+});
+
+test("/apps/ 之类的非仓库路径不会被当成仓库", () => {
+  const html = `<article class="Box-row"><h2><a href="/apps/foo">x</a><a href="/real/repo">y</a></h2></article>`;
+  assert.equal(parseTrending(html).repos[0].repo, "real/repo");
+});
+
 test("parseTrending 空输入与无行分别给出可区分的错误", () => {
   assert.deepEqual(parseTrending(""), { repos: [], error: "empty_html" });
   assert.deepEqual(parseTrending("   "), { repos: [], error: "empty_html" });

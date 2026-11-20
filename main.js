@@ -73,24 +73,60 @@ function escapeRegExp(input) {
   return String(input).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** 星标/复刻数：锚点内容里夹着 svg path，只认 `</a>` 前的最后一段数字。 */
+/**
+ * 星标/复刻数：锚点内容里夹着 svg path，只认 `</a>` 前的最后一段数字。
+ * 不在正则里限定窗口长度——GitHub 给大仓库加 badge 时 path 会变长，写死窗口
+ * 会让星数静默变 null。这里先定位到锚点，再取它这一段里最后一个数字。
+ */
 function countFromAnchor(article, slug, kind) {
-  const re = new RegExp(
-    'href="/' + escapeRegExp(slug) + "/" + kind + '"[\\s\\S]{0,2000}?([\\d,]+)\\s*</a>',
-  );
-  const m = article.match(re);
-  return m ? toCount(m[1]) : null;
+  const anchor = 'href="/' + escapeRegExp(slug) + "/" + kind + '"';
+  const at = article.search(new RegExp(anchor));
+  if (at < 0) return null;
+  const end = article.indexOf("</a>", at);
+  if (end < 0) return null;
+  const segment = article.slice(at, end);
+  const nums = segment.match(/[\d,]+/g);
+  if (!nums || nums.length === 0) return null;
+  // 锚点 href 里也可能有数字（如 /a/repo2/stargazers），最后一段才是计数
+  return toCount(nums[nums.length - 1]);
 }
+
+/** GitHub 会重定向 /apps、/marketplace 这类非仓库路径，正文里不该当仓库。 */
+const NON_REPO_PREFIX = /^(sponsors|topics|collections|users|login|orgs|apps|marketplace|features|settings|explore|about|pricing|enterprise|security|site|readme)\//i;
 
 function pickSlug(headingHtml) {
   const re = /href="\/([^"\s/]+\/[^"\s/?]+)"/g;
   let m;
   while ((m = re.exec(headingHtml))) {
     const candidate = m[1];
-    if (/^(sponsors|topics|collections|users|login|orgs)\//i.test(candidate)) continue;
+    if (NON_REPO_PREFIX.test(candidate)) continue;
+    // 两段都得是合法仓库名形状，挡掉 /apps/foo 之类残留
+    if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(candidate)) continue;
     return candidate;
   }
   return null;
+}
+
+const ARTICLE_OPEN = '<article class="Box-row">';
+const ARTICLE_CLOSE = "</article>";
+
+/**
+ * 按开/闭标签线性切分，而不是用 `<article…>[\s\S]*?</article>`。
+ * 后者在「有开标签、缺闭标签」时是 O(n²)：GitHub 改版删掉 </article> 会让
+ * 主线程卡死几十秒（2MB 实测 2.3s，正则版本更差）。
+ */
+function splitArticles(html) {
+  const out = [];
+  let from = 0;
+  for (;;) {
+    const open = html.indexOf(ARTICLE_OPEN, from);
+    if (open < 0) break;
+    const close = html.indexOf(ARTICLE_CLOSE, open + ARTICLE_OPEN.length);
+    if (close < 0) break;
+    out.push(html.slice(open, close + ARTICLE_CLOSE.length));
+    from = close + ARTICLE_CLOSE.length;
+  }
+  return out;
 }
 
 /**
@@ -102,7 +138,7 @@ function parseTrending(html) {
   if (typeof html !== "string" || html.trim() === "") {
     return { repos: [], error: "empty_html" };
   }
-  const articles = html.match(/<article class="Box-row">[\s\S]*?<\/article>/g) || [];
+  const articles = splitArticles(html);
   const repos = [];
 
   for (const article of articles) {
@@ -116,7 +152,10 @@ function parseTrending(html) {
     const colorMatch = article.match(
       /<span class="repo-language-color" style="background-color:\s*([^;"]+)\s*;?"/,
     );
-    const gainMatch = article.match(/([\d,]+)\s+stars\s+(today|this week|this month)/);
+    // 增量只在页脚出现，而描述里也可能写「999 stars today」。先把描述段挖掉，
+    // 否则恶意/巧合的描述会盖过真实数字。
+    const footer = descMatch ? article.replace(descMatch[0], "") : article;
+    const gainMatch = footer.match(/([\d,]+)\s+stars\s+(today|this week|this month)/);
 
     repos.push({
       repo: slug,
@@ -159,12 +198,15 @@ function normalise(item) {
   const slash = full.indexOf("/");
   if (slash <= 0 || slash === full.length - 1) return null;
   const created = typeof item.created_at === "string" ? item.created_at : null;
+  const createdTs = created ? Date.parse(created) : NaN;
   return {
     repo: full,
     owner: full.slice(0, slash),
     name: full.slice(slash + 1),
     url: typeof item.html_url === "string" ? item.html_url : "https://github.com/" + full,
-    description: typeof item.description === "string" ? item.description.trim() : "",
+    // 折叠空白是安全要求不只是美观：换行能让恶意描述伪造出一整行榜单事实，
+    // 直接进入解读 prompt。
+    description: typeof item.description === "string" ? item.description.replace(/\s+/g, " ").trim() : "",
     language: typeof item.language === "string" ? item.language : "",
     languageColor: "",
     stars: asCount(item.stargazers_count),
@@ -172,7 +214,7 @@ function normalise(item) {
     gain: asCount(item.stargazers_count),
     gainPeriod: "rising",
     createdAt: created,
-    ageDays: created ? Math.max(0, Math.floor((Date.now() - Date.parse(created)) / 86400000)) : null,
+    ageDays: Number.isFinite(createdTs) ? Math.max(0, Math.floor((Date.now() - createdTs) / 86400000)) : null,
   };
 }
 
@@ -221,8 +263,9 @@ function parseRising(payload) {
   };
 }
 
-/** 设置里的阈值做一次收敛：既防 0 也防离谱值。 */
+/** 设置里的阈值做一次收敛：既防 0 也防离谱值。空输入回落默认值而不是 1。 */
 function normaliseMinStars(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return 50;
   const n = Number(value);
   if (!Number.isFinite(n)) return 50;
   return Math.min(100000, Math.max(1, Math.round(n)));
@@ -410,7 +453,11 @@ const REQUEST_TIMEOUT_MS = 20000;
 const AGENT_TIMEOUT_MS = 120000;
 const TRENDING_TEXT_LIMIT = 2_000_000;
 
-/** 激活期间由 activate 注入；卸载时清空，避免旧实例的回调还读到新实例。 */
+/**
+ * 激活期间由 activate 注入。卸载时不置空：宿主可能在卸载动画期间再渲染一次
+ * 组件，置空会让那次渲染直接抛错。生命周期隔离靠 activateSeq / genSeq /
+ * digestSeq 三代际号，不靠这个引用。
+ */
 let appCtx = null;
 
 const PERIODS = [
@@ -445,7 +492,6 @@ const DEFAULT_STATE = {
   loading: false,
   loaded: false,
   digest: "",
-  digestSaved: "",
   digestTruncated: false,
   digestIncluded: 0,
   digestTotal: 0,
@@ -453,6 +499,7 @@ const DEFAULT_STATE = {
   engines: [],
   engineModels: [],
   modelsLoading: false,
+  modelsError: "",
 };
 
 const store = { snap: { ...DEFAULT_STATE }, listeners: new Set() };
@@ -495,9 +542,7 @@ function useSnap() {
 
 let genSeq = 0;
 let digestSeq = 0;
-let activeRunId = null;
 let activateSeq = 0;
-let digestPhase = 0;
 
 const THIN_ICON = {
   width: 16,
@@ -543,10 +588,6 @@ function fmtTime(ts) {
 /** 只允许 https 链接进 DOM；其它一律当纯文本。 */
 function safeHref(url) {
   return typeof url === "string" && /^https:\/\/[a-z0-9.-]+(\/|$)/i.test(url) ? url : null;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function withTimeout(promise, ms, label) {
@@ -690,17 +731,55 @@ async function readSnapshot(ctx, period, language) {
   }
 }
 
+/**
+ * 写快照。同一路径的并发写会 CAS 冲突：快速切语言/时间档时两次写会读到同一个
+ * version，后者被吞掉，导致快照停在旧数据、下次刷新把已上榜的重标成「新上榜」。
+ * 这里按路径串行化，并在冲突后重读 version 重试一次。
+ */
+const snapshotLocks = new Map();
+
 async function writeSnapshot(ctx, period, language, repos) {
   const rel = historyPath(period, language);
-  const content = JSON.stringify({ savedAt: new Date().toISOString(), repos });
+  const prev = snapshotLocks.get(rel) || Promise.resolve();
+  const next = prev.then(
+    () => writeSnapshotOnce(ctx, rel, period, language, repos),
+    () => writeSnapshotOnce(ctx, rel, period, language, repos),
+  );
+  snapshotLocks.set(rel, next.catch(() => {}));
   try {
-    let expected = null;
-    const existing = await ctx.documentStorage.readText(rel);
-    if (existing) expected = existing.version;
-    await ctx.documentStorage.writeTextAtomic(rel, content, expected);
-    await cleanupBackups(ctx, rel);
-  } catch {
-    // 快照只是增强：写失败不该让用户看不到榜单。
+    await next;
+  } finally {
+    if (snapshotLocks.get(rel) === next || snapshotLocks.get(rel) === undefined) snapshotLocks.delete(rel);
+  }
+}
+
+async function writeSnapshotOnce(ctx, rel, period, language, repos) {
+  const content = JSON.stringify({ savedAt: new Date().toISOString(), repos });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      let expected = null;
+      const existing = await ctx.documentStorage.readText(rel);
+      if (existing) expected = existing.version;
+      // 内容没变就不覆盖：省一次写盘，也不必清理 .bak。
+      if (existing) {
+        try {
+          const parsed = JSON.parse(existing.content);
+          if (Array.isArray(parsed && parsed.repos) && snapshotSignature(parsed.repos) === snapshotSignature(repos)) {
+            return;
+          }
+        } catch {
+          /* 旧文件损坏：直接覆盖 */
+        }
+      }
+      await ctx.documentStorage.writeTextAtomic(rel, content, expected);
+      await cleanupBackups(ctx, rel);
+      return;
+    } catch (error) {
+      // 只有 CAS 冲突值得重试；其它错误（权限、目录）重试也没用。
+      if (attempt === 0 && /conflict/i.test(String(error && error.message))) continue;
+      // 快照只是增强：写失败不该让用户看不到榜单。
+      return;
+    }
   }
 }
 
@@ -766,18 +845,22 @@ async function refresh(ctx, options) {
   if (seq !== genSeq) return;
 
   if (!result.ok) {
+    const key = view + ":" + period + ":" + language;
+    // 失败时优先保住用户正在看的内容：同一视图的旧数据 > 本地快照 > 空。
+    const sameView = snap.source === key && snap.repos.length > 0;
     const cached = view === "rising" ? null : await readSnapshot(ctx, period, language);
     if (seq !== genSeq) return;
+    const fallback = sameView ? snap.repos : cached ? diffSnapshot(cached, null).repos : [];
     set({
       loading: false,
       loaded: true,
       errorKind: result.kind,
       httpError: result.message,
-      source: view + ":" + period + ":" + language,
-      repos: cached ? diffSnapshot(cached, null).repos : [],
-      dropped: [],
-      isFirstRun: cached ? true : store.snap.isFirstRun,
-      loadedAt: cached ? Date.now() : null,
+      source: key,
+      repos: fallback,
+      dropped: sameView ? snap.dropped : [],
+      isFirstRun: sameView ? snap.isFirstRun : Boolean(cached),
+      loadedAt: sameView ? snap.loadedAt : cached ? Date.now() : null,
     });
     return;
   }
@@ -824,7 +907,7 @@ async function resolveWorkspace(ctx, settings) {
 }
 
 async function loadEngines(ctx) {
-  set({ modelsLoading: true });
+  set({ modelsLoading: true, modelsError: "" });
   try {
     const engines = await ctx.models.listEngines();
     const list = (Array.isArray(engines) ? engines : []).filter(
@@ -833,8 +916,14 @@ async function loadEngines(ctx) {
     set({ engines: list, modelsLoading: false });
     const chosen = store.snap.settings.engine || (list[0] && list[0].id) || "";
     if (chosen) await loadModels(ctx, chosen);
-  } catch {
-    set({ engines: [], engineModels: [], modelsLoading: false });
+  } catch (error) {
+    // 「读不到引擎列表」和「一个引擎都没装」是两回事，提示不能混。
+    set({
+      engines: [],
+      engineModels: [],
+      modelsLoading: false,
+      modelsError: "读取引擎列表失败：" + messageOf(error),
+    });
   }
 }
 
@@ -855,18 +944,109 @@ async function loadModels(ctx, engine) {
   }
 }
 
+/**
+ * 一轮解读的完整生命周期。把它收成一个对象而不是散在闭包里，是为了让
+ * 「start 还在飞的时候用户点停止」也能被正确处理——那种时刻还没有 runId，
+ * 只有会话对象知道这一轮已经作废。
+ */
+let activeDigest = null;
+
+function newDigestSession(seq) {
+  return {
+    seq,
+    runId: null,
+    // start 还没 resolve 就被停止/切走：拿到 runId 后必须立刻 interrupt，
+    // 否则宿主那侧的进程会跑到底、一直烧 token。
+    cancelled: false,
+    interrupted: false,
+    settled: false,
+    timer: null,
+    off: null,
+  };
+}
+
+/** 释放这一轮的事件订阅与定时器；幂等。 */
+function releaseSession(session) {
+  if (!session) return;
+  session.settled = true;
+  if (session.timer) {
+    clearTimeout(session.timer);
+    session.timer = null;
+  }
+  if (session.off) {
+    try {
+      session.off();
+    } catch {
+      /* 宿主可能已回收 */
+    }
+    session.off = null;
+  }
+  if (activeDigest === session) activeDigest = null;
+}
+
+/**
+ * 打断这一轮在宿主侧的 run。
+ *
+ * 与 releaseSession 分开，是因为「停止」可能发生在 start 还没返回的时候：
+ * 那一刻没有 runId 可打断，只能先记下 cancelled；等 start resolve 拿到 runId
+ * 后再补这一刀。合并进幂等清理里就会被 settled 守卫挡掉，留下孤儿进程。
+ */
+function interruptSession(session, interruptRun) {
+  if (!session || !session.cancelled || !session.runId || session.interrupted) return;
+  session.interrupted = true;
+  try {
+    void interruptRun(session.runId);
+  } catch {
+    /* 已结束 */
+  }
+}
+
+function disposeSession(session, interruptRun) {
+  releaseSession(session);
+  interruptSession(session, interruptRun);
+}
+
+/** 停止当前解读：无论它处于「准备中」「start 在飞」还是「流式中」。 */
+function abortDigest(ctx) {
+  digestSeq += 1;
+  const session = activeDigest;
+  if (session) session.cancelled = true;
+  disposeSession(session, (runId) => ctx.agent.interrupt(runId));
+  set({ generating: false });
+}
+
+/** 兼容旧调用名。 */
+function stopDigest(ctx) {
+  abortDigest(ctx);
+}
+
 async function generateDigest(ctx) {
   const snap = store.snap;
   if (snap.repos.length === 0) {
     set({ httpError: "先刷新出榜单再生成解读" });
     return;
   }
-  if (snap.generating) return;
+  if (snap.generating || activeDigest) return;
 
   const settings = snap.settings;
   const view = snap.view;
   const period = view === "rising" ? RISING_PERIOD.key : settings.period;
   const seq = ++digestSeq;
+
+  // 立刻置 generating：下面有两个 await，等到那时再置，双击就能开出两轮。
+  set({
+    generating: true,
+    digest: "",
+    httpError: "",
+  });
+  const session = newDigestSession(seq);
+  activeDigest = session;
+
+  const bailed = (message) => {
+    if (activeDigest === session) activeDigest = null;
+    session.settled = true;
+    if (seq === digestSeq) set({ generating: false, httpError: message });
+  };
 
   const built = buildDigestPrompt({
     view,
@@ -876,69 +1056,29 @@ async function generateDigest(ctx) {
     dropped: snap.dropped,
     isFirstRun: snap.isFirstRun,
   });
+  set({ digestTruncated: built.truncated, digestIncluded: built.included, digestTotal: built.total });
 
   const workspace = await resolveWorkspace(ctx, settings);
-  if (seq !== digestSeq) return;
-  if (!workspace) {
-    set({ httpError: "还没有可用工作区：请先在设置里填写 agent 的工作区路径" });
-    return;
-  }
+  if (seq !== digestSeq || session.cancelled) return bailed("");
+  if (!workspace) return bailed("还没有可用工作区：请先在设置里填写 agent 的工作区路径");
 
   // 中央页签不会先打开设置页，引擎列表要在这里按需补一次。
   if (store.snap.engines.length === 0) {
     await loadEngines(ctx);
-    if (seq !== digestSeq) return;
+    if (seq !== digestSeq || session.cancelled) return bailed("");
   }
 
   const engine = String(settings.engine || (store.snap.engines[0] && store.snap.engines[0].id) || "").trim();
   if (!engine) {
-    set({ httpError: "没有可用引擎，请先在设置里选择" });
-    return;
+    return bailed(store.snap.modelsError || "没有可用引擎，请先在设置里选择");
   }
 
-  const runLabel = "digest";
-
-  set({
-    generating: true,
-    digest: "",
-    digestTruncated: built.truncated,
-    digestIncluded: built.included,
-    digestTotal: built.total,
-    httpError: "",
-  });
-
-  let expectedRunId = null;
-  let settled = false;
   let queued = [];
   let text = "";
-  let timer = null;
-
-  // 订阅必须在 start 之前建立：宿主可能先推 delta，再 resolve runId。
-  const onEvent = (event) => {
-    if (!event || typeof event !== "object") return;
-    if (!expectedRunId) {
-      queued.push(event);
-      if (queued.length > 500) queued.shift();
-      return;
-    }
-    if (event.runId !== expectedRunId) return;
-    handleEvent(event);
-  };
 
   const finish = (error, value) => {
-    if (settled) return;
-    settled = true;
-    if (timer) clearTimeout(timer);
-    activeRunId = null;
-    if (activeDigestOff === off) activeDigestOff = null;
-    off();
-    if (error && expectedRunId) {
-      try {
-        void ctx.agent.interrupt(expectedRunId);
-      } catch {
-        /* 宿主侧可能已经结束 */
-      }
-    }
+    if (session.settled) return;
+    disposeSession(session, null);
     if (seq !== digestSeq) return;
     if (error) {
       set({ generating: false, httpError: messageOf(error) });
@@ -948,6 +1088,7 @@ async function generateDigest(ctx) {
   };
 
   const handleEvent = (event) => {
+    if (session.settled) return;
     if (event.kind === "delta") {
       const piece =
         typeof event.data === "object" && event.data
@@ -970,9 +1111,19 @@ async function generateDigest(ctx) {
     }
   };
 
-  const off = ctx.events.on("agent://" + PLUGIN_ID, onEvent);
-  activeDigestOff = off;
-  timer = setTimeout(() => finish(new Error("生成超时")), AGENT_TIMEOUT_MS);
+  // 订阅必须在 start 之前建立：宿主可能先推 delta，再 resolve runId。
+  session.off = ctx.events.on("agent://" + PLUGIN_ID, (event) => {
+    if (!event || typeof event !== "object" || session.settled) return;
+    if (!session.runId) {
+      queued.push(event);
+      if (queued.length > 500) queued.shift();
+      return;
+    }
+    if (event.runId !== session.runId) return;
+    handleEvent(event);
+  });
+
+  session.timer = setTimeout(() => finish(new Error("生成超时")), AGENT_TIMEOUT_MS);
 
   try {
     const started = await ctx.agent.start({
@@ -982,43 +1133,28 @@ async function generateDigest(ctx) {
       prompt: built.prompt,
       readOnly: true,
     });
-    expectedRunId = started && started.runId ? started.runId : null;
-    activeRunId = expectedRunId;
+    const runId = started && started.runId ? started.runId : null;
+    session.runId = runId;
+
+    // 用户在 start 期间点了停止 / 切了视图 / 卸载了插件：这一轮已经作废，
+    // 但宿主的进程刚起来，必须当场打断。
+    if (session.cancelled || seq !== digestSeq) {
+      session.cancelled = true;
+      interruptSession(session, (id) => ctx.agent.interrupt(id));
+      releaseSession(session);
+      return;
+    }
+
     const buffered = queued;
     queued = [];
+    // 没有 runId 时退化为接收全部：本插件同一时刻只跑一轮解读，没有别的轮次可混淆。
     for (const event of buffered) {
-      if (expectedRunId && event.runId !== expectedRunId) continue;
+      if (runId && event.runId !== runId) continue;
       handleEvent(event);
     }
   } catch (error) {
     finish(error);
   }
-}
-
-/** 当前这一轮解读的事件订阅；每轮只有一条，结束时立即释放。 */
-let activeDigestOff = null;
-
-function stopDigest(ctx) {
-  digestSeq += 1;
-  const run = activeRunId;
-  activeRunId = null;
-  if (activeDigestOff) {
-    const off = activeDigestOff;
-    activeDigestOff = null;
-    try {
-      off();
-    } catch {
-      /* 宿主可能已回收 */
-    }
-  }
-  if (run) {
-    try {
-      void ctx.agent.interrupt(run);
-    } catch {
-      /* 已结束 */
-    }
-  }
-  set({ generating: false });
 }
 
 /* ---------- 渲染 ---------- */
@@ -1041,6 +1177,12 @@ function Chip(props) {
 function Dot({ color }) {
   const h = appCtx.react.createElement;
   return h("span", { className: "gt-dot", style: color ? { background: color } : undefined, "aria-hidden": "true" });
+}
+
+/** 增量单位跟着榜单时间档走，周榜不能写「今日」。 */
+const GAIN_LABEL = { daily: "今日", weekly: "本周", monthly: "本月", rising: "star" };
+function gainLabel(period) {
+  return GAIN_LABEL[period] || "近期";
 }
 
 function movementLabel(row) {
@@ -1088,7 +1230,7 @@ function RepoRow({ row }) {
           ? h(
               "span",
               { className: "gt-gain" },
-              "+" + fmtNumber(row.gain) + (row.gainPeriod === "rising" ? " star" : " 今日"),
+              "+" + fmtNumber(row.gain) + " " + gainLabel(row.gainPeriod),
             )
           : null,
         Number.isFinite(row.ageDays) ? h("span", { className: "gt-stat" }, row.ageDays + " 天前创建") : null,
@@ -1099,13 +1241,17 @@ function RepoRow({ row }) {
 
 function Toolbar({ snap, ctx }) {
   const h = appCtx.react.createElement;
+  // 切视图/时间档会让榜单换掉，正在生成的解读说的是旧榜单，必须一并停掉，
+  // 否则旧轮次的 delta 会继续写进新视图，而且宿主那侧还在烧 token。
   const onView = (view) => {
     if (view === snap.view) return;
+    if (snap.generating) stopDigest(ctx);
     set({ view, digest: "", dropped: [], isFirstRun: true, repos: [], loaded: false });
     void refresh(ctx, { force: true });
   };
   const onPeriod = (period) => {
     if (period === snap.settings.period) return;
+    if (snap.generating) stopDigest(ctx);
     setSettings({ period });
     void persistSettings(ctx, { period });
     set({ loaded: false, repos: [], digest: "", dropped: [] });
@@ -1163,12 +1309,12 @@ function StatusLine({ snap }) {
   const h = appCtx.react.createElement;
   if (snap.loading) return h("p", { className: "gt-notice" }, "正在抓取 GitHub…");
   if (snap.httpError) {
-    const cacheHint = snap.view === "trending" && snap.repos.length > 0;
+    const cacheHint = snap.repos.length > 0;
     return h(
       "div",
       { className: "gt-notice gt-notice--error", role: "status" },
       h("span", null, snap.httpError),
-      cacheHint ? h("span", { className: "gt-notice-hint" }, "（当前显示的是上次缓存）") : null,
+      cacheHint ? h("span", { className: "gt-notice-hint" }, "（当前显示的是上次的结果）") : null,
     );
   }
   if (!snap.loaded) return h("p", { className: "gt-notice" }, "点「刷新」拉取榜单。");
@@ -1274,7 +1420,14 @@ function SettingsSection() {
 
   const engineOptions = snap.engines.length
     ? snap.engines
-    : [{ id: "", name: snap.modelsLoading ? "读取引擎列表中…" : "（无可用引擎）" }];
+    : [
+        {
+          id: "",
+          name: snap.modelsLoading
+            ? "读取引擎列表中…"
+            : snap.modelsError || "（没有可用引擎）",
+        },
+      ];
   const modelOptions = snap.engineModels.length ? snap.engineModels : [""];
 
   return h(
@@ -1566,23 +1719,9 @@ export default function activate(ctx) {
     activateSeq += 1;
     genSeq += 1;
     digestSeq += 1;
-    const run = activeRunId;
-    activeRunId = null;
-    if (run) {
-      try {
-        void ctx.agent.interrupt(run);
-      } catch {
-        /* 已结束 */
-      }
-    }
-    if (activeDigestOff) {
-      try {
-        activeDigestOff();
-      } catch {
-        /* 宿主可能已回收 */
-      }
-      activeDigestOff = null;
-    }
+    const session = activeDigest;
+    if (session) session.cancelled = true;
+    disposeSession(session, (runId) => ctx.agent.interrupt(runId));
     try {
       cssDisposer();
     } catch {

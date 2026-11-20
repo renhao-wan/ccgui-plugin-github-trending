@@ -208,7 +208,8 @@ const GOOD_SEARCH = {
   }),
 };
 let searchPayload = GOOD_SEARCH;
-let agentMode = "stream"; // stream | error | silent
+let agentMode = "stream"; // stream | error | silent | slow-start
+let agentStartDelay = 200;
 let agentRunIdx = 0;
 
 function emit(ev) {
@@ -316,6 +317,11 @@ const ctx = {
       const idx = agentRunIdx;
       const runId = "run-" + idx;
       if (agentMode === "silent") return { runId, sessionId: null };
+      if (agentMode === "slow-start") {
+        // start 迟迟不 resolve：用来验证「start 在飞时点停止」不会留下孤儿进程
+        await sleep(agentStartDelay);
+        return { runId, sessionId: null };
+      }
       setTimeout(() => {
         if (agentMode === "error") {
           emit({ runId, kind: "error", data: { message: "模型炸了" } });
@@ -481,16 +487,22 @@ await check("切到新星库走 Search API 并渲染", async () => {
   assert.ok(httpCalls.some((c) => c.url.startsWith("https://api.github.com/search/repositories")));
 });
 
-await check("限流时保留缓存并给出可读提示", async () => {
-  // 回到 Trending，先确保有数据
-  findByText(render(), "Trending").props.onClick();
-  assert.ok(await waitFor(() => textOf(render()).includes("first fixture repo") || textOf(render()).includes("brand new repo")));
-  const before = countByType(render(), "li");
-  assert.ok(before > 0);
-
-  searchPayload = { status: 403, body: JSON.stringify({ message: "API rate limit exceeded" }) };
+await check("限流时保留已有列表并给出可读提示", async () => {
+  // 先在新星库拿到正常数据
+  searchPayload = GOOD_SEARCH;
   findByText(render(), "新星库（7 天）").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("fresh repo")), "先有数据");
+  const before = countByType(render(), "li");
+  assert.ok(before > 0, "应有列表行");
+
+  // 同一视图刷新时被限流：列表必须还在
+  searchPayload = { status: 403, body: JSON.stringify({ message: "API rate limit exceeded" }) };
+  findByText(render(), "刷新").props.onClick();
   assert.ok(await waitFor(() => textOf(render()).includes("限流")), "应提示限流");
+  const after = countByType(render(), "li");
+  assert.equal(after, before, "限流后列表行数不应变化");
+  assert.match(textOf(render()), /fresh repo/, "内容应保留");
+  assert.match(textOf(render()), /上次缓存|当前显示/, "应说明显示的是旧数据");
 });
 
 await check("页面结构变化时给出明确提示而不是空榜单", async () => {
@@ -558,6 +570,79 @@ await check("快速切换视图时晚到的响应不覆盖新视图", async () =
 
   trendingDelay = 0;
   ctx.bridge.invoke = originalInvoke;
+});
+
+await check("生成解读时切视图会停止这一轮，不串台到新视图", async () => {
+  trendingPayload = { status: 200, body: trendingHtml(day2) };
+  searchPayload = GOOD_SEARCH;
+  kv.delete("settings");
+  agentMode = "silent";
+
+  findByText(render(), "Trending").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("brand new repo")));
+
+  findByText(render(), "生成解读").props.onClick();
+  assert.ok(await waitFor(() => !!findByText(render(), "停止生成")), "应进入生成中");
+  await sleep(60);
+
+  const beforeInterrupts = agentInterrupts.length;
+  // 切到新星库
+  findByText(render(), "新星库（7 天）").props.onClick();
+  assert.ok(await waitFor(() => agentInterrupts.length > beforeInterrupts), "切视图应 interrupt 旧轮次");
+  assert.ok(findByText(render(), "生成解读") === null || findByText(render(), "生成解读"), "按钮应复位");
+
+  // 旧轮次晚到的 delta 不能出现在新视图
+  await sleep(80);
+  const text = textOf(render());
+  assert.doesNotMatch(text, /今天在热什么/, "旧解读的 delta 不应写入新视图");
+  assert.match(text, /fresh repo|正在抓取/, "应显示新星库内容");
+
+  agentMode = "stream";
+  findByText(render(), "Trending").props.onClick();
+  await waitFor(() => textOf(render()).includes("brand new repo"));
+});
+
+await check("start 还没返回时点停止，拿到 runId 后仍会 interrupt", async () => {
+  // 这是最容易被漏掉的路径：stopDigest 执行时 runId 还不存在。
+  agentMode = "slow-start";
+  agentStartDelay = 250;
+
+  findByText(render(), "生成解读").props.onClick();
+  assert.ok(await waitFor(() => !!findByText(render(), "停止生成")), "应立刻进入生成中");
+  await sleep(30); // start 还在飞
+
+  const before = agentInterrupts.length;
+  findByText(render(), "停止生成").props.onClick();
+  assert.ok(findByText(render(), "生成解读"), "按钮应立刻复位");
+
+  // 等 start resolve；必须当场 interrupt 掉刚起来的进程
+  assert.ok(
+    await waitFor(() => agentInterrupts.length > before, 1500),
+    "start resolve 后应 interrupt，避免孤儿进程继续烧 token",
+  );
+
+  agentMode = "stream";
+  agentStartDelay = 200;
+});
+
+await check("start 期间切视图，同样不会留下孤儿进程", async () => {
+  agentMode = "slow-start";
+  agentStartDelay = 200;
+
+  findByText(render(), "生成解读").props.onClick();
+  await sleep(40);
+  const before = agentInterrupts.length;
+  const risingChip = findByText(render(), "新星库（7 天）");
+  assert.ok(risingChip, "应有新星库按钮");
+  risingChip.props.onClick();
+  assert.ok(
+    await waitFor(() => agentInterrupts.length > before, 1500),
+    "切视图后 start 回来也应 interrupt",
+  );
+
+  agentMode = "stream";
+  findByText(render(), "Trending").props.onClick();
+  await waitFor(() => textOf(render()).includes("brand new repo"));
 });
 
 // 放在最后：重新 import 会覆盖模块级的 tabDef/settingsDef，破坏前面用例的装配。

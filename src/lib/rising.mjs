@@ -12,12 +12,15 @@ function normalise(item) {
   const slash = full.indexOf("/");
   if (slash <= 0 || slash === full.length - 1) return null;
   const created = typeof item.created_at === "string" ? item.created_at : null;
+  const createdTs = created ? Date.parse(created) : NaN;
   return {
     repo: full,
     owner: full.slice(0, slash),
     name: full.slice(slash + 1),
     url: typeof item.html_url === "string" ? item.html_url : "https://github.com/" + full,
-    description: typeof item.description === "string" ? item.description.trim() : "",
+    // 折叠空白是安全要求不只是美观：换行能让恶意描述伪造出一整行榜单事实，
+    // 直接进入解读 prompt。
+    description: typeof item.description === "string" ? item.description.replace(/\s+/g, " ").trim() : "",
     language: typeof item.language === "string" ? item.language : "",
     languageColor: "",
     stars: asCount(item.stargazers_count),
@@ -25,7 +28,7 @@ function normalise(item) {
     gain: asCount(item.stargazers_count),
     gainPeriod: "rising",
     createdAt: created,
-    ageDays: created ? Math.max(0, Math.floor((Date.now() - Date.parse(created)) / 86400000)) : null,
+    ageDays: Number.isFinite(createdTs) ? Math.max(0, Math.floor((Date.now() - createdTs) / 86400000)) : null,
   };
 }
 
@@ -74,8 +77,9 @@ export function parseRising(payload) {
   };
 }
 
-/** 设置里的阈值做一次收敛：既防 0 也防离谱值。 */
+/** 设置里的阈值做一次收敛：既防 0 也防离谱值。空输入回落默认值而不是 1。 */
 export function normaliseMinStars(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return 50;
   const n = Number(value);
   if (!Number.isFinite(n)) return 50;
   return Math.min(100000, Math.max(1, Math.round(n)));
