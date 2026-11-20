@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 // 生成 docs/icon.png：256×256、超采样抗锯齿、零依赖。
-// 图形：圆角方形底板 + 时钟环 + 指针（「每日」），绿色取自 GitHub 的 contribution 色。
+//
+// 风格对齐 CC GUI 生态里的插件图标（工作志、斜杠命令面板、CLI 安装审计）：
+// 大圆角纯色底板 + 扁平白色符号，不用渐变、不堆细节——图标在侧栏里只有
+// 18~20px，双层配色 + 12 个刻度这种复杂度到这里全糊成一团。
+//
+// 符号选「递增的三根柱」：GitHub Trending 说的是什么在升温，柱状图一眼就懂，
+// 而且不依赖文字。最右最高的一根用琥珀色，表示榜首/最热。
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -15,11 +21,11 @@ const S = 4;
 const CW = W * S;
 const CH = H * S;
 
-const PLATE_A = [22, 27, 34, 255];
-const PLATE_B = [12, 60, 48, 255];
-const RING = [57, 211, 153, 255];
-const HAND = [240, 246, 252, 255];
-const TICK = [72, 128, 110, 255];
+// 底板：比宿主深色界面（约 #17191c）明显亮一档，否则图标贴在深色侧栏上
+// 会失去边界、看起来像没加载。同时避开工作志的绿、斜杠面板的蓝。
+const PLATE = [45, 52, 63, 255];
+const BAR = [230, 237, 243, 255];
+const BAR_HOT = [240, 136, 62, 255];
 
 const canvas = new Float32Array(CW * CH * 4);
 
@@ -44,82 +50,33 @@ function insideRoundRect(x, y, x0, y0, x1, y1, r) {
   return dx * dx + dy * dy <= r * r;
 }
 
-// 1) 圆角方形底板，斜向渐变
+/** 填充一个圆角矩形（整像素扫描，配合 4× 超采样即为抗锯齿）。 */
+function fillRoundRect(x0, y0, x1, y1, r, color) {
+  for (let y = Math.floor(y0); y <= Math.ceil(y1); y++) {
+    for (let x = Math.floor(x0); x <= Math.ceil(x1); x++) {
+      if (insideRoundRect(x, y, x0, y0, x1, y1, r)) blend(x, y, color);
+    }
+  }
+}
+
+// 1) 圆角方形底板（纯色，无渐变）
 const pad = CW * 0.045;
-for (let y = 0; y < CH; y++) {
-  for (let x = 0; x < CW; x++) {
-    if (!insideRoundRect(x, y, pad, pad, CW - pad, CH - pad, CW * 0.22)) continue;
-    const t = (x / CW + y / CH) / 2;
-    blend(x, y, [
-      Math.round(PLATE_A[0] + (PLATE_B[0] - PLATE_A[0]) * t),
-      Math.round(PLATE_A[1] + (PLATE_B[1] - PLATE_A[1]) * t),
-      Math.round(PLATE_A[2] + (PLATE_B[2] - PLATE_A[2]) * t),
-      255,
-    ]);
-  }
-}
+fillRoundRect(pad, pad, CW - pad, CH - pad, CW * 0.235, PLATE);
 
-const cx = CW / 2;
-const cy = CH / 2;
-const ringR = CW * 0.315;
-const ringW = CW * 0.028;
+// 2) 三根递增柱：底部对齐，高度递增，最右一根高亮
+const barW = CW * 0.148;
+const barGap = CW * 0.086;
+const totalW = barW * 3 + barGap * 2;
+const left = (CW - totalW) / 2;
+const bottom = CH * 0.79;
+const heights = [0.273, 0.437, 0.602].map((t) => CH * t);
+const radius = CW * 0.039;
 
-// 2) 时钟外环
-for (let y = 0; y < CH; y++) {
-  for (let x = 0; x < CW; x++) {
-    const d = Math.hypot(x - cx, y - cy);
-    if (Math.abs(d - ringR) <= ringW) blend(x, y, RING);
-  }
-}
-
-// 3) 12 个刻度，画在环内
-for (let k = 0; k < 12; k++) {
-  const ang = (k / 12) * Math.PI * 2 - Math.PI / 2;
-  const r1 = ringR - ringW - CW * 0.012;
-  const r2 = r1 - (k % 3 === 0 ? CW * 0.062 : CW * 0.036);
-  const dotR = k % 3 === 0 ? CW * 0.0125 : CW * 0.0085;
-  const steps = Math.ceil((r1 - r2) * 2);
-  for (let s = 0; s <= steps; s++) {
-    const t = s / steps;
-    const r = r1 + (r2 - r1) * t;
-    const px = cx + Math.cos(ang) * r;
-    const py = cy + Math.sin(ang) * r;
-    for (let oy = -dotR; oy <= dotR; oy += 0.5) {
-      for (let ox = -dotR; ox <= dotR; ox += 0.5) {
-        if (ox * ox + oy * oy > dotR * dotR) continue;
-        blend(px + ox, py + oy, TICK);
-      }
-    }
-  }
-}
-
-// 4) 指针：时针朝 10 点，分针朝 1 点
-function hand(angle, length, width) {
-  const steps = Math.ceil(length * 2);
-  for (let s = 0; s <= steps; s++) {
-    const r = (s / steps) * length;
-    const px = cx + Math.cos(angle) * r;
-    const py = cy + Math.sin(angle) * r;
-    for (let oy = -width; oy <= width; oy += 0.5) {
-      for (let ox = -width; ox <= width; ox += 0.5) {
-        if (ox * ox + oy * oy > width * width) continue;
-        blend(px + ox, py + oy, HAND);
-      }
-    }
-  }
-}
-
-const deg = (d) => (d * Math.PI) / 180 - Math.PI / 2;
-hand(deg(305), ringR * 0.6, CW * 0.022); // 时针
-hand(deg(48), ringR * 0.82, CW * 0.016); // 分针
-
-// 5) 中心轴
-for (let oy = -CW * 0.042; oy <= CW * 0.042; oy += 0.5) {
-  for (let ox = -CW * 0.042; ox <= CW * 0.042; ox += 0.5) {
-    if (ox * ox + oy * oy > (CW * 0.042) ** 2) continue;
-    blend(cx + ox, cy + oy, RING);
-  }
-}
+heights.forEach((h, i) => {
+  const x0 = left + i * (barW + barGap);
+  const color = i === heights.length - 1 ? BAR_HOT : BAR;
+  fillRoundRect(x0, bottom - h, x0 + barW, bottom, radius, color);
+});
 
 // 下采样（预乘 alpha）
 const rgba = Buffer.alloc(W * H * 4);

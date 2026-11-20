@@ -567,6 +567,22 @@ const THIN_ICON = {
 };
 
 /**
+ * 应用内图标：三根递增柱，与 docs/icon.png 同一套符号。
+ * 侧栏/页签里只有 16px，线条一律 1.5px、不画刻度与指针——细节到这个尺寸只会糊。
+ */
+function Icon(props) {
+  const h = appCtx.react.createElement;
+  return h(
+    "svg",
+    Object.assign({}, THIN_ICON, props && props.className ? { className: props.className } : {}),
+    h("path", { d: "M3.2 12.6V9.4" }),
+    h("path", { d: "M8 12.6V6.6" }),
+    h("path", { d: "M12.8 12.6V3.4" }),
+    h("path", { d: "M2.2 12.6h11.6", "stroke-width": 1.2 }),
+  );
+}
+
+/**
  * Build artefacts inline lib/*.mjs verbatim, but those files are ES modules.
  * A literal `export ` inside a function body is a syntax error, so drop the
  * keyword — every declaration is already a top-level function declaration.
@@ -2323,26 +2339,14 @@ export default function activate(ctx) {
   const tabDisposer = ctx.ui.registerCenterTab({
     key: "main",
     title: () => "每日热点",
-    icon: (props) =>
-      ctx.react.createElement(
-        "svg",
-        Object.assign({}, THIN_ICON, props && props.className ? { className: props.className } : {}),
-        ctx.react.createElement("path", { d: "M8 1.8v5.4l3.6 2.1" }),
-        ctx.react.createElement("circle", { cx: 8, cy: 8, r: 6.2 }),
-      ),
+    icon: Icon,
     component: MainTab,
   });
 
   const sideDisposer = ctx.ui.registerSidebarNav({
     key: "main",
     label: () => "每日热点",
-    icon: (props) =>
-      ctx.react.createElement(
-        "svg",
-        Object.assign({}, THIN_ICON, props && props.className ? { className: props.className } : {}),
-        ctx.react.createElement("path", { d: "M8 1.8v5.4l3.6 2.1" }),
-        ctx.react.createElement("circle", { cx: 8, cy: 8, r: 6.2 }),
-      ),
+    icon: Icon,
     badge: () => {
       const snap = store.snap;
       if (!snap.loaded || snap.loading) return null;
