@@ -1326,6 +1326,25 @@ function rememberDiscussSession(repo, sessionId) {
   }
 }
 
+/**
+ * 把某个仓库标记为「刚刚用过」——**命中已有会话时也必须调用**。
+ *
+ * 只在新建会话时记账是不够的：常点的仓库走的是「直接打开」那条路，从不经过
+ * `rememberDiscussSession`，于是它永远停在队首。等下一份新会话进来，被淘汰的
+ * 就是这个刚点过的仓库——用户下次再点它又变成新开一条，正是这个功能要解决的问题。
+ *
+ * @returns {boolean} 顺序是否真的变了（变了才需要写盘）
+ */
+function touchDiscussSession(repo) {
+  if (!discussSessions.has(repo)) return false;
+  // 已经在队尾就没有可挪的，省一次写盘。
+  if (Array.from(discussSessions.keys()).pop() === repo) return false;
+  const id = discussSessions.get(repo);
+  discussSessions.delete(repo);
+  discussSessions.set(repo, id);
+  return true;
+}
+
 /** 把当前表写回设置。失败不报错：这只是省一次重复开会话，不影响主流程。 */
 function persistDiscussSessions(ctx) {
   const rows = {};
@@ -1436,6 +1455,9 @@ async function discussRepo(ctx, row) {
         // 打开成功也算「这份榜单认领过」：后面的点击继续走这条路。
         discussTouched = true;
         discussSessionsStale = false;
+        // 命中即刷新位置，否则这个仓库会一直是「最久没用过的」，下一份新会话
+        // 进来就被淘汰掉。顺序真的变了才写盘。
+        if (touchDiscussSession(row.repo)) void persistDiscussSessions(ctx);
         set({
           discussing: "",
           discussError: "",

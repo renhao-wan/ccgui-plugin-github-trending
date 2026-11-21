@@ -2351,6 +2351,38 @@ await check("讨论续接：换一行仍然新开，只有同一仓库才复用"
   }
 });
 
+await check("讨论续接：命中也算「刚用过」，下一份新会话不会把它挤掉", async () => {
+  // LRU 的关键不在于「新建时挪到队尾」，而在于**读取时也挪**。常点的仓库走
+  // 「直接打开」那条路，从不经过新建分支——不记读取的话它永远停在队首，
+  // 下一次新开会话就把它淘汰了，用户再点又变成新开一条。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  const seeded = { "alpha/one": "sess-alpha" };
+  // 先塞 39 条凑到 40：alpha/one 在最前（最久没用）。
+  for (let i = 0; i < 39; i += 1) seeded["seed/seed-" + i] = "seed-" + i;
+  let lastSaved = null;
+  const inst = await freshTabInstance(() => ({ discussSessionIds: seeded }), (k, v) => {
+    if (k === "settings") lastSaved = v;
+  });
+  try {
+    // 1) 打开 alpha/one：应把它挪到队尾
+    inst.click("alpha/one");
+    assert.ok(await waitFor(() => sessionSelects.length === 1), "应直接打开");
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+
+    // 2) 再开一个新仓库（beta/two），表已满，应淘汰队首
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    const rows = lastSaved.discussSessionIds;
+    assert.ok(rows["alpha/one"] === "sess-alpha", "刚点开过的 alpha/one 不能被淘汰");
+    assert.ok(!rows["seed/seed-0"], "该淘汰的是最久没用过的那条");
+    assert.equal(Object.keys(rows).length, 40, "仍是 40 条");
+  } finally {
+    inst.dispose();
+  }
+});
+
 await check("讨论续接：会话表落盘，重新激活后仍能直接打开", async () => {
   // 内存表熬不过重装/重激活/宿主重启。只放内存里的话，用户看到的就是
   // 「每点一次都新开一条」——这正是反馈里的原话。
