@@ -266,6 +266,11 @@ let workspaceAddError = null;
 /** 登记新工作区后插件应请宿主补扫会话目录（把之前看不见的旧会话找回来）。 */
 let sessionRefreshes = 0;
 /**
+ * raw.githubusercontent.com 的假响应。默认全部 404——也就是「raw 快路径不命中」，
+ * 让已有用例继续走 API 那条路，断言不用改。需要测快路径的用例显式塞一条。
+ */
+const rawRoutes = new Map();
+/**
  * README 接口的假响应。按仓库名路由，所以能测「展开 A 再展开 B」。
  * `status` 用来覆盖 404 / 限流 / 网络错误。
  */
@@ -587,8 +592,13 @@ const ctx = {
         if (/stars:/.test(q)) return { status: discoverPayload.status, body: discoverPayload.body };
         return { status: searchPayload.status, body: searchPayload.body };
       }
-      // /repos/<owner>/<name>/readme —— 不走 raw.githubusercontent.com，
-      // 是为了复用已有的 network:api.github.com 授权。
+      // raw 快路径：不受 API 配额影响。默认没有路由 → 404，用例按需登记。
+      const raw = /^https:\/\/raw\.githubusercontent\.com\/([^/]+\/[^/]+)\/HEAD\/(.+)$/.exec(args.url);
+      if (raw) {
+        const hit = rawRoutes.get(raw[1] + ":" + raw[2]);
+        return hit ? { status: hit.status, body: hit.body } : { status: 404, body: "404: Not Found" };
+      }
+      // /repos/<owner>/<name>/readme —— raw 没命中时的回落
       const readme = /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)\/readme$/.exec(args.url);
       if (readme) {
         const hit = readmeRoutes.get(readme[1]) || readmeDefault;
@@ -1074,7 +1084,8 @@ await check("登记侧栏工作区失败时不阻断会话，但要说清可能�
   }
 });
 
-await check("README：点行内展开，走 api.github.com 而不是 raw 域名", async () => {
+await check("README：点行内展开，raw 没命中时回落到 api.github.com", async () => {
+  rawRoutes.clear();
   readmeRoutes.clear();
   httpCalls.length = 0;
   let btn = null;
@@ -1086,11 +1097,15 @@ await check("README：点行内展开，走 api.github.com 而不是 raw 域名"
   btn.props.onClick();
 
   assert.ok(await waitFor(() => textOf(render()).includes("用法")), "应渲染出 README 正文");
+  // 先试 raw 的三个文件名（都不占 API 配额），全落空再回落 API。
+  const rawCalls = httpCalls.filter((c) => c.url.startsWith("https://raw.githubusercontent.com/beta/two/HEAD/"));
+  assert.ok(rawCalls.length > 0, "应优先试 raw 快路径");
+  assert.equal(rawCalls[0].url, "https://raw.githubusercontent.com/beta/two/HEAD/README.md");
+  assert.equal(rawCalls[0].headers.Authorization, undefined, "Token 不能发给 raw 域名");
+
   const call = httpCalls.find((c) => c.url.includes("/readme"));
-  assert.ok(call, "应请求 readme 接口");
+  assert.ok(call, "raw 没命中时应请求 readme 接口");
   assert.equal(call.url, "https://api.github.com/repos/beta/two/readme");
-  // 走 api 域名是为了复用已有授权；换成 raw.xxx 就要新增网络权限、重装才生效。
-  assert.doesNotMatch(call.url, /raw\.githubusercontent/);
   assert.match(String(call.headers.Accept), /vnd\.github\.raw/);
 
   // 预处理生效：badge、frontmatter、HTML 标签都不该出现在正文里
@@ -1101,6 +1116,60 @@ await check("README：点行内展开，走 api.github.com 而不是 raw 域名"
   assert.match(bodyText, /一个很长的说明/);
   assert.match(bodyText, /npm i beta-two/, "代码块内容应保留");
 });
+
+await check("README：raw 命中时不再花 API 配额（限流期间也能看）", async () => {
+  // 用独立实例：主实例的会话内缓存里已经有这几个仓库的正文，会挡住请求，
+  // 那样这条用例就测不到「raw 命中后不再打 API」了。
+  const fresh = await import(PLUGIN + "?readme-raw=" + Date.now());
+  let freshTab = null;
+  const dispose2 = fresh.default(
+    Object.assign({}, ctx, {
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: (d) => {
+          freshTab = d;
+          return () => {};
+        },
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: () => () => {},
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  const view = () => renderFresh(freshTab.component, {});
+  try {
+    assert.ok(await waitFor(() => !!freshTab, 2000), "独立实例应注册页签");
+    renderFresh(freshTab.component, {}, { effects: true });
+    const readmeBtn = (repo) => {
+      let hit = null;
+      walk(view(), (n) => {
+        if (!hit && n.type === "button" && n.props && n.props["aria-label"] === "展开 " + repo + " 的 README") hit = n;
+      });
+      return hit;
+    };
+    assert.ok(await waitFor(() => !!readmeBtn("alpha/one"), 3000), "独立实例应渲染出榜单");
+
+    // 配额用完时 API 那条路会 403；raw 不受影响，必须还能读出正文。
+    rawRoutes.clear();
+    readmeRoutes.clear();
+    httpCalls.length = 0;
+    rawRoutes.set("alpha/one:README.md", { status: 200, body: "# alpha/one\n\n来自 raw 快路径" });
+    readmeRoutes.set("alpha/one", { status: 403, body: JSON.stringify({ message: "API rate limit exceeded" }) });
+
+    readmeBtn("alpha/one").props.onClick();
+    assert.ok(await waitFor(() => textOf(view()).includes("来自 raw 快路径")), "raw 命中应直接出正文");
+    assert.doesNotMatch(textOf(view()), /限流/, "命中 raw 时不该出现任何限流提示");
+    assert.equal(
+      httpCalls.filter((c) => c.url.startsWith("https://api.github.com/repos/alpha/one/readme")).length,
+      0,
+      "raw 命中后不该再打 API，否则照样烧配额",
+    );
+  } finally {
+    rawRoutes.clear();
+    readmeRoutes.clear();
+    dispose2();
+  }
+});
+
 
 await check("README：403 只在正文说明限流时才按配额解释", async () => {
   const openReadme = (repo) => {
@@ -1224,8 +1293,8 @@ await check("README：会话内再展开不重新请求", async () => {
   };
   openBtn().props.onClick();
   assert.ok(await waitFor(() => textOf(render()).includes("一个很长的说明")), "第二次展开也应立刻看到正文");
-  const readmeCalls = httpCalls.filter((c) => c.url.includes("/readme"));
-  assert.equal(readmeCalls.length, 0, "同一会话内重复展开不该再走网络");
+  const readmeCalls = httpCalls.filter((c) => c.url.includes("/readme") || c.url.startsWith("https://raw.githubusercontent.com/"));
+  assert.equal(readmeCalls.length, 0, "同一会话内重复展开不该再走网络（raw 与 API 都一样）");
 });
 
 await check("README：失败结果不缓存，看着恢复了就能重新读到", async () => {

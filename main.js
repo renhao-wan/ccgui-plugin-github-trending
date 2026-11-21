@@ -2197,15 +2197,47 @@ async function fetchRepoSearch(term, settings) {
 /* ---------- README 预览 ---------- */
 
 /**
- * README 的接口选在 api.github.com 而不是 raw.githubusercontent.com：前者已经在
- * `network:api.github.com` 的授权里，后者要新增一条网络权限、重装后才生效，而
- * 换来的只是省一次 API 配额（README 是低频动作，配额不是瓶颈）。设置里的 Token
- * 也自动复用——私有仓的 README 因此能读。
- *
- * `Accept: application/vnd.github.raw` 让接口直接回文件正文而不是 base64 JSON；
- * 但网关可能无视它，所以 `readmeTextFromBody` 两种形状都认。
+ * raw 域名上按优先级试的文件名。GitHub 自己的 readme 接口认更多变体
+ * （README.txt、README.adoc 等），这里只试最常见的三种：命中即停，
+ * 全落空时回落 API——那条路认全部变体，只是要花配额。
  */
-async function fetchReadme(repo, settings) {
+const README_RAW_NAMES = ["README.md", "README.markdown", "README.rst"];
+
+/**
+ * 先试 raw.githubusercontent.com。
+ *
+ * 为什么值得多一条网络权限：**raw 不占 API 配额**。未认证的 60 次/小时是
+ * 按**出口 IP** 算的，不是按人算的——共享代理/VPN 后面别人把额度用光，
+ * 用户自己点两次 README 就会看到「限流」，而他什么都没做错。raw 不受这个影响，
+ * 也不需要 Token（因此也绝不把 Token 发给这个域名）。
+ *
+ * 代价是 raw 只认确切文件名（大小写敏感）、读不了私有仓。所以它只是**快路径**：
+ * 拿不到就回落 API，私有仓与冷门文件名照旧能读。
+ *
+ * @returns {Promise<string|null>} 成功时返回正文；任何失败都返回 null（交给回落）
+ */
+async function fetchReadmeFromRaw(repo) {
+  for (const name of README_RAW_NAMES) {
+    const res = await httpGet("https://raw.githubusercontent.com/" + repo + "/HEAD/" + name, {
+      "User-Agent": "ccgui-github-trending",
+    });
+    if (res.status === 200) {
+      // 空文件不能算命中：继续试下一个，都空再回落 API 让它给出结论。
+      if (res.body.trim()) return res.body;
+      continue;
+    }
+    // 404 = 这个文件名不存在，试下一个；其余状态（403/5xx）继续试也没意义。
+    if (res.status !== 404) return null;
+  }
+  return null;
+}
+
+/**
+ * API 那条路：`Accept: application/vnd.github.raw` 让接口直接回文件正文而不是
+ * base64 JSON；但网关可能无视它，所以 `readmeTextFromBody` 两种形状都认。
+ * 认 Token，私有仓的 README 靠它。
+ */
+async function fetchReadmeViaApi(repo, settings) {
   const url = "https://api.github.com/repos/" + repo + "/readme";
   const headers = {
     Accept: "application/vnd.github.raw",
@@ -2228,17 +2260,22 @@ async function fetchReadme(repo, settings) {
   // 429 一定是限流，不用看正文。
   if (res.status === 429 || (res.status === 403 && /rate limit|too many requests/i.test(res.body))) {
     // 「配额用完」和「请求太密」是两种限流，用户能做的事不一样：前者要等一小时
-    // 或填 Token，后者等十几秒就好。README 走核心 REST API，未认证 60 次/小时。
+    // 或填 Token，后者等十几秒就好。
     if (/secondary rate limit/i.test(res.body)) {
       return {
         ok: false,
         message: "请求太密被 GitHub 暂时限制，等十几秒再展开" + (token ? "" : "，或在设置里填 Token 提高额度") + detail,
       };
     }
+    // 走到这里说明 raw 那条免费的路也没成（私有仓/冷门文件名），
+    // 而配额是按出口 IP 算的：共享代理后面额度可能是别人用掉的，说清楚比让用户
+    // 怀疑自己「没点几次怎么就限流了」有用。
     return {
       ok: false,
       message:
-        (token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（60 次/小时），可在设置里填 Token 提高额度") + detail,
+        (token
+          ? "GitHub 限流了，请等一会儿再试"
+          : "GitHub 未认证限流（60 次/小时，按出口 IP 算），可在设置里填 Token 提高额度") + detail,
     };
   }
   if (res.status === 403) return { ok: false, message: "GitHub 拒绝访问这个仓库" + detail };
@@ -2248,6 +2285,29 @@ async function fetchReadme(repo, settings) {
   if (!prepared) return { ok: false, message: "README 是空的" };
   const clipped = truncateReadme(prepared);
   return { ok: true, text: clipped.text, truncated: clipped.truncated, total: clipped.total };
+}
+
+/**
+ * 读一个仓库的 README：raw 快路径 → API 回落。
+ *
+ * raw 抛网络错误时静默回落：那只是「快路径没走通」，不该让用户看到一次失败，
+ * 尤其是 API 那条路未必有问题。
+ */
+async function fetchReadme(repo, settings) {
+  let rawText = null;
+  try {
+    rawText = await fetchReadmeFromRaw(repo);
+  } catch {
+    rawText = null;
+  }
+  if (rawText) {
+    const prepared = prepareReadme(rawText);
+    if (prepared) {
+      const clipped = truncateReadme(prepared);
+      return { ok: true, text: clipped.text, truncated: clipped.truncated, total: clipped.total };
+    }
+  }
+  return await fetchReadmeViaApi(repo, settings);
 }
 
 /** 只允许「看上去像 GitHub 仓库名」的输入拼进 URL，避免路径注入到别的接口路径上。 */
@@ -4805,7 +4865,7 @@ function SettingsSection() {
       h(
         "p",
         { className: "gt-hint" },
-        "不填也能正常使用：未认证时搜索接口 10 次/分钟，一般够每天刷新一两次。Token 只存在本机，只发给 api.github.com。",
+        "不填也能正常使用：搜索接口未认证 10 次/分钟，一般够每天刷新一两次；README 走 raw 域名，不占配额。Token 只存在本机，只发给 api.github.com。",
       ),
       h(
         "div",

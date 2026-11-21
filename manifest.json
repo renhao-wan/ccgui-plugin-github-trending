@@ -25,6 +25,7 @@
     "host:workspace",
     "assets:directory",
     "network:github.com",
-    "network:api.github.com"
+    "network:api.github.com",
+    "network:raw.githubusercontent.com"
   ]
 }
