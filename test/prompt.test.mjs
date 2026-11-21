@@ -5,6 +5,7 @@ import {
   buildDiscussPrompt,
   BUILTIN_PROMPT,
   DEFAULT_DISCUSS_TEMPLATE,
+  DISCUSS_PLACEHOLDERS,
   normalisePrompts,
   pickPrompt,
   PROMPT_COUNT_LIMIT,
@@ -323,6 +324,59 @@ test("pickPrompt：空正文的条目不能当选（否则模型收到空 prompt
   ];
   assert.equal(pickPrompt(prompts, "a").id, "", "默认指向空正文时回落内置模板");
   assert.equal(pickPrompt([{ id: "a", name: "空", text: "" }], "a").text, DEFAULT_DISCUSS_TEMPLATE);
+});
+
+test("占位符清单与 fillTemplate 实际支持的 key 一致", () => {
+  // 文档写的和实现填的是同一份东西：清单里每一项都必须真的被替换掉，
+  // 否则「设置页说有、填进去没用」就是最气人的那种 bug。
+  const fill = (row) => buildDiscussPrompt({ row, view: "trending", period: "daily", template: DISCUSS_PLACEHOLDERS.map((p) => p.token + "|").join("") });
+  const filled = fill({
+    repo: "owner/name",
+    description: "简介",
+    language: "Rust",
+    stars: 42,
+    gain: 7,
+    gainPeriod: "daily",
+    rank: 3,
+    ageDays: 100,
+  });
+  for (const p of DISCUSS_PLACEHOLDERS) {
+    assert.ok(!filled.includes(p.token), p.token + " 没有被替换");
+  }
+  assert.match(filled, /owner\/name\|/);
+  assert.match(filled, /https:\/\/github\.com\/owner\/name\|/);
+  assert.match(filled, /GitHub Trending daily 榜\|/);
+  assert.match(filled, /简介\|/);
+  assert.match(filled, /Rust\|/);
+  assert.match(filled, /42\|/);
+  assert.match(filled, /\+7\/daily\|/);
+  assert.match(filled, /3\|/);
+  assert.match(filled, /100 天\|/);
+  assert.match(filled, /- 总 star：42/, "{{facts}} 是一节拼好的事实");
+});
+
+test("占位符清单：每项都有中文作用说明与样例，且不重复", () => {
+  const tokens = DISCUSS_PLACEHOLDERS.map((p) => p.token);
+  assert.equal(new Set(tokens).size, tokens.length, "token 不该重复");
+  for (const p of DISCUSS_PLACEHOLDERS) {
+    assert.match(p.token, /^\{\{[a-z]+\}\}$/);
+    assert.ok(p.label && p.label.trim(), p.token + " 缺少名字");
+    assert.ok(p.detail && p.detail.length > 8, p.token + " 缺少作用说明");
+    assert.equal(typeof p.sample, "string");
+  }
+  // {{facts}} 的说明必须提到「不写也补」，否则用户不知道可以省掉它
+  const facts = DISCUSS_PLACEHOLDERS.find((p) => p.token === "{{facts}}");
+  assert.match(facts.detail, /不写|补/);
+});
+
+test("随便看看的行：没有名次与年龄时占位符是空串，不是 undefined", () => {
+  const p = buildDiscussPrompt({
+    row: { repo: "a/b" },
+    view: "browse",
+    template: "rank=[{{rank}}] age=[{{age}}] stars=[{{stars}}]",
+  });
+  assert.ok(!/undefined|null|NaN/.test(p));
+  assert.match(p, /rank=\[\] age=\[\] stars=\[\]/);
 });
 
 test("pickPrompt 的结果能直接喂给 buildDiscussPrompt", () => {

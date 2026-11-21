@@ -180,6 +180,27 @@ export const DEFAULT_DISCUSS_TEMPLATE = [
  */
 export const BUILTIN_PROMPT = { id: "", name: "内置模板", text: DEFAULT_DISCUSS_TEMPLATE };
 
+/**
+ * 讨论模板可用的占位符清单。
+ *
+ * 这份表既是设置页「占位符」面板的数据源，也是 fillTemplate 实际支持的
+ * key 的说明书——两边对不上时单测会失败，不会出现「文档写了但填不进去」。
+ *
+ * `sample` 是填进去之后的样子，比只写 key 更好认。
+ */
+export const DISCUSS_PLACEHOLDERS = [
+  { token: "{{repo}}", label: "仓库全名", sample: "owner/name", detail: "榜单里这一行的 owner/name，也是让模型去找本地副本时用的名字。" },
+  { token: "{{url}}", label: "仓库地址", sample: "https://github.com/owner/name", detail: "仓库在 GitHub 上的地址；仓库名不合法时为空串。" },
+  { token: "{{scope}}", label: "数据来源", sample: "GitHub Trending daily 榜", detail: "这一行是从哪个榜单来的（Trending 的时间档 / 近 7 天新星库 / 随便看看）。" },
+  { token: "{{description}}", label: "简介", sample: "An agentic skills framework…", detail: "仓库自身的简介，超过 400 字会截断。" },
+  { token: "{{language}}", label: "主要语言", sample: "TypeScript", detail: "榜单里标出的主语言。" },
+  { token: "{{stars}}", label: "总 star", sample: "322190", detail: "当前总 star 数。" },
+  { token: "{{gain}}", label: "近期增长", sample: "+2028/daily", detail: "榜单统计周期内的新增 star。" },
+  { token: "{{rank}}", label: "当前名次", sample: "2", detail: "在来源榜单里的排名；「随便看看」没有名次，这里为空串。" },
+  { token: "{{age}}", label: "仓库年龄", sample: "412 天", detail: "仓库创建至今的天数；「随便看看」不提供，为空串。" },
+  { token: "{{facts}}", label: "事实清单", sample: "- 简介：… - 总 star：…", detail: "上面这些字段按行拼好的一节事实。写它就不必逐个拼；不写时插件会在末尾补一节。" },
+];
+
 /** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
 export const PROMPT_TEXT_LIMIT = 20000;
 /** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */

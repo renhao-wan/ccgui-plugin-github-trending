@@ -832,6 +832,27 @@ const DEFAULT_DISCUSS_TEMPLATE = [
  */
 const BUILTIN_PROMPT = { id: "", name: "内置模板", text: DEFAULT_DISCUSS_TEMPLATE };
 
+/**
+ * 讨论模板可用的占位符清单。
+ *
+ * 这份表既是设置页「占位符」面板的数据源，也是 fillTemplate 实际支持的
+ * key 的说明书——两边对不上时单测会失败，不会出现「文档写了但填不进去」。
+ *
+ * `sample` 是填进去之后的样子，比只写 key 更好认。
+ */
+const DISCUSS_PLACEHOLDERS = [
+  { token: "{{repo}}", label: "仓库全名", sample: "owner/name", detail: "榜单里这一行的 owner/name，也是让模型去找本地副本时用的名字。" },
+  { token: "{{url}}", label: "仓库地址", sample: "https://github.com/owner/name", detail: "仓库在 GitHub 上的地址；仓库名不合法时为空串。" },
+  { token: "{{scope}}", label: "数据来源", sample: "GitHub Trending daily 榜", detail: "这一行是从哪个榜单来的（Trending 的时间档 / 近 7 天新星库 / 随便看看）。" },
+  { token: "{{description}}", label: "简介", sample: "An agentic skills framework…", detail: "仓库自身的简介，超过 400 字会截断。" },
+  { token: "{{language}}", label: "主要语言", sample: "TypeScript", detail: "榜单里标出的主语言。" },
+  { token: "{{stars}}", label: "总 star", sample: "322190", detail: "当前总 star 数。" },
+  { token: "{{gain}}", label: "近期增长", sample: "+2028/daily", detail: "榜单统计周期内的新增 star。" },
+  { token: "{{rank}}", label: "当前名次", sample: "2", detail: "在来源榜单里的排名；「随便看看」没有名次，这里为空串。" },
+  { token: "{{age}}", label: "仓库年龄", sample: "412 天", detail: "仓库创建至今的天数；「随便看看」不提供，为空串。" },
+  { token: "{{facts}}", label: "事实清单", sample: "- 简介：… - 总 star：…", detail: "上面这些字段按行拼好的一节事实。写它就不必逐个拼；不写时插件会在末尾补一节。" },
+];
+
 /** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
 const PROMPT_TEXT_LIMIT = 20000;
 /** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
@@ -2194,7 +2215,14 @@ async function fetchReadme(repo, settings) {
   if (token) headers.Authorization = "Bearer " + token;
 
   const res = await httpGet(url, headers);
+  // 把状态码与正文前几十字带进文案：同样是 403，「配额用完」「请求太密」
+  // 「仓库被限制」「Token 无效」要用户做的事完全不同，靠猜不如照实说。
+  const snippet = String(res.body || "").replace(/\s+/g, " ").slice(0, 90).trim();
+  const detail = "（HTTP " + res.status + (snippet ? "：" + snippet : "") + "）";
   if (res.status === 404) return { ok: false, message: "这个仓库没有 README" };
+  if (res.status === 401) {
+    return { ok: false, message: "Token 无效或已过期，请到设置里更新" + detail };
+  }
   // 403 不一定都是限流：仓库被限制访问、命中二次限流也会给 403。只有正文
   // 明确说了 rate limit 才按配额解释，否则会把「没权限」说成「等一会儿」。
   // 429 一定是限流，不用看正文。
@@ -2202,16 +2230,18 @@ async function fetchReadme(repo, settings) {
     // 「配额用完」和「请求太密」是两种限流，用户能做的事不一样：前者要等一小时
     // 或填 Token，后者等十几秒就好。README 走核心 REST API，未认证 60 次/小时。
     if (/secondary rate limit/i.test(res.body)) {
-      return { ok: false, message: "请求太密被 GitHub 暂时限制，等十几秒再展开" + (token ? "" : "（或在设置里填 Token 提高额度）") };
+      return {
+        ok: false,
+        message: "请求太密被 GitHub 暂时限制，等十几秒再展开" + (token ? "" : "，或在设置里填 Token 提高额度") + detail,
+      };
     }
     return {
       ok: false,
-      message: token
-        ? "GitHub 限流了，请等一会儿再试"
-        : "GitHub 未认证限流（60 次/小时），可在设置里填 Token 提高额度",
+      message:
+        (token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（60 次/小时），可在设置里填 Token 提高额度") + detail,
     };
   }
-  if (res.status === 403) return { ok: false, message: "GitHub 拒绝访问这个仓库（HTTP 403）" };
+  if (res.status === 403) return { ok: false, message: "GitHub 拒绝访问这个仓库" + detail };
   if (res.status < 200 || res.status >= 300) return { ok: false, message: "GitHub 返回 HTTP " + res.status };
 
   const prepared = prepareReadme(readmeTextFromBody(res.body));
@@ -4301,6 +4331,48 @@ function segField(label, control, hint) {
   );
 }
 
+/**
+ * 占位符说明面板。
+ *
+ * 数据来自 prompt.mjs 的 DISCUSS_PLACEHOLDERS，与 fillTemplate 实际支持的 key
+ * 是同一份清单——文档和实现不可能各说各话。
+ */
+function PlaceholderHelp() {
+  const h = appCtx.react.createElement;
+  return h(
+    "div",
+    { className: "gt-placeholders", id: "gt-placeholders" },
+    h(
+      "p",
+      { className: "gt-note-line" },
+      "这些标记会被这一行的真实数据替换。不认识的占位符不会被吞掉，会原样留在 prompt 里，方便自己发现拼错了。",
+    ),
+    h(
+      "dl",
+      { className: "gt-placeholder-list" },
+      DISCUSS_PLACEHOLDERS.map((p) =>
+        h(
+          "div",
+          { className: "gt-placeholder", key: p.token },
+          h(
+            "dt",
+            { className: "gt-placeholder-head" },
+            h("code", { className: "gt-placeholder-token" }, p.token),
+            h("span", { className: "gt-placeholder-label" }, p.label),
+            h("span", { className: "gt-placeholder-sample" }, p.sample),
+          ),
+          h("dd", { className: "gt-placeholder-detail" }, p.detail),
+        ),
+      ),
+    ),
+    h(
+      "p",
+      { className: "gt-note-line" },
+      "没写 {{facts}} 时，插件会在正文末尾补一节「榜单事实（插件补充）」，所以只写自己关心的那几个占位符也行。",
+    ),
+  );
+}
+
 function SettingsSection() {
   const R = appCtx.react;
   const h = R.createElement;
@@ -4477,8 +4549,9 @@ function SettingsSection() {
   /**
    * 一份提示词的一行。
    *
-   * `builtin` 的那份只读：它不在 settings.prompts 里，改它没有地方存。
-   * 想改就「新增提示词」——那份以内置模板为底稿，是可编辑的。
+   * `builtin` 的那份只读，而且**不渲染输入框**：一个 readOnly 的 textarea 看起来
+   * 仍然像能改，点进去还可能出现光标。直接给只读的文本块，可编辑这件事就
+   * 不会产生误会。想改就「新增提示词」——那份以内置模板为底稿，是可编辑的。
    */
   const promptRow = (item, builtin) => {
     const isDefault = builtin ? defaultId === "" : item.id === defaultId;
@@ -4486,7 +4559,7 @@ function SettingsSection() {
     const key = builtin ? "__builtin__" : item.id;
     return h(
       "div",
-      { className: "gt-prompt" + (builtin ? " gt-prompt--builtin" : ""), key },
+      { className: "gt-prompt", key },
       h(
         "div",
         { className: "gt-prompt-head" },
@@ -4498,11 +4571,11 @@ function SettingsSection() {
             onClick: () => setOpenPrompt(isOpen ? "" : key),
             "aria-expanded": isOpen ? "true" : "false",
             "aria-label": (isOpen ? "收起 " : "展开 ") + item.name + " 的正文",
-            title: builtin ? "查看内置模板正文（只读）" : "展开编辑正文",
+            title: builtin ? "查看内置模板（只读）" : "展开编辑正文",
           },
           h("span", { className: "gt-prompt-chevron", "aria-hidden": "true" }, isOpen ? "▾" : "▸"),
           h("span", { className: "gt-prompt-label" }, item.name),
-          builtin ? h("span", { className: "gt-prompt-tag" }, "系统") : null,
+          builtin ? h("span", { className: "gt-prompt-note" }, "只读") : null,
         ),
         // 默认那份用「已设为默认」的静态标记，而不是一个点下去没反应的按钮：
         // 几份提示词里哪份在生效，是这一节最重要的一条信息。
@@ -4539,7 +4612,7 @@ function SettingsSection() {
             "div",
             { className: "gt-prompt-body" },
             builtin
-              ? null
+              ? h("pre", { className: "gt-prompt-readonly" }, item.text)
               : h(
                   "div",
                   { className: "gt-path" },
@@ -4556,28 +4629,23 @@ function SettingsSection() {
                     },
                   }),
                 ),
-            h("textarea", {
-              className: "gt-input gt-prompt-text",
-              value: item.text,
-              rows: 14,
-              spellCheck: false,
-              readOnly: Boolean(builtin),
-              "aria-label": item.name + " 的提示词正文",
-              onChange: (e) => {
-                if (builtin) return;
-                // 超长只截断不报错：一边打字一边弹红字比截断更烦。
-                const text = e.target.value.slice(0, PROMPT_TEXT_LIMIT);
-                writePrompts(prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { text }) : p)));
-              },
-            }),
             builtin
-              ? h("p", { className: "gt-hint" }, "内置模板不可编辑。要以它为底稿改一份，点下面的「新增提示词」。")
-              : h(
-                  "p",
-                  { className: "gt-hint" },
-                  "可用占位符：{{repo}} {{url}} {{scope}} {{description}} {{language}} {{stars}} {{gain}} {{rank}} {{age}} {{facts}}。"
-                    + "它们会被这一行的真实数据替换；没写 {{facts}} 时插件会在末尾补一节事实。",
-                ),
+              ? null
+              : h("textarea", {
+                  className: "gt-input gt-prompt-text",
+                  value: item.text,
+                  rows: 14,
+                  spellCheck: false,
+                  "aria-label": item.name + " 的提示词正文",
+                  onChange: (e) => {
+                    // 超长只截断不报错：一边打字一边弹红字比截断更烦。
+                    const text = e.target.value.slice(0, PROMPT_TEXT_LIMIT);
+                    writePrompts(prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { text }) : p)));
+                  },
+                }),
+            builtin
+              ? h("p", { className: "gt-hint" }, "内置模板只读，也删不掉。要以它为底稿改一份，点下面的「新增提示词」。")
+              : h("p", { className: "gt-hint" }, "仓库数据由插件按占位符填进来，不用自己抄 star 数。可用占位符见「占位符」按钮。"),
           )
         : null,
     );
@@ -4594,6 +4662,12 @@ function SettingsSection() {
         )
       : null,
   ].filter(Boolean);
+
+  // 占位符说明做成可开合的浮层：常驻一屏文字会把设置页撑长，而它是「写模板
+  // 时才需要查」的东西。只有这里需要它，所以放在这一节里而不是设置页顶部。
+  const showPlaceholdersState = R.useState(false);
+  const showPlaceholders = showPlaceholdersState[0];
+  const setShowPlaceholders = showPlaceholdersState[1];
 
   const promptEditor = h(
     "div",
@@ -4619,9 +4693,22 @@ function SettingsSection() {
         },
         "新增提示词",
       ),
+      h(
+        "button",
+        {
+          type: "button",
+          className: "gt-btn gt-path-pick",
+          onClick: () => setShowPlaceholders(!showPlaceholders),
+          "aria-expanded": showPlaceholders ? "true" : "false",
+          "aria-controls": "gt-placeholders",
+          title: "查看可用的 {{占位符}} 及各自作用",
+        },
+        showPlaceholders ? "收起占位符" : "占位符",
+      ),
       h("span", { className: "gt-prompt-count" }, prompts.length + " / " + PROMPT_COUNT_LIMIT),
       flashMsg ? h("span", { className: "gt-prompt-flash" }, flashMsg) : null,
     ),
+    showPlaceholders ? h(PlaceholderHelp, null) : null,
   );
 
   // 工作区只读展示 + 文件夹选择按钮（与工作志同一套）：路径只能由系统选择器
@@ -5314,14 +5401,9 @@ const CSS = `
 .gt-settings .gt-prompt-label {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* 系统内置那份：左边一道与其他行不同的竖线，不用颜色区分，暗色主题也稳。 */
-.gt-settings .gt-prompt--builtin { border-left: 2px solid var(--gt-accent); }
-.gt-settings .gt-prompt--builtin .gt-prompt-head { background: transparent; }
-.gt-settings .gt-prompt-tag {
-  flex: none; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;
-  letter-spacing: 0.02em; color: var(--gt-muted); background: var(--gt-raised);
-  border: 1px solid var(--gt-control);
-}
+/* 内置那份只在名字后面挂一个灰字，不加边框/底色/左边线：它是列表里的第一行，
+ * 位置已经说明了它是什么，再刷一层样式只会和这一节其他控件打架。 */
+.gt-settings .gt-prompt-note { flex: none; font-size: 11px; color: var(--gt-muted); }
 .gt-settings .gt-prompt-default {
   flex: none; padding: 2px 8px; border-radius: 5px; font-size: 11px; font-weight: 600;
   color: var(--gt-accent); background: transparent;
@@ -5338,10 +5420,39 @@ const CSS = `
   resize: vertical; font-family: var(--gt-mono, ui-monospace, "Cascadia Code", Consolas, monospace);
   font-size: 12.5px;
 }
+/* 内置模板的只读正文：和 textarea 同样的字距与行长，但它是文字而不是控件。 */
+.gt-settings .gt-prompt-readonly {
+  margin: 0; max-height: 260px; overflow: auto; padding: 10px 12px;
+  border: 1px solid var(--gt-border); border-radius: 6px; background: var(--gt-raised);
+  font-family: var(--gt-mono, ui-monospace, "Cascadia Code", Consolas, monospace);
+  font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+}
 .gt-settings .gt-prompts-actions {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
 .gt-settings .gt-prompt-count { font-size: 12px; color: var(--gt-muted); font-variant-numeric: tabular-nums; }
+/* 占位符说明：按钮点开才出现，所以直接铺一列，不做折叠动画。 */
+.gt-settings .gt-placeholders {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px; border: 1px solid var(--gt-border); border-radius: 8px;
+}
+.gt-settings .gt-placeholder-list {
+  display: flex; flex-direction: column; gap: 10px; margin: 0;
+}
+.gt-settings .gt-placeholder { display: flex; flex-direction: column; gap: 2px; }
+.gt-settings .gt-placeholder-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.gt-settings .gt-placeholder-token {
+  font-family: var(--gt-mono, ui-monospace, "Cascadia Code", Consolas, monospace);
+  font-size: 12.5px; color: var(--gt-accent);
+}
+.gt-settings .gt-placeholder-label { font-size: 13px; font-weight: 500; }
+.gt-settings .gt-placeholder-sample {
+  font-family: var(--gt-mono, ui-monospace, "Cascadia Code", Consolas, monospace);
+  font-size: 11.5px; color: var(--gt-muted);
+}
+.gt-settings .gt-placeholder-detail { margin: 0; font-size: 12px; line-height: 1.5; color: var(--gt-muted); }
 .gt-settings .gt-prompt-flash { font-size: 12px; color: var(--gt-muted); }
 /* 没设置时显示的默认路径：虚框表示「这不是你选的，是插件自己的目录」 */
 .gt-settings .gt-path-value.is-default {

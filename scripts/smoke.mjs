@@ -2334,7 +2334,7 @@ await check("设置页：提示词可以新增、设为默认、删除，并写�
     assert.match(initialText, /还没有自定义提示词/, "初始应说明会用内置模板");
     // 内置模板一开始就在列表里，且是默认那份
     assert.match(initialText, /内置模板/);
-    assert.match(initialText, /系统/, "内置那份要能一眼看出不是用户建的");
+    assert.match(initialText, /只读/, "内置那份要能一眼看出不可编辑");
 
     // 表单值是组件局部 state：必须用 renderKeep，renderFresh 会把它重置回
     // snap.settings，「新增」的结果还没写盘就丢了。
@@ -2395,6 +2395,32 @@ await check("设置页：提示词可以新增、设为默认、删除，并写�
     });
     assert.equal(deleteButtons.length, 0, "内置模板不可删除");
     assert.match(textOf(keep()), /内置模板/, "删完之后内置那份还在");
+
+    // 内置那份展开后是只读文本，不是 textarea：一个 readOnly 的输入框看起来
+    // 仍然像能改，点进去还会出现光标。
+    findByText(keep(), "内置模板").props.onClick();
+    await waitFor(() => textOf(keep()).includes("先在本机找同名仓库") || textOf(keep()).includes("本地副本"));
+    const builtinInputs = [];
+    walk(keep(), (n) => {
+      if (n.type === "textarea" || (n.type === "input" && n.props && n.props["aria-label"] === "提示词名字")) {
+        builtinInputs.push(n);
+      }
+    });
+    assert.equal(builtinInputs.length, 0, "内置模板不应有任何可编辑控件");
+    findByText(keep(), "内置模板").props.onClick();
+
+    // 占位符：默认收起，点按钮才出现，且每一项都带作用说明
+    assert.doesNotMatch(textOf(keep()), /\{\{repo\}\}/, "默认不展开占位符面板");
+    findByText(keep(), "占位符").props.onClick();
+    assert.ok(await waitFor(() => textOf(keep()).includes("{{repo}}")), "点开后应列出占位符");
+    const helpText = textOf(keep());
+    for (const token of ["{{repo}}", "{{facts}}", "{{stars}}", "{{rank}}", "{{scope}}"]) {
+      assert.ok(helpText.includes(token), "占位符清单应含 " + token);
+    }
+    assert.match(helpText, /让模型去找本地副本时用的名字/, "每个占位符都要说清作用");
+    assert.match(helpText, /收起占位符/);
+    findByText(keep(), "收起占位符").props.onClick();
+    await waitFor(() => !textOf(keep()).includes("{{repo}}"));
   } finally {
     dispose3();
   }
