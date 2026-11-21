@@ -102,3 +102,14 @@ test("导出 Markdown：掉榜单独一节，且不与在榜重复", () => {
   assert.match(md, /## 掉榜（2）/);
   assert.match(md, /- gone\/one\n- gone\/two/);
 });
+
+test("随便看看：scopeText 写进导出标题，不冒充 Trending 榜", () => {
+  const md = buildBoardMarkdown({
+    view: "browse",
+    scopeText: "GitHub 上按仓库名搜索「react」的结果",
+    rows: [{ repo: "a/b", description: "x" }],
+    dropped: [],
+  });
+  assert.match(md, /^# 每日热点 · GitHub 上按仓库名搜索「react」的结果/m);
+  assert.doesNotMatch(md, /GitHub Trending/);
+});

@@ -319,6 +319,57 @@ const GOOD_SEARCH = {
   }),
 };
 let searchPayload = GOOD_SEARCH;
+/**
+ * 「随便看看」的随机批次响应。与新星库分开取值：两者走同一个接口，
+ * 但一个断言的是「时间窗内新仓库」，一个是「随机档位抽样」，
+ * 共用 fixture 会让用例看不出到底走了哪条 query。
+ */
+const GOOD_DISCOVER = {
+  status: 200,
+  body: JSON.stringify({
+    total_count: 40097,
+    items: [
+      {
+        full_name: "random/pick",
+        html_url: "https://github.com/random/pick",
+        description: "a random pick",
+        language: "Go",
+        stargazers_count: 4200,
+        forks_count: 12,
+        created_at: new Date(Date.now() - 900 * 86400000).toISOString(),
+      },
+    ],
+  }),
+};
+let discoverPayload = GOOD_DISCOVER;
+/** 按仓库名搜索的响应：两个结果，其中 random/pick 精确命中。 */
+const GOOD_NAME_SEARCH = {
+  status: 200,
+  body: JSON.stringify({
+    total_count: 2,
+    items: [
+      {
+        full_name: "random/pick",
+        html_url: "https://github.com/random/pick",
+        description: "a random pick",
+        language: "Go",
+        stargazers_count: 4200,
+        forks_count: 12,
+        created_at: new Date(Date.now() - 900 * 86400000).toISOString(),
+      },
+      {
+        full_name: "random/pick-extra",
+        html_url: "https://github.com/random/pick-extra",
+        description: "fuzzy hit",
+        language: "Go",
+        stargazers_count: 90,
+        forks_count: 1,
+        created_at: new Date(Date.now() - 400 * 86400000).toISOString(),
+      },
+    ],
+  }),
+};
+let nameSearchPayload = GOOD_NAME_SEARCH;
 let agentMode = "stream"; // stream | error | silent | slow-start | hang
 let agentStartDelay = 200;
 let agentRunIdx = 0;
@@ -528,6 +579,12 @@ const ctx = {
         return { status: trendingPayload.status, body: trendingPayload.body };
       }
       if (args.url.startsWith("https://api.github.com/search/repositories")) {
+        // 三条路径共用一个接口，按 q 区分，才能断言「用的对的那条 query」。
+        const q = decodeURIComponent((/[?&]q=([^&]*)/.exec(args.url) || ["", ""])[1]);
+        if (/in:name/.test(q)) return { status: nameSearchPayload.status, body: nameSearchPayload.body };
+        // 新星库带 created:> 时间窗；「随便看看」是 stars:lo..hi 档位。
+        if (/created:>/.test(q)) return { status: searchPayload.status, body: searchPayload.body };
+        if (/stars:/.test(q)) return { status: discoverPayload.status, body: discoverPayload.body };
         return { status: searchPayload.status, body: searchPayload.body };
       }
       // /repos/<owner>/<name>/readme —— 不走 raw.githubusercontent.com，
@@ -1251,6 +1308,142 @@ await check("页面结构变化时给出明确提示而不是空榜单", async (
   trendingPayload = { status: 200, body: "<html><body>redesigned</body></html>" };
   findByText(render(), "Trending").props.onClick();
   assert.ok(await waitFor(() => textOf(render()).includes("页面结构可能已变化")), "应提示结构变化");
+});
+
+/* ------------------------------------------------------- 随便看看 */
+
+/** 「随便看看」的输入框内容属于组件局部 state：必须用 renderKeep 才看得见。 */
+const browseKeep = () => renderKeep(tab(), {});
+
+function searchInputOf(node) {
+  let hit = null;
+  walk(node, (n) => {
+    if (hit || n.type !== "input") return;
+    const ph = n.props && n.props.placeholder;
+    if (typeof ph === "string" && /搜仓库名/.test(ph)) hit = n;
+  });
+  return hit;
+}
+
+/**
+ * 提交搜索。
+ *
+ * 走 form 的 onSubmit 而不是按钮的 onClick：搜索按钮是 `type="submit"`、
+ * 没有自己的 onClick，浏览器里点它（或按回车）触发的是表单提交。这里模拟
+ * 同一条路径，也顺便验证了表单确实是可提交的。
+ */
+function submitSearch(value) {
+  browseKeep();
+  const input = searchInputOf(browseKeep());
+  assert.ok(input, "应有搜索输入框");
+  input.props.onChange({ target: { value } });
+  browseKeep();
+  let form = null;
+  walk(browseKeep(), (n) => {
+    if (form || n.type !== "form") return;
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-search")) form = n;
+  });
+  assert.ok(form && typeof form.props.onSubmit === "function", "搜索框应在一个可提交的表单里");
+  form.props.onSubmit({ preventDefault() {} });
+}
+
+await check("随便看看：换一批走 Search 的随机档位，并说明这不是排行榜", async () => {
+  findByText(render(), "随便看看").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("a random pick")), "应渲染随机批次");
+  const text = textOf(render());
+  assert.match(text, /随机抽的一批热门仓库/);
+  assert.match(text, /不是排行榜/, "必须说清楚没有名次与涨跌");
+  assert.match(text, /★[\d.]+k?–5?[\d.]*k|★50k 以上|★\d/, "应说出抽的是哪个 star 档");
+
+  const call = httpCalls.filter((c) => c.url.startsWith("https://api.github.com/search/repositories")).pop();
+  const q = decodeURIComponent((/[?&]q=([^&]*)/.exec(call.url) || ["", ""])[1]);
+  // 最高档是无上界写法（stars:>50000），所以数字前可能是 ":" 也可能是 ">"
+  assert.match(q, /stars:[>\d]/, "随机批次应带 star 档位");
+  assert.match(q, /fork:false/);
+  assert.doesNotMatch(q, /created:>/, "不是新星库的时间窗查询");
+  // 随机批次没有可比排名：不该出现「新上榜」这类标签
+  assert.doesNotMatch(text, /新上榜/);
+});
+
+await check("随便看看：换一批每次都真的重新请求，不被早退挡掉", async () => {
+  const before = httpCalls.length;
+  findByText(render(), "换一批").props.onClick();
+  assert.ok(await waitFor(() => httpCalls.length > before), "换一批必须打网络");
+  assert.ok(await waitFor(() => textOf(render()).includes("a random pick")), "换一批后应有列表");
+});
+
+await check("随便看看：按仓库名搜索走 in:name，并标出精确命中", async () => {
+  submitSearch("random/pick");
+
+  assert.ok(await waitFor(() => textOf(render()).includes("fuzzy hit")), "应渲染搜索结果");
+  const call = httpCalls.filter((c) => c.url.startsWith("https://api.github.com/search/repositories")).pop();
+  const q = decodeURIComponent((/[?&]q=([^&]*)/.exec(call.url) || ["", ""])[1]);
+  assert.match(q, /^random\/pick in:name/, "只搜仓库名");
+
+  const tree = browseKeep();
+  assert.equal(countByClass(tree, "gt-hit"), 1, "只有精确命中那一行带「正中」");
+  assert.match(textOf(tree), /随机抽的一批热门仓库|搜索|正中/);
+  assert.match(textOf(tree), /GitHub 搜索「random\/pick」/);
+  assert.match(textOf(tree), /不是排行榜/);
+});
+
+await check("随便看看：搜不到时说清楚没搜到，而不是「榜单为空」", async () => {
+  nameSearchPayload = { status: 200, body: JSON.stringify({ total_count: 0, items: [] }) };
+  submitSearch("根本没有这个仓库");
+  assert.ok(await waitFor(() => /没搜到/.test(textOf(render()))), "应说明没搜到");
+  nameSearchPayload = GOOD_NAME_SEARCH;
+});
+
+await check("随便看看：清空搜索词再提交，回到换一批", async () => {
+  submitSearch("");
+  assert.ok(await waitFor(() => textOf(render()).includes("a random pick")), "应回到随机批次");
+  assert.match(textOf(render()), /随机抽的一批/, "状态行应说明又回到随机抽样");
+});
+
+await check("随便看看：空批次给出明确的下一步，不是空白页", async () => {
+  discoverPayload = { status: 200, body: JSON.stringify({ total_count: 900, items: [] }) };
+  findByText(render(), "换一批").props.onClick();
+  assert.ok(await waitFor(() => /没抽到仓库/.test(textOf(render()))), "应提示再换一批");
+  discoverPayload = GOOD_DISCOVER;
+});
+
+await check("随便看看：限流时给出可读提示，不留空白", async () => {
+  discoverPayload = { status: 403, body: JSON.stringify({ message: "API rate limit exceeded" }) };
+  findByText(render(), "换一批").props.onClick();
+  assert.ok(await waitFor(() => /限流/.test(textOf(render()))), "应提示限流");
+  discoverPayload = GOOD_DISCOVER;
+});
+
+await check("随便看看：没有本地快照，切回来也不会说「与上次相比」", async () => {
+  // 先离开再回来：同一个视图重复点 chip 是早退，不算「切回来」。
+  findByText(render(), "Trending").props.onClick();
+  await waitFor(() => !textOf(render()).includes("a random pick"));
+  discoverPayload = GOOD_DISCOVER;
+  findByText(render(), "随便看看").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("a random pick")), "应重新抽一批");
+  // 随机批次或搜索结果之间没有可比排名，说「排名无变化」就是编数据
+  assert.doesNotMatch(textOf(render()), /排名无变化/);
+  assert.doesNotMatch(textOf(render()), /首次抓取/);
+});
+
+await check("随便看看：导出标题写明来源，不冒充榜单", async () => {
+  let copied = null;
+  const prev = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { writeText: async (t) => { copied = t; } } },
+  });
+  try {
+    submitSearch("random/pick");
+    assert.ok(await waitFor(() => textOf(render()).includes("fuzzy hit")), "先有搜索结果");
+    findByText(render(), "导出 Markdown").props.onClick();
+    assert.ok(await waitFor(() => copied !== null), "应调用剪贴板");
+    assert.match(copied, /^# 每日热点 · GitHub 上按仓库名搜索「random\/pick」的结果/);
+    assert.doesNotMatch(copied, /Trending ·/, "不能冒充 Trending 榜");
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: prev });
+  }
 });
 
 /** 找到文本匹配的下拉触发器（Dropdown 未展开时不渲染选项）。 */

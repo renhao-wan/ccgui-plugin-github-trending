@@ -51,6 +51,29 @@ const PERIODS = [
 
 const RISING_PERIOD = { key: "rising", label: "新星库" };
 
+/** 视图的中文名，给下拉/状态行/导出标题共用同一套说法。 */
+const VIEW_LABEL = { trending: "Trending", rising: "新星库（7 天）", browse: "随便看看" };
+
+/**
+ * 「你现在看的是什么数据」的一句话说明。
+ *
+ * 三个视图的数据来源差异很大（爬页面 / Search 时间窗 / Search 随机或搜索），
+ * 状态行、解读 prompt、导出标题都要交代清楚，否则模型和用户都会把一批随机
+ * 抽样当成「今日榜单」来理解。
+ */
+function scopeTextOf(snap) {
+  const v = snap || {};
+  if (v.view === "rising") return "近 7 天新建且 star 增长快的新仓库（GitHub Search）";
+  if (v.view === "browse") {
+    const term = String(v.discoverTerm || "").trim();
+    if (term) return "GitHub 上按仓库名搜索「" + term + "」的结果";
+    return "从热门仓库里随机抽的一批" + (v.discoverBand ? "（" + v.discoverBand + "）" : "") + "（GitHub Search）";
+  }
+  const period = (v.settings && v.settings.period) || "daily";
+  const language = v.settings && v.settings.language;
+  return "GitHub Trending " + period + " 榜" + (language ? "（" + language + "）" : "");
+}
+
 const DEFAULT_SETTINGS = {
   period: "daily",
   language: "",
@@ -116,6 +139,15 @@ const DEFAULT_STATE = {
   readmeText: "",
   readmeTruncated: false,
   readmeTotal: 0,
+  /**
+   * 「随便看看」当前生效的搜索词；空串 = 换一批（随机档位 + 随机页）。
+   * 输入框里的未提交内容不在这里，否则每敲一个字就换一批。
+   */
+  discoverTerm: "",
+  /** 当前这批是从哪个 star 档抽的（「★1k–3k」）；搜索模式下为空。 */
+  discoverBand: "",
+  /** Search API 报的总命中数，只用于说明「一共多少条里挑了这些」。 */
+  discoverTotal: 0,
   catalog: [],
   catalogLoaded: false,
   modelsLoading: false,
@@ -334,19 +366,24 @@ async function fetchTrending(ctx, period, language) {
   return { ok: true, repos: parsed.repos };
 }
 
-async function fetchRising(settings) {
-  const url =
-    "https://api.github.com/search/repositories?q=" +
-    encodeURIComponent(buildRisingQuery(settings.minStars, 7)) +
-    "&sort=stars&order=desc&per_page=25";
+/**
+ * Search API 的通用取数。新星库、随便看看、仓库搜索三条路径共用一套：
+ * URL 组装交给纯函数（各视图的 query 语义差得远），这里只管网络、限流与
+ * 空结果的口径。
+ *
+ * @param {{ q: string, sort: string, order: string, perPage: number, page: number }} spec
+ * @param {object} settings
+ * @param {{ emptyMessage: string }} hints
+ */
+async function fetchSearch(spec, settings, hints) {
   const headers = {
     Accept: "application/vnd.github+json",
     "User-Agent": "ccgui-github-trending",
   };
-  const token = String(settings.token || "").trim();
+  const token = String((settings && settings.token) || "").trim();
   if (token) headers.Authorization = "Bearer " + token;
 
-  const res = await httpGet(url, headers);
+  const res = await httpGet(discoverUrl(spec), headers);
   let payload = null;
   try {
     payload = JSON.parse(res.body);
@@ -367,10 +404,52 @@ async function fetchRising(settings) {
     return {
       ok: false,
       kind: parsed.error,
-      message: res.status >= 400 ? "GitHub 返回 HTTP " + res.status : "新星库结果为空，可调低 star 阈值",
+      message: res.status >= 400
+        ? "GitHub 返回 HTTP " + res.status
+        : (hints && hints.emptyMessage) || "没有结果",
     };
   }
-  return { ok: true, repos: parsed.repos };
+  return { ok: true, repos: parsed.repos, total: parsed.total };
+}
+
+async function fetchRising(settings) {
+  return fetchSearch(
+    {
+      q: buildRisingQuery(settings.minStars, 7),
+      sort: "stars",
+      order: "desc",
+      perPage: 25,
+      page: 1,
+    },
+    settings,
+    { emptyMessage: "新星库结果为空，可调低 star 阈值" },
+  );
+}
+
+/** 「换一批」：伪随机档位 + 随机页，见 src/lib/discover.mjs 的说明。 */
+async function fetchDiscover(settings) {
+  const spec = buildDiscoverQuery();
+  const result = await fetchSearch(spec, settings, { emptyMessage: "这一批没抽到仓库，再换一批" });
+  if (result.ok) {
+    // 把星档带回去，状态行要说出「这批是从哪个档位抽的」。
+    result.band = spec.band;
+    result.repos = shapeDiscoverRows(result.repos);
+  }
+  return result;
+}
+
+/** 按仓库名搜索。空输入由调用方先行拦截，这里再兜一次。 */
+async function fetchRepoSearch(term, settings) {
+  const spec = buildSearchSpec(term);
+  if (!spec) return { ok: true, repos: [], total: 0, term: "" };
+  const result = await fetchSearch(spec, settings, {
+    emptyMessage: "没搜到叫「" + String(term).trim() + "」的仓库",
+  });
+  if (result.ok) {
+    result.term = String(term).trim();
+    result.repos = shapeDiscoverRows(result.repos);
+  }
+  return result;
 }
 
 /* ---------- README 预览 ---------- */
@@ -568,11 +647,21 @@ async function refresh(ctx, options) {
   const snap = store.snap;
   const settings = snap.settings;
   const view = snap.view;
-  const period = view === "rising" ? RISING_PERIOD.key : settings.period;
-  const language = view === "rising" ? "" : settings.language;
+  const period = view === "rising" ? RISING_PERIOD.key : view === "browse" ? "browse" : settings.period;
+  const language = view === "trending" ? settings.language : "";
+  // 搜索词只在「随便看看」里有意义；空串 = 换一批（伪随机档位 + 随机页）。
+  // 可以从 options 传（搜索框刚提交，state 里的还是上一批），否则沿用当前生效的。
+  const term =
+    view === "browse"
+      ? String(options && options.term !== undefined ? options.term : snap.discoverTerm || "").trim()
+      : "";
+  // 浏览视图没有「时间档」和「语言」，批次标识就是搜索词本身：
+  // 同一个词重刷不该被早退挡掉，所以 key 必须把词算进去。
+  const sourceKey = view === "browse" ? "browse:" + (term || "__random__") : view + ":" + period + ":" + language;
 
-  // 同一视图已经有数据且不是强制刷新：不重复打网络。
-  if (!force && snap.loaded && snap.source === view + ":" + period + ":" + language) return;
+  // 同一份数据已经有内容且不是强制刷新：不重复打网络。
+  // 注意「换一批」必须走 force——不 force 就等于按了没反应。
+  if (!force && snap.loaded && snap.source === sourceKey) return;
 
   const seq = ++genSeq;
 
@@ -602,7 +691,11 @@ async function refresh(ctx, options) {
 
   let result;
   try {
-    result = view === "rising" ? await fetchRising(settings) : await fetchTrending(ctx, period, language);
+    if (view === "browse") {
+      result = term ? await fetchRepoSearch(term, settings) : await fetchDiscover(settings);
+    } else {
+      result = view === "rising" ? await fetchRising(settings) : await fetchTrending(ctx, period, language);
+    }
   } catch (error) {
     result = { ok: false, kind: "network", message: messageOf(error) };
   }
@@ -612,10 +705,10 @@ async function refresh(ctx, options) {
   if (seq !== genSeq) return;
 
   if (!result.ok) {
-    const key = view + ":" + period + ":" + language;
     // 失败时优先保住用户正在看的内容：同一视图的旧数据 > 本地快照 > 空。
-    const sameView = snap.source === key && snap.repos.length > 0;
-    const cached = view === "rising" ? null : await readSnapshot(ctx, period, language);
+    // 「随便看看」没有本地快照（随机批次、搜索结果本就不该落盘）。
+    const sameView = snap.source === sourceKey && snap.repos.length > 0;
+    const cached = view === "trending" ? await readSnapshot(ctx, period, language) : null;
     if (seq !== genSeq) return;
     const fallback = sameView ? snap.repos : cached ? diffSnapshot(cached, null).repos : [];
     set({
@@ -623,11 +716,35 @@ async function refresh(ctx, options) {
       loaded: true,
       errorKind: result.kind,
       httpError: result.message,
-      source: key,
+      source: sourceKey,
       repos: fallback,
       dropped: sameView ? snap.dropped : [],
       isFirstRun: sameView ? snap.isFirstRun : Boolean(cached),
       loadedAt: sameView ? snap.loadedAt : cached ? Date.now() : null,
+      // 失败不覆盖上一批的档位说明：列表还在，说的还是同一批。
+      discoverTerm: view === "browse" && sameView ? snap.discoverTerm : term,
+      discoverBand: view === "browse" && sameView ? snap.discoverBand : "",
+      discoverTotal: view === "browse" && sameView ? snap.discoverTotal : 0,
+    });
+    return;
+  }
+
+  if (view === "browse") {
+    // 不落盘、不做历史对比：这批是随机抽的（或一次搜索结果），
+    // 跟「上一次」没有任何可比的排名关系，标涨跌就是编数据。
+    set({
+      loading: false,
+      loaded: true,
+      errorKind: "",
+      httpError: "",
+      repos: result.repos.map((row, index) => ({ ...row, rank: null, rankDelta: null, isNew: false })),
+      dropped: [],
+      isFirstRun: false,
+      source: sourceKey,
+      loadedAt: Date.now(),
+      discoverTerm: term,
+      discoverBand: result.band ? bandLabel(result.band) : "",
+      discoverTotal: Number.isFinite(result.total) ? result.total : result.repos.length,
     });
     return;
   }
@@ -649,10 +766,13 @@ async function refresh(ctx, options) {
     isFirstRun: diff.isFirstRun,
     source: view + ":" + period + ":" + language,
     loadedAt: Date.now(),
+    discoverTerm: "",
+    discoverBand: "",
+    discoverTotal: 0,
   });
 
   // 快照只对 Trending 有意义（新星库是滚动窗口，排名不可比）。
-  if (view !== "rising") await writeSnapshot(ctx, period, language, result.repos);
+  if (view === "trending") await writeSnapshot(ctx, period, language, result.repos);
 }
 
 /* ---------- AI 解读 ---------- */
@@ -1067,7 +1187,10 @@ async function discussRepo(ctx, row) {
       row,
       view: snap.view,
       period: snap.view === "rising" ? RISING_PERIOD.key : settings.period,
-      language: snap.view === "rising" ? "" : settings.language,
+      language: snap.view === "trending" ? settings.language : "",
+      // 「随便看看」的行没有名次/涨跌，来源得如实写成随机抽样或搜索结果，
+      // 否则模型会以为这是一个有排名的榜单。
+      scopeText: scopeTextOf(snap),
       template: chosen.text,
     });
 
@@ -1136,7 +1259,8 @@ async function generateDigest(ctx) {
 
   const settings = snap.settings;
   const view = snap.view;
-  const period = view === "rising" ? RISING_PERIOD.key : settings.period;
+  const period =
+    view === "rising" ? RISING_PERIOD.key : view === "browse" ? "browse" : settings.period;
   const seq = ++digestSeq;
 
   // 立刻置 generating：下面有两个 await，等到那时再置，双击就能开出两轮。
@@ -1158,7 +1282,10 @@ async function generateDigest(ctx) {
   const built = buildDigestPrompt({
     view,
     period,
-    language: view === "rising" ? "" : settings.language,
+    language: view === "trending" ? settings.language : "",
+    // 「随便看看」的榜单不是排行榜：不说清楚来源，模型会把随机抽样写成
+    // 「今天在热什么」，那是在编结论。
+    scopeText: scopeTextOf(store.snap),
     repos: snap.repos,
     dropped: snap.dropped,
     isFirstRun: snap.isFirstRun,
@@ -1332,6 +1459,12 @@ function RepoRow({ row, ctx, discussing, readme }) {
   const blocked = Boolean(discussing) && !busy;
   // readme 传的是整块快照，展开状态由 readmeOpen 决定——同一时刻只开一行。
   const readmeOpen = Boolean(readme) && readme.readmeOpen === repoName;
+  // 搜索结果里精确命中的那一行标一下：`in:name` 是模糊匹配，搜 react 会先出
+  // facebook/react-native，不标就得多扫几眼才知道「我要的那个在哪」。
+  const exactHit =
+    Boolean(readme) && readme.view === "browse" && readme.discoverTerm
+      ? isExactNameMatch(row, readme.discoverTerm)
+      : false;
 
   return h(
     "li",
@@ -1352,6 +1485,7 @@ function RepoRow({ row, ctx, discussing, readme }) {
               name || null,
             )
           : h("span", { className: "gt-repo" }, repoName),
+        exactHit ? h("span", { className: "gt-hit", title: "仓库名与搜索词一致" }, "正中") : null,
         movement
           ? h("span", { className: "gt-move" + movementClass(row) }, movement)
           : null,
@@ -1450,6 +1584,89 @@ function ReadmePanel({ readme, href }) {
   );
 }
 
+/**
+ * 「随便看看」的搜索框 + 换一批。
+ *
+ * 输入框内容放组件局部 state，不写回 store：每敲一个字就换一批显然是错的，
+ * 提交（回车/点「搜索」）才去 GitHub。清空输入框再提交 = 回到换一批。
+ */
+function DiscoverBar({ snap, ctx }) {
+  const R = appCtx.react;
+  const h = R.createElement;
+  const textState = R.useState("");
+  const text = textState[0];
+  const setText = textState[1];
+  // 搜索生效时输入框要显示那个词：否则清空后看不出「现在这批是搜出来的」。
+  R.useEffect(() => {
+    if (snap.discoverTerm) setText(snap.discoverTerm);
+  }, [snap.discoverTerm]);
+
+  const busy = snap.loading;
+  const submit = (raw) => {
+    const term = String(raw === undefined ? text : raw).trim();
+    if (busy) return;
+    // 提交时先清空列表再拉：换一批/换关键词时旧行留着会让人以为结果出来了。
+    set({ repos: [], loaded: false, discoverTerm: term, discoverBand: "", discoverTotal: 0 });
+    void refresh(ctx, { force: true, term });
+  };
+  // 空输入时「搜索」等于换一批，语义上是「取消搜索」，这也正是用户想要的。
+  const onSearch = () => submit(text);
+  const onRandom = () => {
+    if (busy) return;
+    set({ repos: [], loaded: false, discoverTerm: "", discoverBand: "", discoverTotal: 0 });
+    void refresh(ctx, { force: true, term: "" });
+  };
+
+  return h(
+    "div",
+    { className: "gt-group gt-discover" },
+    h(
+      "form",
+      {
+        className: "gt-search",
+        onSubmit: (event) => {
+          if (event && typeof event.preventDefault === "function") event.preventDefault();
+          onSearch();
+        },
+      },
+      h("input", {
+        type: "search",
+        className: "gt-input gt-search-input",
+        value: text,
+        placeholder: "搜仓库名，回车去 GitHub 查",
+        "aria-label": "搜索仓库名",
+        disabled: busy,
+        onChange: (event) => setText(event && event.target ? String(event.target.value || "") : ""),
+        // Esc 清空：输入框里最常见的「算了」，比逼用户逐个删字强。
+        onKeyDown: (event) => {
+          if (event && event.key === "Escape") setText("");
+        },
+      }),
+      h(
+        "button",
+        {
+          type: "submit",
+          className: "gt-btn",
+          disabled: busy,
+          title: text.trim() ? "按仓库名到 GitHub 上搜索" : "没有关键词时等同于换一批",
+        },
+        "搜索",
+      ),
+    ),
+    h(
+      "button",
+      {
+        type: "button",
+        className: "gt-btn",
+        onClick: onRandom,
+        disabled: busy,
+        title: "重新随机抽一个 star 档位与页码",
+      },
+      "换一批",
+    ),
+  );
+}
+
 function Toolbar({ snap, ctx }) {
   const h = appCtx.react.createElement;
   const R = appCtx.react;
@@ -1472,6 +1689,8 @@ function Toolbar({ snap, ctx }) {
       view: snap.view,
       period: snap.settings.period,
       language: snap.view === "trending" ? snap.settings.language : "",
+      // 「随便看看」导出时得说清这批是怎么来的，否则粘出去像一份榜单。
+      scopeText: scopeTextOf(snap),
       rows: snap.repos,
       dropped: snap.dropped,
       capturedAt: fmtTime(snap.loadedAt),
@@ -1486,6 +1705,26 @@ function Toolbar({ snap, ctx }) {
       () => flashExport("复制失败"),
     );
   };
+  const clearRows = () => ({
+    digest: "",
+    digestStopped: false,
+    dropped: [],
+    isFirstRun: true,
+    repos: [],
+    loaded: false,
+    discussError: "",
+    discussNotice: "",
+    discussWorkspace: "",
+    discussWarning: "",
+    discussResumed: false,
+    discussPromptName: "",
+    readmeOpen: "",
+    readmeLoading: false,
+    readmeError: "",
+    readmeText: "",
+    readmeTruncated: false,
+    readmeTotal: 0,
+  });
   // 切视图/时间档会让榜单换掉，正在生成的解读说的是旧榜单，必须一并停掉，
   // 否则旧轮次的 delta 会继续写进新视图，而且宿主那侧还在烧 token。
   const onView = (view) => {
@@ -1494,24 +1733,12 @@ function Toolbar({ snap, ctx }) {
     markDiscussSessionsStale();
     set({
       view,
-      digest: "",
-      digestStopped: false,
-      dropped: [],
-      isFirstRun: true,
-      repos: [],
-      loaded: false,
-      discussError: "",
-      discussNotice: "",
-      discussWorkspace: "",
-      discussWarning: "",
-      discussResumed: false,
-      discussPromptName: "",
-      readmeOpen: "",
-    readmeLoading: false,
-    readmeError: "",
-    readmeText: "",
-    readmeTruncated: false,
-    readmeTotal: 0,
+      ...clearRows(),
+      // 「随便看看」每次都从新的一批开始：保留上一个视图的搜索词只会让
+      // 人以为搜索还生效着，其实列表已经是随机的了。
+      discoverTerm: "",
+      discoverBand: "",
+      discoverTotal: 0,
     });
     void refresh(ctx, { force: true });
   };
@@ -1521,25 +1748,7 @@ function Toolbar({ snap, ctx }) {
     markDiscussSessionsStale();
     setSettings({ period });
     void persistSettings(ctx, { period });
-    set({
-      loaded: false,
-      repos: [],
-      digest: "",
-      digestStopped: false,
-      dropped: [],
-      discussError: "",
-      discussNotice: "",
-      discussWorkspace: "",
-      discussWarning: "",
-      discussResumed: false,
-      discussPromptName: "",
-      readmeOpen: "",
-    readmeLoading: false,
-    readmeError: "",
-    readmeText: "",
-    readmeTruncated: false,
-    readmeTotal: 0,
-    });
+    set(clearRows());
     void refresh(ctx, { force: true });
   };
 
@@ -1551,6 +1760,7 @@ function Toolbar({ snap, ctx }) {
       { className: "gt-group", role: "group", "aria-label": "数据视图" },
       h(Chip, { active: snap.view === "trending", onClick: () => onView("trending") }, "Trending"),
       h(Chip, { active: snap.view === "rising", onClick: () => onView("rising") }, "新星库（7 天）"),
+      h(Chip, { active: snap.view === "browse", onClick: () => onView("browse") }, "随便看看"),
     ),
     snap.view === "trending"
       ? h(
@@ -1561,6 +1771,9 @@ function Toolbar({ snap, ctx }) {
           ),
         )
       : null,
+    // 搜索与换一批只在「随便看看」里出现：它们换掉的是列表本身，
+    // 放到别的视图里就会变成「刷新按钮的另一种写法」。
+    snap.view === "browse" ? h(DiscoverBar, { snap, ctx }) : null,
     h(
       "div",
       { className: "gt-group gt-group--end" },
@@ -1608,17 +1821,58 @@ function Toolbar({ snap, ctx }) {
   );
 }
 
+/**
+ * 状态行里「你现在在看什么」那句话。
+ *
+ * 三个视图的来源不同，涨跌标签也并非处处都有（「随便看看」的批次之间
+ * 没有可比排名），所以每一段都要按视图决定在场与否——不能写一句通用文案
+ * 就指望它对三种数据都成立。
+ */
+function scopeParts(snap) {
+  if (snap.view === "browse") {
+    const term = String(snap.discoverTerm || "").trim();
+    const parts = [];
+    if (term) {
+      parts.push("GitHub 搜索「" + term + "」");
+      if (Number.isFinite(snap.discoverTotal) && snap.discoverTotal > 0) {
+        parts.push("共 " + fmtNumber(snap.discoverTotal) + " 个命中");
+      }
+    } else {
+      parts.push("随机抽的一批热门仓库");
+      if (snap.discoverBand) parts.push(snap.discoverBand);
+    }
+    parts.push("不是排行榜，没有名次与涨跌");
+    return parts;
+  }
+  const parts = [
+    snap.view === "rising" ? "近 7 天新建的高增长仓库" : "GitHub Trending · " + snap.settings.period,
+  ];
+  if (snap.view === "trending" && snap.settings.language) parts.push(snap.settings.language);
+  if (snap.isFirstRun) parts.push("首次抓取，下次刷新可看到排名变化");
+  // 没有变化时整榜都没有涨跌标签，不说明会让人以为标签没渲染出来
+  if (!snap.isFirstRun && snap.repos.length > 0 && !hasRankChange(snap.repos)) parts.push("与上次相比排名无变化");
+  return parts;
+}
+
 function StatusLine({ snap }) {
   const h = appCtx.react.createElement;
   if (snap.loading) {
     // 刷新时列表还在：只转圈 + 一句话，不抢走用户正在看的内容。
     // 首次加载没有列表：文案改成「首次抓取」的口吻。
     const first = snap.repos.length === 0;
+    const what =
+      snap.view === "browse"
+        ? snap.discoverTerm
+          ? "正在搜索仓库…"
+          : "正在抽一批热门仓库…"
+        : first
+          ? "正在抓取 GitHub…"
+          : "正在刷新榜单…";
     return h(
       "p",
       { className: "gt-notice gt-running", role: "status", "aria-live": "polite" },
       h("span", { className: "gt-spinner", "aria-hidden": "true" }),
-      h("span", { className: "gt-running-text" }, first ? "正在抓取 GitHub…" : "正在刷新榜单…"),
+      h("span", { className: "gt-running-text" }, what),
     );
   }
   // 讨论的回执讲的是「你刚才那一按的结果」，比榜单状态更该优先显示：
@@ -1626,14 +1880,7 @@ function StatusLine({ snap }) {
   // 把「开会话失败了，因为…」整个吞掉——用户看到的还是几分钟前的错误。
   if (snap.discussError || snap.discussNotice) {
     const base = snap.loaded
-      ? h(
-          "p",
-          { className: "gt-notice" },
-          snap.view === "rising" ? "近 7 天新建的高增长仓库" : "GitHub Trending · " + snap.settings.period,
-          snap.view === "trending" && snap.settings.language ? " · " + snap.settings.language : "",
-          snap.isFirstRun ? " · 首次抓取，下次刷新可看到排名变化" : "",
-          !snap.isFirstRun && snap.repos.length > 0 && !hasRankChange(snap.repos) ? " · 与上次相比排名无变化" : "",
-        )
+      ? h("p", { className: "gt-notice" }, scopeParts(snap).join(" · "))
       : null;
     return h(
       "div",
@@ -1686,18 +1933,16 @@ function StatusLine({ snap }) {
       cacheHint ? h("span", { className: "gt-notice-hint" }, "（当前显示的是上次的结果）") : null,
     );
   }
-  if (!snap.loaded) return h("p", { className: "gt-notice" }, "点「刷新」拉取榜单。");
+  if (!snap.loaded) {
+    return h(
+      "p",
+      { className: "gt-notice" },
+      snap.view === "browse" ? "点「换一批」抽一批热门仓库，或直接搜仓库名。" : "点「刷新」拉取榜单。",
+    );
+  }
   // 回执和榜单说明并列，不互相顶替：回执说的是「你刚才那一按的结果」，
   // 榜单行说的是「你现在在看什么数据」，两件事都得在场。
-  return h(
-    "p",
-    { className: "gt-notice" },
-    snap.view === "rising" ? "近 7 天新建的高增长仓库" : "GitHub Trending · " + snap.settings.period,
-    snap.view === "trending" && snap.settings.language ? " · " + snap.settings.language : "",
-    snap.isFirstRun ? " · 首次抓取，下次刷新可看到排名变化" : "",
-    // 没有变化时整榜都没有涨跌标签，不说明会让人以为标签没渲染出来
-    !snap.isFirstRun && snap.repos.length > 0 && !hasRankChange(snap.repos) ? " · 与上次相比排名无变化" : "",
-  );
+  return h("p", { className: "gt-notice" }, scopeParts(snap).join(" · "));
 }
 
 /** 整榜是否有任何涨跌/新上榜。全为 false 时列表里不会出现任何变化标签。 */
@@ -1981,7 +2226,7 @@ function MainTab() {
         "div",
         { className: "gt-head-text" },
         h("h2", { className: "gt-title" }, "每日热点"),
-        h("p", { className: "gt-sub" }, "GitHub Trending 与新星库，数据只在本机处理"),
+        h("p", { className: "gt-sub" }, "GitHub Trending、新星库与「随便看看」，数据只在本机处理"),
       ),
     ),
     h(Toolbar, { snap, ctx }),
@@ -1994,7 +2239,17 @@ function MainTab() {
         : snap.loading
           ? h(SkeletonList, null)
           : snap.loaded
-            ? h("p", { className: "gt-empty" }, snap.errorKind ? "没有可显示的数据" : "榜单为空")
+            ? h(
+                "p",
+                { className: "gt-empty" },
+                snap.errorKind
+                  ? "没有可显示的数据"
+                  : snap.view === "browse"
+                    ? snap.discoverTerm
+                      ? "没搜到叫这个名字的仓库，换个词试试"
+                      : "这一批没抽到仓库，点「换一批」再来"
+                    : "榜单为空",
+              )
             : null,
       snap.view === "trending" && snap.dropped.length > 0
         ? h(
@@ -2850,6 +3105,36 @@ const CSS = `
   outline-offset: 2px;
 }
 .gt-stamp { font-size: 11px; opacity: 0.55; white-space: nowrap; }
+/* 「随便看看」的搜索框与换一批。输入框吃掉剩余宽度，但设上限：
+ * 工具栏是 flex-wrap 的，输入框太宽会把右侧按钮挤到第二行。 */
+.gt-discover { gap: 6px; flex-wrap: wrap; }
+.gt-search { display: flex; align-items: center; gap: 4px; }
+.gt-input {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--gt-border);
+  background: var(--gt-surface);
+  color: inherit;
+  transition: border-color 120ms ease;
+}
+.gt-input::placeholder { color: inherit; opacity: 0.45; }
+.gt-input:disabled { opacity: 0.55; cursor: not-allowed; }
+.gt-search-input { width: 180px; min-width: 0; }
+.gt-search-input::-webkit-search-cancel-button { cursor: pointer; }
+/* 精确命中标记：和涨跌标签同一视觉重量（小、带底色），但用强调色，
+ * 不会被误读成「上升」。 */
+.gt-hit {
+  flex: none;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--gt-accent);
+  color: var(--gt-accent);
+}
 .gt-notice { margin: 0; font-size: 12px; opacity: 0.7; }
 /* 状态区可能同时有两件事要说（在看什么数据 + 刚才那一按的结果）。
  * 合成一列而不是二选一，两句话都短，叠起来还不到原来两行的钱。 */

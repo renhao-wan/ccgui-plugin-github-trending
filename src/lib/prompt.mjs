@@ -41,33 +41,41 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
   const repos = Array.isArray(input.repos) ? input.repos : [];
   const dropped = Array.isArray(input.dropped) ? input.dropped : [];
   const limit = Number.isFinite(budget) && budget > 0 ? budget : DEFAULT_BUDGET;
+  // 「随便看看」给的不是榜单：随机抽样/搜索结果之间没有排名与涨跌，
+  // 照搬「按排名」「今天在热什么」会让模型把一批随机仓库写成趋势判断。
+  const random = input.view === "browse";
 
-  const scope = input.view === "rising"
-    ? "近 7 天新建且 star 增长快的新仓库（GitHub Search）"
-    : "GitHub Trending " + (input.period || "daily") + " 榜" + (input.language ? "（" + input.language + "）" : "");
+  const scope = String((input && input.scopeText) || "").trim() ||
+    (input.view === "rising"
+      ? "近 7 天新建且 star 增长快的新仓库（GitHub Search）"
+      : "GitHub Trending " + (input.period || "daily") + " 榜" + (input.language ? "（" + input.language + "）" : ""));
 
   const header = [
-    "你在为一位中文开发者解读今天的 GitHub 热点。",
+    random ? "你在为一位中文开发者挑 GitHub 上值得一看的项目。" : "你在为一位中文开发者解读今天的 GitHub 热点。",
     "",
     "## 数据范围",
     scope,
     "共 " + repos.length + " 个仓库" + (input.isFirstRun ? "（首次抓取，无历史对比）" : ""),
     "",
-    "## 榜单事实（按排名）",
+    random ? "## 这批仓库" : "## 榜单事实（按排名）",
   ];
 
   const footer = [
     "",
     "## 写作要求",
     "- 全文中文，术语保留英文原文。",
-    "- 只依据上面的「榜单事实」；事实里没有的信息不要编造，也不要猜技术细节。",
+    "- 只依据上面的「" + (random ? "这批仓库" : "榜单事实") + "」；事实里没有的信息不要编造，也不要猜技术细节。",
     "- 不要复述榜单，不要用「首先/其次/总之」这类填充词。",
     "- 用 Markdown，但不要写一级标题（不要用 `#`）。",
+    // 随机批次最容易被模型写成趋势判断，这条必须显式在场。
+    ...(random ? ["- 这批不是排行榜：没有名次、没有涨跌，也不代表今天的热点。不要写「今天在热什么」这类趋势判断。"] : []),
     "",
     "按这个结构写：",
     "",
-    "### 今天在热什么",
-    "3-5 句总体判断：哪个方向在升温、有没有共同的技术主题。",
+    random ? "### 这几个项目在做什么" : "### 今天在热什么",
+    random
+      ? "3-5 句：这批项目大致落在哪些方向、有没有共同的技术主题。用「这批里」而不是「今天」。"
+      : "3-5 句总体判断：哪个方向在升温、有没有共同的技术主题。",
     "",
     "### 值得看的项目",
     "用一个 Markdown 表格，5-8 行，列固定为：",
@@ -75,7 +83,9 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
     "每格一句话，仓库名写成 `owner/repo`。不要加评分、不要加星级数字（上面的事实里已有）。",
     "",
     "### 一句话结论",
-    "一行，说明今天最值得点开的那一个，以及为什么。",
+    random
+      ? "一行，说明这批里最值得点开的那一个，以及为什么。"
+      : "一行，说明今天最值得点开的那一个，以及为什么。",
   ];
 
   const lines = [];
@@ -232,10 +242,10 @@ export function buildDiscussPrompt(input) {
   const row = (input && input.row) || {};
   const repo = String(row.repo || "").trim() || "这个仓库";
   const url = repo.indexOf("/") > 0 ? "https://github.com/" + repo : "";
-  const scope =
-    input.view === "rising"
+  const scope = String((input && input.scopeText) || "").trim() ||
+    (input.view === "rising"
       ? "近 7 天新建且 star 增长快的新仓库（GitHub Search）"
-      : "GitHub Trending " + (input.period || "daily") + " 榜" + (input.language ? "（" + input.language + "）" : "");
+      : "GitHub Trending " + (input.period || "daily") + " 榜" + (input.language ? "（" + input.language + "）" : ""));
 
   const facts = [];
   if (row.description) facts.push("- 简介：" + clip(row.description, 400));

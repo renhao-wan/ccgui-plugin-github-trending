@@ -5,11 +5,11 @@
   "sdkVersion": "^0.3",
   "minAppVersion": "1.2.4",
   "author": "renhao-wan",
-  "description": "每天的 GitHub Trending 与近 7 天新星库，标出新上榜与排名变化；需要时让模型写一段中文解读。",
+  "description": "每天的 GitHub Trending 与近 7 天新星库，标出新上榜与排名变化；也能随机看看热门仓库或按仓库名搜索。需要时让模型写一段中文解读。",
   "repo": "renhao-wan/ccgui-plugin-github-trending",
   "license": "MIT",
   "icon": "docs/icon.png",
-  "keywords": ["github", "trending", "hot", "daily", "digest", "热点", "榜单"],
+  "keywords": ["github", "trending", "hot", "daily", "digest", "discover", "热点", "榜单", "搜索"],
   "tier": "js",
   "permissions": [
     "ui:center-tab",

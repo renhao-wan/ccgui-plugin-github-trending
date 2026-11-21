@@ -317,3 +317,38 @@ test("续接策略：每种模式都有说明文字，且互不相同", () => {
   assert.equal(new Set(hints).size, hints.length, "三个说明不该长一样");
   assert.equal(resumeModeHint("乱写"), resumeModeHint(DEFAULT_RESUME_MODE));
 });
+
+test("随便看看的解读：不冒充「今天的榜单」，也不写趋势判断", () => {
+  const { prompt } = buildDigestPrompt(base({ view: "browse", scopeText: "从热门仓库里随机抽的一批（★1k–3k）" }));
+  assert.match(prompt, /这批里/, "结论句应说「这批里」而不是「今天」");
+  assert.match(prompt, /这批不是排行榜/);
+  assert.match(prompt, /随机抽的一批/);
+  // 「今天在热什么」是小标题：随机抽样不该出现这个标题
+  assert.doesNotMatch(prompt, /### 今天在热什么/);
+  assert.match(prompt, /## 这批仓库/);
+});
+
+test("随便看看：榜单视图的措辞不受影响", () => {
+  const { prompt } = buildDigestPrompt(base());
+  assert.match(prompt, /### 今天在热什么/);
+  assert.match(prompt, /## 榜单事实（按排名）/);
+  assert.doesNotMatch(prompt, /这批不是排行榜/);
+});
+
+test("scopeText 覆盖默认范围说明（三个视图共用同一入口）", () => {
+  assert.match(buildDigestPrompt(base({ scopeText: "自定义范围" })).prompt, /自定义范围/);
+  assert.match(
+    buildDiscussPrompt({ row: discussRow(), view: "browse", scopeText: "GitHub 上按仓库名搜索「react」的结果" }),
+    /来源：GitHub 上按仓库名搜索「react」的结果/,
+  );
+});
+
+test("讨论 prompt：随便看看的行没有名次时不编排名", () => {
+  const p = buildDiscussPrompt({
+    row: discussRow({ rank: null, rankDelta: null, gain: null, gainPeriod: "" }),
+    view: "browse",
+    scopeText: "从热门仓库里随机抽的一批",
+  });
+  assert.doesNotMatch(p, /排第|当前名次/);
+  assert.doesNotMatch(p, /undefined|null|NaN/);
+});

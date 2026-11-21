@@ -68,9 +68,10 @@ function boardItem(row) {
 
 /**
  * @param {object} input
- * @param {"trending"|"rising"} input.view
+ * @param {"trending"|"rising"|"browse"} input.view
  * @param {string} input.period  daily|weekly|monthly
  * @param {string} input.language 空字符串 = 全部语言
+ * @param {string} [input.scopeText] 覆盖默认范围说明（「随便看看」用：随机抽样/搜索结果）
  * @param {Array<object>} input.rows
  * @param {Array<object>} input.dropped
  * @param {string} input.capturedAt 已格式化好的抓取时间（由调用方负责本地化）
@@ -83,10 +84,12 @@ export function buildBoardMarkdown(input) {
   if (items.length === 0) return "";
 
   const scope =
-    input.view === "rising"
+    String((input && input.scopeText) || "").trim() ||
+    (input.view === "rising"
       ? "近 7 天新星库"
-      : "GitHub Trending · " + (BOARD_PERIOD_LABEL[input.period] || input.period || "今日");
-  const heading = "# 每日热点 · " + scope + (input.view === "trending" && input.language ? " · " + input.language : "");
+      : "GitHub Trending · " + (BOARD_PERIOD_LABEL[input.period] || input.period || "今日"));
+  const heading =
+    "# 每日热点 · " + scope + (input.view === "trending" && input.language ? " · " + input.language : "");
 
   const out = [heading];
   // 引用块写在标题下面：粘到别处时，「这是哪天的数据」比格式更重要。
