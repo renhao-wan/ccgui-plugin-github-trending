@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // 生成 docs/icon.png：256×256、超采样抗锯齿、零依赖。
 //
-// 风格对齐 CC GUI 生态里的插件图标（工作志、斜杠命令面板、CLI 安装审计）：
-// 大圆角纯色底板 + 扁平白色符号，不用渐变、不堆细节——图标在侧栏里只有
-// 18~20px，双层配色 + 12 个刻度这种复杂度到这里全糊成一团。
+// 风格对齐 CC GUI 插件市场里规范的那一档（斜杠命令面板为参考）：
+// **高饱和纯色圆角底板 + 单个粗白符号 + 两点浅色点缀**，两层配色、零细节。
+// 图标在侧栏里只有 18~20px，多一层配色、多两根细柱都会糊成一团；早先那版
+// 灰蓝底板 + 三根细柱 + 橙色高亮正是这样糊掉的。
 //
-// 符号选「递增的三根柱」：GitHub Trending 说的是什么在升温，柱状图一眼就懂，
-// 而且不依赖文字。最右最高的一根用琥珀色，表示榜首/最热。
+// 符号选「向上的箭头」：Trending 说的就是什么在升温，箭头不依赖文字、不依赖
+// 语言，20px 下仍然认得出。两侧两点浅色圆点与斜杠面板同构，让同生态的图标
+// 摆在一起时像一套。
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -17,15 +19,20 @@ const OUT = path.join(HERE, "..", "docs", "icon.png");
 
 const W = 256;
 const H = 256;
+// 4× 超采样：整像素扫描 + 下采样即为抗锯齿，不需要任何图形库。
 const S = 4;
 const CW = W * S;
 const CH = H * S;
 
-// 底板：比宿主深色界面（约 #17191c）明显亮一档，否则图标贴在深色侧栏上
-// 会失去边界、看起来像没加载。同时避开工作志的绿、斜杠面板的蓝。
-const PLATE = [45, 52, 63, 255];
-const BAR = [230, 237, 243, 255];
-const BAR_HOT = [240, 136, 62, 255];
+/**
+ * 底板用高饱和的橙红：Trending = 升温，别的插件已经占了蓝（斜杠面板）与
+ * 绿（工作志）。同时压得足够深，白符号贴上去对比度够（~4.7:1）；
+ * 亮橙（如 #F4883E）白字只有 3.3:1，缩到 18px 会发虚。
+ */
+const PLATE = [222, 78, 22, 255];
+const INK = [255, 255, 255, 255];
+/** 点缀色 = 底板混白，和斜杠面板的浅蓝点是同一种做法。 */
+const DOT = [250, 196, 178, 255];
 
 const canvas = new Float32Array(CW * CH * 4);
 
@@ -59,24 +66,62 @@ function fillRoundRect(x0, y0, x1, y1, r, color) {
   }
 }
 
-// 1) 圆角方形底板（纯色，无渐变）
+/**
+ * 填充一条圆头线段（胶囊）。
+ *
+ * 箭头由三段胶囊组成：箭杆 + 两条 45° 的头部斜臂。用圆头而不是三角箭头，
+ * 是为了和斜杠面板的圆头斜杠保持同一种笔触——方角在 18px 下会显脏。
+ */
+function fillCapsule(x0, y0, x1, y1, r, color) {
+  const minX = Math.floor(Math.min(x0, x1) - r);
+  const maxX = Math.ceil(Math.max(x0, x1) + r);
+  const minY = Math.floor(Math.min(y0, y1) - r);
+  const maxY = Math.ceil(Math.max(y0, y1) + r);
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const len2 = dx * dx + dy * dy || 1;
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      // 点到线段的距离：投影落在段内就用垂直距离，落在段外就用端点距离。
+      let t = ((x - x0) * dx + (y - y0) * dy) / len2;
+      t = Math.min(1, Math.max(0, t));
+      const ex = x0 + t * dx - x;
+      const ey = y0 + t * dy - y;
+      if (ex * ex + ey * ey <= r * r) blend(x, y, color);
+    }
+  }
+}
+
+function fillCircle(cx, cy, r, color) {
+  for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
+    for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
+      const dx = x - cx;
+      const dy = y - cy;
+      if (dx * dx + dy * dy <= r * r) blend(x, y, color);
+    }
+  }
+}
+
+// 1) 圆角方形底板：纯色、无渐变、无描边。留白与圆角比例抄斜杠面板，
+//    这样两枚图标并排时轮廓完全一致。
 const pad = CW * 0.045;
 fillRoundRect(pad, pad, CW - pad, CH - pad, CW * 0.235, PLATE);
 
-// 2) 三根递增柱：底部对齐，高度递增，最右一根高亮
-const barW = CW * 0.148;
-const barGap = CW * 0.086;
-const totalW = barW * 3 + barGap * 2;
-const left = (CW - totalW) / 2;
-const bottom = CH * 0.79;
-const heights = [0.273, 0.437, 0.602].map((t) => CH * t);
-const radius = CW * 0.039;
+// 2) 向上的箭头。笔画粗细对齐斜杠面板的那一笔（约画布 10%），否则箭头
+//    天然比单根斜杠重，并排时一个像加粗、一个像细体。头部两臂张开到约
+//    45°：角度太陡时三根胶囊会在顶端挤成一个实心三角，放大看很沉。
+const cx = CW * 0.5;
+const strokeR = CW * 0.052;
+const tipY = CH * 0.305;
+const wingY = CH * 0.455;
+fillCapsule(cx, CH * 0.755, cx, CH * 0.355, strokeR, INK);
+fillCapsule(cx, tipY, CW * 0.328, wingY, strokeR, INK);
+fillCapsule(cx, tipY, CW * 0.672, wingY, strokeR, INK);
 
-heights.forEach((h, i) => {
-  const x0 = left + i * (barW + barGap);
-  const color = i === heights.length - 1 ? BAR_HOT : BAR;
-  fillRoundRect(x0, bottom - h, x0 + barW, bottom, radius, color);
-});
+// 3) 两侧点缀：一高一低（与斜杠面板同为错落的两点），不抢主符号。
+const dotR = CW * 0.042;
+fillCircle(CW * 0.268, CH * 0.655, dotR, DOT);
+fillCircle(CW * 0.732, CH * 0.565, dotR, DOT);
 
 // 下采样（预乘 alpha）
 const rgba = Buffer.alloc(W * H * 4);
