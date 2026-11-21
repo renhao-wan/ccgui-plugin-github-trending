@@ -526,8 +526,7 @@ const DEFAULT_DISCUSS_TEMPLATE = [
 ].join("\n");
 
 /** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
-const PROMPT_TEXT_LIMIT = 20000;
-/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
+const PROMPT_TEXT_LIMIT = 20000;/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
 const PROMPT_COUNT_LIMIT = 8;
 /** 名字上限：侧栏/下拉里只放得下一行。 */
 const PROMPT_NAME_LIMIT = 40;
@@ -643,6 +642,50 @@ function buildDiscussPrompt(input) {
     return text + "\n\n## 榜单事实（插件补充）\n" + facts.join("\n");
   }
   return text;
+}
+
+/* ---------- 重复讨论时的续接策略 ---------- */
+
+/**
+ * 「同一个仓库再点一次讨论」该新开还是接着聊。做成设置项而不是写死：
+ * 两种做法都对，取决于用户在拿它干什么——扫榜时想要每次干净的新会话，
+ * 深挖一个项目时希望追问的上下文还在。写死任何一种都会让另一半人别扭。
+ */
+const RESUME_MODES = [
+  { key: "session", label: "同一份榜单内续接", hint: "榜单刷新、换日/周/月之后新开" },
+  { key: "always", label: "总是续接", hint: "只要拿得到上次的会话就接着聊" },
+  { key: "never", label: "总是新开", hint: "每次都从零开始，侧栏会多出几行" },
+];
+
+const DEFAULT_RESUME_MODE = "session";
+
+/** 归一化从磁盘读到的值：不认识的、空的都退回默认，绝不返回 undefined。 */
+function normaliseResumeMode(raw) {
+  const s = String(raw === undefined || raw === null ? "" : raw).trim();
+  return RESUME_MODES.some((m) => m.key === s) ? s : DEFAULT_RESUME_MODE;
+}
+
+/**
+ * 这次点击能不能续接上次的会话。
+ *
+ * @param {string} mode RESUME_MODES 里的 key
+ * @param {boolean} resetSince 自上次开会话以来榜单是否已经换过（仅在 session 模式下有意义）
+ * @param {boolean} hasSession 有没有拿到可用的 sessionId
+ * @returns {boolean}
+ */
+function shouldResume(mode, resetSince, hasSession) {
+  if (!hasSession) return false; // 没有 id 就没有可续的东西，任何模式下都新开
+  const key = normaliseResumeMode(mode);
+  if (key === "never") return false;
+  if (key === "always") return true;
+  return !resetSince;
+}
+
+/** 续接策略的说明文字，给设置项用。 */
+function resumeModeHint(mode) {
+  const key = normaliseResumeMode(mode);
+  const hit = RESUME_MODES.find((m) => m.key === key);
+  return hit ? hit.hint : "";
 }
 
 // ---- src/lib/catalog.mjs ----
@@ -1253,6 +1296,8 @@ const DEFAULT_SETTINGS = {
   prompts: [],
   /** 点「讨论」时用哪一份；空 = 用列表第一份。 */
   defaultPromptId: "",
+  /** 同一个仓库再点一次「讨论」时：session / always / never，见 prompt.mjs 的 RESUME_MODES。 */
+  resumeMode: DEFAULT_RESUME_MODE,
 };
 
 const DEFAULT_STATE = {
@@ -1764,8 +1809,9 @@ async function refresh(ctx, options) {
 
   const seq = ++genSeq;
 
-  // 榜单要换掉了：这份榜单里续接过的会话属于旧话题，不能再往新讨论里接。
-  resetDiscussSessions();
+  // 榜单要换掉了。只打标记，不清表：清不清由用户选的 resumeMode 决定
+  // （「总是续接」明确要求跨榜单也接着聊）。
+  markDiscussSessionsStale();
 
   // 讨论的回执只服务于那一次点击：刷新是用户明确表示的「再来一次」，
   // 回执要让位给榜单本身的状态说明，失败的那条同理。
@@ -2154,22 +2200,34 @@ function supportsDiscuss(ctx) {
 let discussSeq = 0;
 
 /**
- * 这份榜单里已经为哪些仓库开过会话：`仓库全名 -> sessionId`。
+ * 已经为哪些仓库开过会话：`仓库全名 -> sessionId`。
  *
- * 只在**同一份榜单**内有效——刷新、切日/周/月、切新星库时清空。理由：榜单
- * 每天在变，昨天为 beta/two 开的会话里积累的是昨天的结论；把它当今天新话题
- * 的上下文，会让模型拿旧事实说话。同一次浏览内续接则相反：用户已经追问过
- * 「它的插件机制怎么实现的」，再点一次不该从零开始。
+ * 记成**跨榜单**的表而不是榜单内的：`resumeMode` 为 `always` 时用户明确要求
+ * 「只要拿得到就接着聊」，那就不能因为换了一份榜单就把 id 扔掉。`session`
+ * 模式靠 `discussSessionsStale` 这个标记来区分，而不是靠清空表。
  *
  * sessionId 可能拿不到：`startRun` 文档写明引擎稍后才 announce，此时返回 null。
- * 那条路径记成 `null`（表示「开过但没有 id」），点第二次仍然新开——续接是
- * 加分项，拿不到 id 时不能因此让按钮失败。
+ * 那条路径存空串（表示「开过但没有 id」），再点时仍然新开——续接是加分项，
+ * 拿不到 id 时不能因此让按钮失败。
  */
 let discussSessions = new Map();
+/**
+ * 自这张表上一次被写入以来，榜单是否已经换过（刷新 / 切视图 / 切时间档）。
+ *
+ * 用标记而不是清空表，是因为「总是续接」模式下换榜单不该丢掉会话。标记只影响
+ * `session` 模式，见 shouldResume。
+ */
+let discussSessionsStale = false;
 
-/** 清空续接表。刷新/切视图/卸载时调用。 */
+/** 榜单换了一份。不是清空表——清不清由 resumeMode 决定。 */
+function markDiscussSessionsStale() {
+  discussSessionsStale = true;
+}
+
+/** 彻底清空（卸载 / 重新激活时用：那些会话 ID 不一定还有效）。 */
 function resetDiscussSessions() {
   discussSessions = new Map();
+  discussSessionsStale = false;
 }
 
 /**
@@ -2246,10 +2304,12 @@ async function discussRepo(ctx, row) {
       template: chosen.text,
     });
 
-    // 同一份榜单里已经为这个仓库开过、且拿得到 sessionId → 续接。
-    // 拿不到 id（引擎稍后才 announce）时退回新开：续接是加分项，不能因此失败。
+    // 能不能续接由上一步选的策略决定，不写死。拿不到 id（引擎稍后才
+    // announce）时任何策略下都新开：续接是加分项，不能因此让按钮失败。
     const known = discussSessions.get(row.repo);
-    const resumeId = typeof known === "string" && known ? known : "";
+    const resumeId = shouldResume(settings.resumeMode, discussSessionsStale, typeof known === "string" && known !== "")
+      ? known
+      : "";
 
     // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。
     // 续接时传 sessionId 会切回那个会话并沿用它的模型/强度（文档明确覆盖会被忽略）。
@@ -2265,10 +2325,12 @@ async function discussRepo(ctx, row) {
       "会话启动",
     );
 
-    // 记住这一行的 sessionId，供同榜内再次点击时续接。
-    // `started.sessionId` 可能为 null——那就存 null，下次照常新开。
+    // 记住这一行的 sessionId，供下次点击时续接。
+    // `started.sessionId` 可能为 null——那就存空串，下次照常新开。
     const sessionId = started && typeof started.sessionId === "string" && started.sessionId ? started.sessionId : "";
     discussSessions.set(row.repo, sessionId);
+    // 这份榜单已经「认领」过，后面的点击不再算跨榜单。
+    discussSessionsStale = false;
 
     // 不跳转这件事必须写在页面上。侧栏多一行对正在扫榜的人是很容易错过的，
     // 不给提示就会被理解成「按钮没反应」，进而连点，多开一轮真 token。
@@ -2662,7 +2724,7 @@ function Toolbar({ snap, ctx }) {
   const onView = (view) => {
     if (view === snap.view) return;
     if (snap.generating) abortDigest(ctx);
-    resetDiscussSessions();
+    markDiscussSessionsStale();
     set({
       view,
       digest: "",
@@ -2689,7 +2751,7 @@ function Toolbar({ snap, ctx }) {
   const onPeriod = (period) => {
     if (period === snap.settings.period) return;
     if (snap.generating) abortDigest(ctx);
-    resetDiscussSessions();
+    markDiscussSessionsStale();
     setSettings({ period });
     void persistSettings(ctx, { period });
     set({
@@ -3897,7 +3959,21 @@ function SettingsSection() {
         h("h2", null, "讨论提示词"),
         h("p", null, "点榜单某行的「讨论」时发给模型的那段话。可以存几份不同角度，选一份当默认。"),
       ),
-      h("div", { className: "gt-section-panel" }, promptEditor),
+      h(
+        "div",
+        { className: "gt-section-panel" },
+        // 续接策略放在提示词之前：它决定「点一下会发生什么」，比提示词更早要回答。
+        segField(
+          "再点同一个仓库时",
+          h(Dropdown, {
+            items: RESUME_MODES.map((m) => ({ value: m.key, label: m.label })),
+            value: form.resumeMode,
+            onChange: (v) => patch("resumeMode", normaliseResumeMode(v)),
+          }),
+          resumeModeHint(form.resumeMode),
+        ),
+        promptEditor,
+      ),
     ),
 
     h(
@@ -4466,6 +4542,7 @@ export default function activate(ctx) {
           if (saved[key] !== undefined && saved[key] !== null) merged[key] = saved[key];
         }
         merged.minStars = normaliseMinStars(merged.minStars);
+        merged.resumeMode = normaliseResumeMode(merged.resumeMode);
         // 提示词来自磁盘：可能是旧版本的空值、也可能是手改过的坏形状。
         // 归一化在这里做一次，后面所有读取点都不用再防。
         merged.prompts = normalisePrompts(merged.prompts);

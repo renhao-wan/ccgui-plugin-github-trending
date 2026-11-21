@@ -8,6 +8,11 @@ import {
   pickPrompt,
   PROMPT_COUNT_LIMIT,
   PROMPT_TEXT_LIMIT,
+  RESUME_MODES,
+  DEFAULT_RESUME_MODE,
+  normaliseResumeMode,
+  shouldResume,
+  resumeModeHint,
 } from "../src/lib/prompt.mjs";
 
 const makeRepo = (i) => ({
@@ -280,4 +285,35 @@ test("pickPrompt 的结果能直接喂给 buildDiscussPrompt", () => {
   const chosen = pickPrompt(normalisePrompts([{ id: "a", name: "甲", text: "只看 {{repo}} 的 README 结构" }]), "a");
   const p = buildDiscussPrompt({ row: discussRow(), view: "trending", template: chosen.text });
   assert.match(p, /只看 obra\/superpowers 的 README 结构/);
+});
+
+test("续接策略：normaliseResumeMode 只认已知值，其余退回默认", () => {
+  for (const m of RESUME_MODES) assert.equal(normaliseResumeMode(m.key), m.key);
+  for (const bad of ["", null, undefined, "resume", 0, {}, "ALWAYS"]) {
+    assert.equal(normaliseResumeMode(bad), DEFAULT_RESUME_MODE);
+  }
+  assert.equal(DEFAULT_RESUME_MODE, "session");
+});
+
+test("续接策略：never 永远新开，always 拿得到就续，session 只在榜单没换时续", () => {
+  // 没有 sessionId 时任何策略都新开——没有可续的东西
+  for (const m of RESUME_MODES) {
+    assert.equal(shouldResume(m.key, false, false), false);
+    assert.equal(shouldResume(m.key, true, false), false);
+  }
+  assert.equal(shouldResume("never", false, true), false);
+  assert.equal(shouldResume("never", true, true), false);
+  assert.equal(shouldResume("always", false, true), true);
+  assert.equal(shouldResume("always", true, true), true, "跨榜单也要接着聊");
+  assert.equal(shouldResume("session", false, true), true);
+  assert.equal(shouldResume("session", true, true), false, "榜单换过就新开");
+  // 脏值当成默认，不能返回 undefined
+  assert.equal(shouldResume("乱写", false, true), true);
+});
+
+test("续接策略：每种模式都有说明文字，且互不相同", () => {
+  const hints = RESUME_MODES.map((m) => resumeModeHint(m.key));
+  for (const hint of hints) assert.ok(hint.length > 0);
+  assert.equal(new Set(hints).size, hints.length, "三个说明不该长一样");
+  assert.equal(resumeModeHint("乱写"), resumeModeHint(DEFAULT_RESUME_MODE));
 });

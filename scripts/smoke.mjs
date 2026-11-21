@@ -1733,6 +1733,103 @@ await check("讨论续接：刷新榜单后不再续接（新话题配新上下�
   }
 });
 
+await check("续接策略 always：刷新榜单后仍然接着聊", async () => {
+  sessionStarts.length = 0;
+  const inst = await freshTabInstance(() => ({ resumeMode: "always" }));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+
+    trendingPayload = { status: 200, body: trendingHtml(day1) };
+    findByText(inst.tree(), "刷新").props.onClick();
+    assert.ok(await waitFor(() => {
+      const btn = findByText(inst.tree(), "刷新");
+      return btn && btn.props["aria-busy"] === "false";
+    }, 3000));
+
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 2));
+    assert.equal(sessionStarts[1].sessionId, "sess-1", "always 模式下换榜单也要续接");
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("续接策略 never：同一份榜单里也每次新开", async () => {
+  sessionStarts.length = 0;
+  const inst = await freshTabInstance(() => ({ resumeMode: "never" }));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 2));
+    assert.ok(!sessionStarts[1].sessionId, "never 模式下不该续接");
+    assert.ok(!inst.text().includes("续接"), "回执不该说续接");
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("设置页：续接策略用下拉，默认是「同一份榜单内续接」", async () => {
+  const fresh = await import(PLUGIN + "?resume=" + Date.now());
+  let freshSettings = null;
+  const saved = {};
+  const dispose5 = fresh.default(
+    Object.assign({}, ctx, {
+      storage: {
+        get: async () => ({}),
+        set: async (k, v) => {
+          if (k === "settings") Object.assign(saved, v);
+        },
+        delete: async () => {},
+      },
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: () => () => {},
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: (d) => {
+          freshSettings = d;
+          return () => {};
+        },
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  try {
+    assert.ok(await waitFor(() => !!freshSettings, 2000));
+    renderFresh(freshSettings.component, {}, { effects: true });
+    await waitFor(() => textOf(renderFresh(freshSettings.component)).includes("再点同一个仓库时"));
+
+    const keep = () => renderKeep(freshSettings.component, {});
+    // 默认值；未设置过时不该显示成空
+    // 下拉的触发器是 button 但文本在子节点里，用 findTrigger 按 gt-dd-trigger 认。
+    const trigger = findTrigger(keep(), "同一份榜单内续接");
+    assert.ok(trigger, "默认应显示「同一份榜单内续接」");
+    assert.match(textOf(keep()), /榜单刷新、换日\/周\/月之后新开/, "应把当前策略的含义写出来");
+
+    // 换成 always 并写盘
+    trigger.props.onClick();
+    await waitFor(() => isOpen(dropdownFor(keep(), "同一份榜单内续接")));
+    // 菜单项是 .gt-dd-item 的 div（不是 button），findByText 认不到。
+    let option = null;
+    walk(keep(), (n) => {
+      if (option) return;
+      const c = n.props && n.props.className;
+      if (typeof c === "string" && c.split(/\s+/).includes("gt-dd-item") && textOf(n).includes("总是续接")) option = n;
+    });
+    assert.ok(option, "菜单里应有「总是续接」");
+    option.props.onClick();
+    for (let i = 0; i < 60 && saved.resumeMode !== "always"; i += 1) {
+      keep();
+      await sleep(30);
+    }
+    assert.equal(saved.resumeMode, "always", "应写进设置");
+  } finally {
+    dispose5();
+  }
+});
+
 await check("设置页：提示词可以新增、设为默认、删除，并写进设置", async () => {
   // 独立 store：主实例的设置已经激活过，直接改 kv 不会反映到 form 上。
   const fresh = await import(PLUGIN + "?prompts=" + Date.now());

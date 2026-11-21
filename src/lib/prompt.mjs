@@ -152,8 +152,7 @@ export const DEFAULT_DISCUSS_TEMPLATE = [
 ].join("\n");
 
 /** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
-export const PROMPT_TEXT_LIMIT = 20000;
-/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
+export const PROMPT_TEXT_LIMIT = 20000;/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
 export const PROMPT_COUNT_LIMIT = 8;
 /** 名字上限：侧栏/下拉里只放得下一行。 */
 export const PROMPT_NAME_LIMIT = 40;
@@ -269,4 +268,48 @@ export function buildDiscussPrompt(input) {
     return text + "\n\n## 榜单事实（插件补充）\n" + facts.join("\n");
   }
   return text;
+}
+
+/* ---------- 重复讨论时的续接策略 ---------- */
+
+/**
+ * 「同一个仓库再点一次讨论」该新开还是接着聊。做成设置项而不是写死：
+ * 两种做法都对，取决于用户在拿它干什么——扫榜时想要每次干净的新会话，
+ * 深挖一个项目时希望追问的上下文还在。写死任何一种都会让另一半人别扭。
+ */
+export const RESUME_MODES = [
+  { key: "session", label: "同一份榜单内续接", hint: "榜单刷新、换日/周/月之后新开" },
+  { key: "always", label: "总是续接", hint: "只要拿得到上次的会话就接着聊" },
+  { key: "never", label: "总是新开", hint: "每次都从零开始，侧栏会多出几行" },
+];
+
+export const DEFAULT_RESUME_MODE = "session";
+
+/** 归一化从磁盘读到的值：不认识的、空的都退回默认，绝不返回 undefined。 */
+export function normaliseResumeMode(raw) {
+  const s = String(raw === undefined || raw === null ? "" : raw).trim();
+  return RESUME_MODES.some((m) => m.key === s) ? s : DEFAULT_RESUME_MODE;
+}
+
+/**
+ * 这次点击能不能续接上次的会话。
+ *
+ * @param {string} mode RESUME_MODES 里的 key
+ * @param {boolean} resetSince 自上次开会话以来榜单是否已经换过（仅在 session 模式下有意义）
+ * @param {boolean} hasSession 有没有拿到可用的 sessionId
+ * @returns {boolean}
+ */
+export function shouldResume(mode, resetSince, hasSession) {
+  if (!hasSession) return false; // 没有 id 就没有可续的东西，任何模式下都新开
+  const key = normaliseResumeMode(mode);
+  if (key === "never") return false;
+  if (key === "always") return true;
+  return !resetSince;
+}
+
+/** 续接策略的说明文字，给设置项用。 */
+export function resumeModeHint(mode) {
+  const key = normaliseResumeMode(mode);
+  const hit = RESUME_MODES.find((m) => m.key === key);
+  return hit ? hit.hint : "";
 }
