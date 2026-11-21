@@ -78,6 +78,7 @@ npm run smoke     # 假宿主冒烟：刷新 → 列表 → 解读 → 讨论 �
 npm run validate  # manifest、权限 ↔ 调用、禁用写法、产物自检
 npm run check     # 上面四步全跑
 npm run icon      # 重新生成 docs/icon.png
+npm run screenshot  # 重新生成 docs/screenshot.png（headless Chrome，SHOT_README=owner/name 换展开行）
 ```
 
 ### 目录
@@ -96,6 +97,7 @@ src/lib/report.mjs    # 榜单 → Markdown（工具栏「复制 Markdown」）
 src/lib/readme.mjs    # README 去 badge/HTML、截断、base64 还原
 src/lib/catalog.mjs   # 宿主引擎清单 → agent.start 参数（readOnly / 工作区）
 scripts/build.mjs     # 内联构建（剥掉 export 前缀）
+scripts/screenshot.mjs # 生成 docs/screenshot.png（开发用，不进发布包）
 scripts/smoke.mjs     # 假宿主冒烟
 scripts/validate-manifest.mjs
 test/                 # node:test
