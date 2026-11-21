@@ -490,6 +490,105 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
 }
 
 /**
+ * 讨论 prompt 的默认模板。
+ *
+ * 做成「模板 + 占位符」而不是一段写死的字符串：用户在设置里可以另存几份，
+ * 决定的是**让模型干什么**（评估可投入性 / 找可借鉴的设计 / 当技术选型对比），
+ * 而仓库事实永远由插件填，不需要用户每次自己抄一遍 star 数和名次。
+ *
+ * 占位符（写错不会炸，会原样留在 prompt 里，用户自己能看见）：
+ *   {{repo}} {{url}} {{scope}} {{description}} {{language}} {{stars}}
+ *   {{gain}} {{rank}} {{age}} {{facts}}
+ */
+const DEFAULT_DISCUSS_TEMPLATE = [
+  "我想认真了解一下这个项目，先帮我弄清楚它是什么、值不值得投入时间。",
+  "",
+  "## 仓库",
+  "{{repo}}",
+  "{{url}}",
+  "来源：{{scope}}",
+  "",
+  "## 我这边已知的事实",
+  "{{facts}}",
+  "",
+  "## 你要做的",
+  "1. 先在这个工作目录里找有没有这个仓库的本地副本（按仓库名，比如 `{{repo}}` 或只有后半段的目录）。",
+  "   找得到就直接读代码，结论以代码为准。",
+  "   找不到就读远程仓库（README、目录结构、最近的 release/issue），并在开头用一句话说明「没找到本地代码，以下基于远程信息」。",
+  "2. 用自己的话讲清楚：它解决什么问题、核心机制是什么、和同类项目比区别在哪。",
+  "3. 给一个明确的判断：什么人适合用、什么情况下不适合。",
+  "",
+  "## 格式",
+  "- 中文，术语保留英文原文。",
+  "- 用 Markdown，不要写一级标题。",
+  "- 结论要有依据。凡是推测而不是从代码或文档里读到的，明确标成「推测」，不要编造 API、参数、性能数字。",
+  "- 最后一行给我一个「下一步」建议（比如读哪个文件、跑什么命令验证）。",
+].join("\n");
+
+/** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
+const PROMPT_TEXT_LIMIT = 20000;
+/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
+const PROMPT_COUNT_LIMIT = 8;
+/** 名字上限：侧栏/下拉里只放得下一行。 */
+const PROMPT_NAME_LIMIT = 40;
+
+/**
+ * 把存下来的提示词列表归一化。
+ *
+ * 设置是从磁盘读的，可能被手改、可能来自旧版本（那时候只有一个字符串）。
+ * 这里必须是**不会抛错**的：一份坏数据不能让整个设置页白屏。
+ *
+ * @param {unknown} raw
+ * @returns {Array<{ id: string, name: string, text: string }>}
+ */
+function normalisePrompts(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const text = String(item.text === undefined || item.text === null ? "" : item.text);
+    if (!text.trim()) continue; // 空正文的条目没有任何用处，直接丢
+    let id = String(item.id || "").trim();
+    if (!id || seen.has(id)) id = "p" + (out.length + 1) + Math.random().toString(36).slice(2, 6);
+    seen.add(id);
+    out.push({
+      id,
+      name: String(item.name || "").trim().slice(0, PROMPT_NAME_LIMIT) || "未命名",
+      text: text.slice(0, PROMPT_TEXT_LIMIT),
+    });
+    if (out.length >= PROMPT_COUNT_LIMIT) break;
+  }
+  return out;
+}
+
+/**
+ * 选出这次讨论实际用哪份提示词。
+ *
+ * 三级回落：设置里的默认 → 列表第一份 → 内置模板。**永远返回一份可用模板**，
+ * 因为「没有提示词」不该表现为按钮点了没反应。
+ *
+ * @param {Array<{ id: string, name: string, text: string }>} prompts
+ * @param {string} defaultId
+ * @returns {{ id: string, name: string, text: string }}
+ */
+function pickPrompt(prompts, defaultId) {
+  const list = Array.isArray(prompts) ? prompts : [];
+  const hit = list.find((p) => p && p.id === defaultId);
+  if (hit) return hit;
+  if (list.length > 0) return list[0];
+  return { id: "", name: "默认", text: DEFAULT_DISCUSS_TEMPLATE };
+}
+
+function fillTemplate(template, values) {
+  return String(template || DEFAULT_DISCUSS_TEMPLATE).replace(/\{\{\s*([a-z]+)\s*\}\}/g, (whole, key) => {
+    if (Object.prototype.hasOwnProperty.call(values, key)) return values[key];
+    // 不认识的占位符原样保留：比悄悄替换成空串更容易让用户发现拼错了。
+    return whole;
+  });
+}
+
+/**
  * 单个仓库的讨论 prompt。
  *
  * 与解读的区别不只是范围：讨论是**一次真正的会话**，用户会接着追问，所以
@@ -501,6 +600,7 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
  * @param {"trending"|"rising"} input.view
  * @param {string} input.period
  * @param {string} input.language
+ * @param {string} [input.template] 用户自定义的模板；空 = 内置默认
  * @returns {string}
  */
 function buildDiscussPrompt(input) {
@@ -524,32 +624,25 @@ function buildDiscussPrompt(input) {
     facts.push("- 较上次" + (row.rankDelta > 0 ? "上升 " : "下降 ") + Math.abs(row.rankDelta) + " 位");
   }
 
-  return [
-    "我想认真了解一下这个项目，先帮我弄清楚它是什么、值不值得投入时间。",
-    "",
-    "## 仓库",
+  const template = String((input && input.template) || "").trim() || DEFAULT_DISCUSS_TEMPLATE;
+  const text = fillTemplate(template, {
     repo,
     url,
-    // 来源单独一行，不依附于「名次」：新星库没有名次，但它同样是榜单来的，
-    // 模型需要知道自己在看什么范围的数据。
-    "来源：" + scope,
-    "",
-    "## 我这边已知的事实",
-    facts.length > 0 ? facts.join("\n") : "- （榜单里只有仓库名，没有更多信息）",
-    "",
-    "## 你要做的",
-    "1. 先在这个工作目录里找有没有这个仓库的本地副本（按仓库名，比如 `" + repo + "` 或只有后半段的目录）。",
-    "   找得到就直接读代码，结论以代码为准。",
-    "   找不到就读远程仓库（README、目录结构、最近的 release/issue），并在开头用一句话说明「没找到本地代码，以下基于远程信息」。",
-    "2. 用自己的话讲清楚：它解决什么问题、核心机制是什么、和同类项目比区别在哪。",
-    "3. 给一个明确的判断：什么人适合用、什么情况下不适合。",
-    "",
-    "## 格式",
-    "- 中文，术语保留英文原文。",
-    "- 用 Markdown，不要写一级标题。",
-    "- 结论要有依据。凡是推测而不是从代码或文档里读到的，明确标成「推测」，不要编造 API、参数、性能数字。",
-    "- 最后一行给我一个「下一步」建议（比如读哪个文件、跑什么命令验证）。",
-  ].join("\n");
+    scope,
+    description: row.description ? clip(row.description, 400) : "",
+    language: row.language ? String(row.language) : "",
+    stars: Number.isFinite(row.stars) ? String(row.stars) : "",
+    gain: Number.isFinite(row.gain) ? "+" + row.gain + "/" + (row.gainPeriod || "recent") : "",
+    rank: Number.isFinite(row.rank) ? String(row.rank) : "",
+    age: Number.isFinite(row.ageDays) ? String(row.ageDays) + " 天" : "",
+    facts: facts.length > 0 ? facts.join("\n") : "- （榜单里只有仓库名，没有更多信息）",
+  });
+  // 模板里没写 {{facts}} 时也要把事实带上：没有这些数字，模型只能猜。
+  // 用户明确写了 {{facts}} 就不重复。
+  if (template.indexOf("{{facts}}") < 0 && facts.length > 0) {
+    return text + "\n\n## 榜单事实（插件补充）\n" + facts.join("\n");
+  }
+  return text;
 }
 
 // ---- src/lib/catalog.mjs ----
@@ -971,16 +1064,6 @@ function buildBoardMarkdown(input) {
   return out.join("\n");
 }
 
-/**
- * 「讨论」用的 prompt 塞进输入框时的收尾提示。
- *
- * 单独一个函数是为了让 UI 不必自己拼字符串：`setDraft` 会整体替换用户手上
- * 已有的草稿，这句话必须每个入口都一模一样地说清楚。
- */
-function draftWarningText() {
-  return "这会替换输入框里已有的草稿";
-}
-
 // ---- src/lib/readme.mjs ----
 /**
  * README 预览的文本处理。纯函数：把 GitHub 返回的 README 原文整理成
@@ -1166,6 +1249,10 @@ const DEFAULT_SETTINGS = {
   model: "",
   workspacePath: "",
   token: "",
+  /** 讨论用的提示词列表（空列表 = 用内置模板）。 */
+  prompts: [],
+  /** 点「讨论」时用哪一份；空 = 用列表第一份。 */
+  defaultPromptId: "",
 };
 
 const DEFAULT_STATE = {
@@ -1202,8 +1289,10 @@ const DEFAULT_STATE = {
   discussWorkspace: "",
   /** 会话建起来了、但没挂进侧栏工作区时的说明。不阻塞会话，只解释为什么可能看不见。 */
   discussWarning: "",
-  /** 把讨论 prompt 放进输入框（而不是开会话）后的回执；与 discussNotice 互斥。 */
-  draftNotice: "",
+  /** 这次开会话是续接了旧会话还是新开的；空串 = 没开会话。用于回执说明。 */
+  discussResumed: false,
+  /** 这次开会话用的是哪份提示词的名字；空串 = 内置默认。 */
+  discussPromptName: "",
   /**
    * README 预览。同一时刻只展开一个仓库：
    * `open` 是仓库全名，空串 = 全部收起。
@@ -1675,6 +1764,9 @@ async function refresh(ctx, options) {
 
   const seq = ++genSeq;
 
+  // 榜单要换掉了：这份榜单里续接过的会话属于旧话题，不能再往新讨论里接。
+  resetDiscussSessions();
+
   // 讨论的回执只服务于那一次点击：刷新是用户明确表示的「再来一次」，
   // 回执要让位给榜单本身的状态说明，失败的那条同理。
   set({
@@ -1685,7 +1777,8 @@ async function refresh(ctx, options) {
     discussNotice: "",
     discussWorkspace: "",
     discussWarning: "",
-    draftNotice: "",
+    discussResumed: false,
+    discussPromptName: "",
     readmeOpen: "",
     readmeLoading: false,
     readmeError: "",
@@ -2061,6 +2154,25 @@ function supportsDiscuss(ctx) {
 let discussSeq = 0;
 
 /**
+ * 这份榜单里已经为哪些仓库开过会话：`仓库全名 -> sessionId`。
+ *
+ * 只在**同一份榜单**内有效——刷新、切日/周/月、切新星库时清空。理由：榜单
+ * 每天在变，昨天为 beta/two 开的会话里积累的是昨天的结论；把它当今天新话题
+ * 的上下文，会让模型拿旧事实说话。同一次浏览内续接则相反：用户已经追问过
+ * 「它的插件机制怎么实现的」，再点一次不该从零开始。
+ *
+ * sessionId 可能拿不到：`startRun` 文档写明引擎稍后才 announce，此时返回 null。
+ * 那条路径记成 `null`（表示「开过但没有 id」），点第二次仍然新开——续接是
+ * 加分项，拿不到 id 时不能因此让按钮失败。
+ */
+let discussSessions = new Map();
+
+/** 清空续接表。刷新/切视图/卸载时调用。 */
+function resetDiscussSessions() {
+  discussSessions = new Map();
+}
+
+/**
  * 为一行榜单开一个会话。
  *
  * 不走 activeDigest 那套「start 在飞时点停止」的状态机：会话一旦建起来就归
@@ -2085,7 +2197,15 @@ async function discussRepo(ctx, row) {
   const seq = ++discussSeq;
   // 新的一轮先把上一条「已开会话」提示收掉：否则连续点两行，页面会同时说
   // 两个仓库都开了会话，而实际只留了最后那条。
-  set({ discussing: row.repo, discussError: "", discussNotice: "", discussWorkspace: "", discussWarning: "", draftNotice: "" });
+  set({
+    discussing: row.repo,
+    discussError: "",
+    discussNotice: "",
+    discussWorkspace: "",
+    discussWarning: "",
+    discussResumed: false,
+    discussPromptName: "",
+  });
   const settings = snap.settings;
   const bailed = (message) => {
     if (seq === discussSeq) set({ discussing: "", discussError: message });
@@ -2116,18 +2236,26 @@ async function discussRepo(ctx, row) {
     const models = (entry.models || []).filter((m) => m && typeof m.id === "string" && m.id.trim());
     const model = String(settings.model || "").trim() || (models[0] ? models[0].id : undefined);
 
+    // 设置里可能维护了多份提示词，用选中的那份；没设置过就用内置模板。
+    const chosen = pickPrompt(settings.prompts, settings.defaultPromptId);
     const prompt = buildDiscussPrompt({
       row,
       view: snap.view,
       period: snap.view === "rising" ? RISING_PERIOD.key : settings.period,
       language: snap.view === "rising" ? "" : settings.language,
+      template: chosen.text,
     });
 
+    // 同一份榜单里已经为这个仓库开过、且拿得到 sessionId → 续接。
+    // 拿不到 id（引擎稍后才 announce）时退回新开：续接是加分项，不能因此失败。
+    const known = discussSessions.get(row.repo);
+    const resumeId = typeof known === "string" && known ? known : "";
+
     // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。
-    // 返回的 sessionId 这里不用：startRun 文档写明引擎可能稍后才 announce，
-    // 此时是 null。拿它去 selectSession 会有一半时候跳不动，详见 discussRepo 头注释。
-    await withTimeout(
+    // 续接时传 sessionId 会切回那个会话并沿用它的模型/强度（文档明确覆盖会被忽略）。
+    const started = await withTimeout(
       ctx.sessions.startRun({
+        sessionId: resumeId || undefined,
         engine: entry.engine,
         model: model || undefined,
         prompt,
@@ -2136,6 +2264,12 @@ async function discussRepo(ctx, row) {
       DISCUSS_TIMEOUT_MS,
       "会话启动",
     );
+
+    // 记住这一行的 sessionId，供同榜内再次点击时续接。
+    // `started.sessionId` 可能为 null——那就存 null，下次照常新开。
+    const sessionId = started && typeof started.sessionId === "string" && started.sessionId ? started.sessionId : "";
+    discussSessions.set(row.repo, sessionId);
+
     // 不跳转这件事必须写在页面上。侧栏多一行对正在扫榜的人是很容易错过的，
     // 不给提示就会被理解成「按钮没反应」，进而连点，多开一轮真 token。
     if (seq === discussSeq)
@@ -2145,6 +2279,10 @@ async function discussRepo(ctx, row) {
         discussNotice: row.repo,
         discussWorkspace: registration.visible ? baseName(workspace) : "",
         discussWarning: registration.visible ? "" : registration.error,
+        discussResumed: Boolean(resumeId),
+        // 用哪份提示词要说出来：用户维护了好几份，回执不写名字就分不清刚才
+        // 点的是哪一套要求。内置默认时不显示（那是没有选择的选择）。
+        discussPromptName: chosen.id ? chosen.name : "",
       });
   } catch (error) {
     // 用原始 message 判权限，不要过 messageOf：那边把 "missing permission"
@@ -2156,64 +2294,6 @@ async function discussRepo(ctx, row) {
         ? "宿主没有及时建起会话（30 秒），可以直接再点一次"
         : messageOf(error);
     bailed("开会话失败：" + hint);
-  }
-}
-
-/**
- * 把讨论 prompt 放进**当前会话的输入框**，而不是立刻开一个新会话。
- *
- * 与 `discussRepo` 互补，不是替代：开会话花的是真 token，而且会话挂在插件
- * 数据目录下；很多时候用户只是想把「这个库跟我们现在用的 X 比怎么样」这句话
- * 带到自己正在写的会话里，改两个字再发。`composer.setDraft`（0.3.2+）正好是
- * 这个动作——只写草稿，不发送，发送永远是用户的事。
- *
- * **会覆盖已有草稿**，这是 API 语义（写入即替换），而且宿主没有「读草稿」的
- * 接口，所以插件无法判断当前有没有草稿、更没法事后还原。这条警告只能写在
- * 按钮 title 上（`draftWarningText()`），点之前就看得到；不弹确认框——这是
- * 一次能用 Ctrl+Z 撤回的写入，不值得为它打断一次扫榜。
- *
- * 不需要引擎可用、不需要登记工作区、不需要权限审批之外的东西——这是它比
- * 「讨论」便宜的地方，也是它应该有一个独立按钮的原因。
- */
-let draftSeq = 0;
-
-async function draftRepo(ctx, row) {
-  const snap = store.snap;
-  if (!row || !row.repo) return;
-  const api = ctx && ctx.composer;
-  if (!api || typeof api.setDraft !== "function") {
-    set({ discussError: "当前 CC GUI 版本不支持写入输入框，请升级宿主，或用「讨论」直接开会话" });
-    return;
-  }
-
-  const prompt = buildDiscussPrompt({
-    row,
-    view: snap.view,
-    period: snap.view === "rising" ? RISING_PERIOD.key : snap.settings.period,
-    language: snap.view === "rising" ? "" : snap.settings.language,
-  });
-  const seq = ++draftSeq;
-  set({ draftNotice: "", discussError: "" });
-  try {
-    // 不 await 任何超时保护：setDraft 是同步写一个受控输入框的值，没有 IPC 往返，
-    // 用 withTimeout 包一层只会引入一个永远清不掉的定时器。
-    await ctx.composer.setDraft(prompt);
-    if (seq !== draftSeq) return;
-    set({
-      draftNotice: row.repo,
-      // 上一次讨论留下的回执不能和新回执并存，否则页面同时说两件事。
-      discussing: "",
-      discussNotice: "",
-      discussWorkspace: "",
-      discussWarning: "",
-    });
-  } catch (error) {
-    if (seq !== draftSeq) return;
-    const raw = error && error.message ? String(error.message) : String(error || "");
-    const hint = /composer:draft|permission|not declared/i.test(raw)
-      ? "缺少写入输入框的权限，请重新安装插件（manifest 已声明 composer:draft）"
-      : messageOf(error);
-    set({ discussError: "放入输入框失败：" + hint });
   }
 }
 
@@ -2421,11 +2501,6 @@ function RepoRow({ row, ctx, discussing, readme }) {
   const busy = Boolean(discussing) && discussing === row.repo;
   // 一次只能开一个：别的行在开的时候按钮禁用，避免连点开出好几个真会话。
   const blocked = Boolean(discussing) && !busy;
-  // 「放入输入框」不做 loading 态：setDraft 不花 token、不建会话，也不涉及
-  // 进程启动，连点的后果只是把同一段草稿再写一遍。给它一个「已放入」的中间
-  // 态反而会让人以为在等什么，等它复位又是一次没必要的闪动。
-  // 唯一要挡的是 opening 期间：那一刻用户按发送，草稿可能刚被另一行覆盖。
-  const draftBlocked = Boolean(discussing);
   // readme 传的是整块快照，展开状态由 readmeOpen 决定——同一时刻只开一行。
   const readmeOpen = Boolean(readme) && readme.readmeOpen === repoName;
 
@@ -2452,8 +2527,7 @@ function RepoRow({ row, ctx, discussing, readme }) {
           ? h("span", { className: "gt-move" + movementClass(row) }, movement)
           : null,
         // 放在标题行末尾：跟仓库名同一视觉层级，用户扫榜时顺手就能点。
-        // 「放入输入框」排在「讨论」前面：前者不花 token、不建会话，是更轻的那个。
-        // 同一条 CSS（.gt-discuss）管淡入，两者一起浮现，不会一高一低。
+        // 两个按钮共用一条 CSS（.gt-discuss）管淡入，一起浮现，不会一高一低。
         h(
           "button",
           {
@@ -2467,18 +2541,6 @@ function RepoRow({ row, ctx, discussing, readme }) {
             "aria-label": (readmeOpen ? "收起 " : "展开 ") + row.repo + " 的 README",
           },
           readmeOpen ? "收起 README" : "README",
-        ),
-        h(
-          "button",
-          {
-            type: "button",
-            className: "gt-btn gt-discuss",
-            onClick: () => void draftRepo(ctx, row),
-            disabled: draftBlocked,
-            title: "把整理好的提问放进输入框，自己看一眼再发（" + draftWarningText() + "）",
-            "aria-label": "把 " + row.repo + " 的提问放进输入框",
-          },
-          "放入输入框",
         ),
         h(
           "button",
@@ -2600,6 +2662,7 @@ function Toolbar({ snap, ctx }) {
   const onView = (view) => {
     if (view === snap.view) return;
     if (snap.generating) abortDigest(ctx);
+    resetDiscussSessions();
     set({
       view,
       digest: "",
@@ -2612,7 +2675,8 @@ function Toolbar({ snap, ctx }) {
       discussNotice: "",
       discussWorkspace: "",
       discussWarning: "",
-      draftNotice: "",
+      discussResumed: false,
+      discussPromptName: "",
       readmeOpen: "",
     readmeLoading: false,
     readmeError: "",
@@ -2625,6 +2689,7 @@ function Toolbar({ snap, ctx }) {
   const onPeriod = (period) => {
     if (period === snap.settings.period) return;
     if (snap.generating) abortDigest(ctx);
+    resetDiscussSessions();
     setSettings({ period });
     void persistSettings(ctx, { period });
     set({
@@ -2637,7 +2702,8 @@ function Toolbar({ snap, ctx }) {
       discussNotice: "",
       discussWorkspace: "",
       discussWarning: "",
-      draftNotice: "",
+      discussResumed: false,
+      discussPromptName: "",
       readmeOpen: "",
     readmeLoading: false,
     readmeError: "",
@@ -2726,11 +2792,10 @@ function StatusLine({ snap }) {
       h("span", { className: "gt-running-text" }, first ? "正在抓取 GitHub…" : "正在刷新榜单…"),
     );
   }
-  // 讨论的两条回执讲的是「你刚才那一按的结果」，比榜单状态更该优先显示：
+  // 讨论的回执讲的是「你刚才那一按的结果」，比榜单状态更该优先显示：
   // 先判回执，再判 httpError / loaded。否则上一次生成超时的红字会原样留着，
   // 把「开会话失败了，因为…」整个吞掉——用户看到的还是几分钟前的错误。
-  // 「放入输入框」的回执也走这条通道：它同样是对一次点击的答复。
-  if (snap.discussError || snap.discussNotice || snap.draftNotice) {
+  if (snap.discussError || snap.discussNotice) {
     const base = snap.loaded
       ? h(
           "p",
@@ -2747,19 +2812,17 @@ function StatusLine({ snap }) {
       base,
       snap.discussError
         ? h("p", { className: "gt-notice gt-notice--error", role: "status" }, snap.discussError)
-        : snap.draftNotice
-          ? h(
-              "p",
-              { className: "gt-notice gt-notice--ok", role: "status" },
-              h("span", null, "已把 " + snap.draftNotice + " 的提问放进输入框"),
-              // 这条提示是「没切过去」之外的第二个提醒：用户可能正在别处看，
-              // 回来时输入框突然多了一大段，不知道是谁塞的会以为是自己误触。
-              h("span", { className: "gt-notice-hint" }, "看一眼再发，发送仍然由你决定"),
-            )
-          : h(
+        : h(
             "p",
             { className: "gt-notice gt-notice--ok", role: "status" },
-            h("span", null, "已在侧栏为 " + snap.discussNotice + " 开了会话"),
+            h(
+              "span",
+              null,
+              (snap.discussResumed ? "已在侧栏续接为 " : "已在侧栏为 ") +
+                snap.discussNotice +
+                " " +
+                (snap.discussResumed ? "的会话（接着上次的话题）" : "开了会话"),
+            ),
             h(
               "span",
               { className: "gt-notice-hint" },
@@ -2767,6 +2830,10 @@ function StatusLine({ snap }) {
               (snap.discussWorkspace ? "分组「" + snap.discussWorkspace + "」· " : "") +
                 "本页不会自动跳转，点侧栏里那一行打开",
             ),
+            // 用户维护了好几份提示词，回执不说名字就分不清刚才用的是哪套要求。
+            snap.discussPromptName
+              ? h("span", { className: "gt-notice-hint" }, "提示词「" + snap.discussPromptName + "」")
+              : null,
             // 会话真的建起来了，只是没挂进侧栏工作区：不能说成失败，更不能不说。
             snap.discussWarning ? h("span", { className: "gt-notice-hint" }, snap.discussWarning) : null,
           ),
@@ -3424,6 +3491,177 @@ function SettingsSection() {
     return prefix + "留空则用该引擎的第一个可用模型。";
   };
 
+  /* ---- 讨论提示词 ---- */
+
+  // 归一化是幂等的，且必须每次都过：磁盘上可能是手改过的数据。
+  const prompts = normalisePrompts(form.prompts);
+  const defaultId = prompts.some((p) => p.id === form.defaultPromptId)
+    ? form.defaultPromptId
+    : prompts.length > 0
+      ? prompts[0].id
+      : "";
+
+  /** 写回列表。顺手修正默认值——默认指向一份刚被删掉的提示词时不能悬空。 */
+  const writePrompts = (next, nextDefault) => {
+    const list = normalisePrompts(next);
+    const wanted = nextDefault === undefined ? form.defaultPromptId : nextDefault;
+    const fixed = list.some((p) => p.id === wanted) ? wanted : list.length > 0 ? list[0].id : "";
+    setForm((prev) => Object.assign({}, prev || snap.settings, { prompts: list, defaultPromptId: fixed }));
+  };
+
+  const addPrompt = () => {
+    if (prompts.length >= PROMPT_COUNT_LIMIT) {
+      flash("最多 " + PROMPT_COUNT_LIMIT + " 份，先删掉一份再添加");
+      return;
+    }
+    // 新条目给内置模板当底稿：空白文本框等于让用户从零开始想，不如给一份能用的。
+    // 名字用「提示词 N」而不是空串：空名字在列表里无法区分。
+    const id = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    const next = prompts.concat([{ id, name: "提示词 " + (prompts.length + 1), text: DEFAULT_DISCUSS_TEMPLATE }]);
+    // 第一份自动成为默认，否则用户加完还得再点一次「设为默认」。
+    writePrompts(next, prompts.length === 0 ? id : form.defaultPromptId);
+  };
+
+  const removePrompt = (id) => {
+    writePrompts(prompts.filter((p) => p.id !== id), undefined);
+  };
+
+  /** 点某份提示词展开/收起它的编辑区。同一时刻只展开一份，设置页才不长。 */
+  const openPromptState = R.useState("");
+  const openPrompt = openPromptState[0];
+  const setOpenPrompt = openPromptState[1];
+
+  const promptRows = prompts.length === 0
+    ? [
+        h(
+          "p",
+          { className: "gt-note-line" },
+          "还没有自定义提示词。点「讨论」会用内置模板（先在本机找同名仓库，找不到再读远程，给出适合谁用的判断）。",
+        ),
+      ]
+    : prompts.map((item) => {
+        const isDefault = item.id === defaultId;
+        const isOpen = openPrompt === item.id;
+        return h(
+          "div",
+          { className: "gt-prompt", key: item.id },
+          h(
+            "div",
+            { className: "gt-prompt-head" },
+            h(
+              "button",
+              {
+                type: "button",
+                className: "gt-prompt-name",
+                onClick: () => setOpenPrompt(isOpen ? "" : item.id),
+                "aria-expanded": isOpen ? "true" : "false",
+                "aria-label": (isOpen ? "收起 " : "展开 ") + item.name + " 的正文",
+                title: "展开编辑正文",
+              },
+              h("span", { className: "gt-prompt-chevron", "aria-hidden": "true" }, isOpen ? "▾" : "▸"),
+              h("span", { className: "gt-prompt-label" }, item.name),
+            ),
+            // 默认那份用「已设为默认」的静态标记，而不是一个点下去没反应的按钮：
+            // 三份提示词里哪份在生效，是这一节最重要的一条信息。
+            isDefault
+              ? h("span", { className: "gt-prompt-default" }, "默认")
+              : h(
+                  "button",
+                  {
+                    type: "button",
+                    className: "gt-btn gt-path-pick",
+                    onClick: () => writePrompts(prompts, item.id),
+                    title: "点「讨论」时用这一份",
+                    "aria-label": "把 " + item.name + " 设为默认提示词",
+                  },
+                  "设为默认",
+                ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "gt-btn ghost gt-path-pick",
+                onClick: () => removePrompt(item.id),
+                title: "删除这份提示词（不影响内置模板）",
+                "aria-label": "删除 " + item.name,
+              },
+              "删除",
+            ),
+          ),
+          isOpen
+            ? h(
+                "div",
+                { className: "gt-prompt-body" },
+                h(
+                  "div",
+                  { className: "gt-path" },
+                  h("input", {
+                    className: "gt-input",
+                    value: item.name,
+                    maxLength: PROMPT_NAME_LIMIT,
+                    placeholder: "名字，例如「评估可投入性」",
+                    spellCheck: false,
+                    "aria-label": "提示词名字",
+                    onChange: (e) => {
+                      const name = e.target.value.slice(0, PROMPT_NAME_LIMIT);
+                      writePrompts(
+                        prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { name }) : p)),
+                      );
+                    },
+                  }),
+                ),
+                h("textarea", {
+                  className: "gt-input gt-prompt-text",
+                  value: item.text,
+                  rows: 14,
+                  spellCheck: false,
+                  "aria-label": item.name + " 的提示词正文",
+                  onChange: (e) => {
+                    // 超长只截断不报错：一边打字一边弹红字比截断更烦。
+                    const text = e.target.value.slice(0, PROMPT_TEXT_LIMIT);
+                    writePrompts(prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { text }) : p)));
+                  },
+                }),
+                h(
+                  "p",
+                  { className: "gt-hint" },
+                  "可用占位符：{{repo}} {{url}} {{scope}} {{description}} {{language}} {{stars}} {{gain}} {{rank}} {{age}} {{facts}}。"
+                    + "它们会被这一行的真实数据替换；没写 {{facts}} 时插件会在末尾补一节事实。",
+                ),
+              )
+            : null,
+        );
+      });
+
+  const promptEditor = h(
+    "div",
+    { className: "gt-prompts" },
+    h(
+      "p",
+      { className: "gt-note-line" },
+      "「讨论」每次只用其中一份（标「默认」的那份）。想换个角度分析时，存一份新的再切默认即可，不用来回改同一段话。",
+    ),
+    promptRows,
+    h(
+      "div",
+      { className: "gt-prompts-actions" },
+      h(
+        "button",
+        {
+          type: "button",
+          className: "gt-btn gt-path-pick",
+          onClick: addPrompt,
+          disabled: prompts.length >= PROMPT_COUNT_LIMIT,
+          title: "以内置模板为底稿新建一份",
+          "aria-label": "新增提示词",
+        },
+        "新增提示词",
+      ),
+      h("span", { className: "gt-prompt-count" }, prompts.length + " / " + PROMPT_COUNT_LIMIT),
+      flashMsg ? h("span", { className: "gt-prompt-flash" }, flashMsg) : null,
+    ),
+  );
+
   // 工作区只读展示 + 文件夹选择按钮（与工作志同一套）：路径只能由系统选择器
   // 产生。手打的路径没有对应 grant，引擎跑起来会因为没授权而失败。
   // 没设置时显示插件数据目录的真实路径——只写「默认」等于没说 cwd 在哪。
@@ -3648,6 +3886,18 @@ function SettingsSection() {
             + (flashMsg ? " " + flashMsg : ""),
         ),
       ),
+    ),
+
+    h(
+      "section",
+      { className: "gt-section" },
+      h(
+        "div",
+        { className: "gt-section-label" },
+        h("h2", null, "讨论提示词"),
+        h("p", null, "点榜单某行的「讨论」时发给模型的那段话。可以存几份不同角度，选一份当默认。"),
+      ),
+      h("div", { className: "gt-section-panel" }, promptEditor),
     ),
 
     h(
@@ -4030,6 +4280,48 @@ const CSS = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .gt-settings .gt-path-value.is-empty { color: var(--gt-muted); }
+
+/* 讨论提示词：一份一行的折叠列表。默认那份只在收起时也一眼可见，
+ * 因为「点讨论会用哪份」是这一节唯一不能猜的信息。 */
+.gt-settings .gt-prompts { display: flex; flex-direction: column; gap: 10px; }
+.gt-settings .gt-prompt {
+  border: 1px solid var(--gt-control); border-radius: 8px; overflow: hidden;
+}
+.gt-settings .gt-prompt-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; background: var(--gt-raised);
+}
+.gt-settings .gt-prompt-name {
+  flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px;
+  font: inherit; font-size: 13px; font-weight: 500; text-align: left;
+  padding: 2px 0; border: 0; background: transparent; color: inherit; cursor: pointer;
+}
+.gt-settings .gt-prompt-name:hover { color: var(--gt-accent); }
+.gt-settings .gt-prompt-chevron { flex: none; font-size: 10px; opacity: 0.7; }
+.gt-settings .gt-prompt-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gt-settings .gt-prompt-default {
+  flex: none; padding: 2px 8px; border-radius: 5px; font-size: 11px; font-weight: 600;
+  color: var(--gt-accent); background: transparent;
+  border: 1px solid var(--gt-accent);
+}
+.gt-settings .gt-prompt-head .gt-btn { height: 26px; padding: 0 10px; font-size: 12px; }
+.gt-settings .gt-prompt-body {
+  display: flex; flex-direction: column; gap: 10px; padding: 12px;
+  border-top: 1px solid var(--gt-control);
+}
+/* 正文是多行提示词：等宽字体比比例字体更容易看出缩进和条目结构。 */
+.gt-settings .gt-prompt-text {
+  height: auto; min-height: 200px; padding: 10px 12px; line-height: 1.6;
+  resize: vertical; font-family: var(--gt-mono, ui-monospace, "Cascadia Code", Consolas, monospace);
+  font-size: 12.5px;
+}
+.gt-settings .gt-prompts-actions {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.gt-settings .gt-prompt-count { font-size: 12px; color: var(--gt-muted); font-variant-numeric: tabular-nums; }
+.gt-settings .gt-prompt-flash { font-size: 12px; color: var(--gt-muted); }
 /* 没设置时显示的默认路径：虚框表示「这不是你选的，是插件自己的目录」 */
 .gt-settings .gt-path-value.is-default {
   color: var(--gt-text); border-style: dashed; background: transparent;
@@ -4174,6 +4466,12 @@ export default function activate(ctx) {
           if (saved[key] !== undefined && saved[key] !== null) merged[key] = saved[key];
         }
         merged.minStars = normaliseMinStars(merged.minStars);
+        // 提示词来自磁盘：可能是旧版本的空值、也可能是手改过的坏形状。
+        // 归一化在这里做一次，后面所有读取点都不用再防。
+        merged.prompts = normalisePrompts(merged.prompts);
+        if (!merged.prompts.some((p) => p.id === merged.defaultPromptId)) {
+          merged.defaultPromptId = merged.prompts.length > 0 ? merged.prompts[0].id : "";
+        }
         set({ settings: merged });
       }
     } catch {
@@ -4192,9 +4490,9 @@ export default function activate(ctx) {
     digestSeq += 1;
     // 讨论也一起作废：卸载期间在飞的 startRun 回来后不能往 store 里写回执。
     discussSeq += 1;
-    // 「放入输入框」同理：卸载期间落地的 setDraft 不能往一个已经脱离的 store
-    // 里写回执（草稿本身是同步写的，拦不住也不必拦——写入那一刻插件还活着）。
-    draftSeq += 1;
+    // 续接表跟着这次激活作废：重新安装/重新激活后 sessionId 未必还有效，
+    // 拿旧 id 去续接会变成一个「刚开就报错」的按钮。
+    resetDiscussSessions();
     // README 预览也作废：卸载后回来的 http 响应不能往 store 里写正文。
     readmeSeq += 1;
     cancelSession(activeDigest, ctx);
@@ -4216,7 +4514,8 @@ export default function activate(ctx) {
       discussNotice: "",
       discussWorkspace: "",
       discussWarning: "",
-      draftNotice: "",
+      discussResumed: false,
+      discussPromptName: "",
       readmeOpen: "",
     readmeLoading: false,
     readmeError: "",

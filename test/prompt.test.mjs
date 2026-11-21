@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildDigestPrompt, buildDiscussPrompt } from "../src/lib/prompt.mjs";
+import {
+  buildDigestPrompt,
+  buildDiscussPrompt,
+  DEFAULT_DISCUSS_TEMPLATE,
+  normalisePrompts,
+  pickPrompt,
+  PROMPT_COUNT_LIMIT,
+  PROMPT_TEXT_LIMIT,
+} from "../src/lib/prompt.mjs";
 
 const makeRepo = (i) => ({
   repo: "owner/repo-" + i,
@@ -174,4 +182,102 @@ test("讨论 prompt 会截断超长描述", () => {
   const p = buildDiscussPrompt({ row: discussRow({ description: "x".repeat(2000) }), view: "trending" });
   // 单行描述不能撑爆整个 prompt
   assert.ok(p.length < 2000);
+});
+
+
+test("自定义模板：占位符被这一行的真实数据替换", () => {
+  const p = buildDiscussPrompt({
+    row: discussRow(),
+    view: "trending",
+    period: "daily",
+    template: ["看看 {{repo}}（{{stars}} star，{{language}}），在 {{scope}} 里排第 {{rank}}。", "事实：", "{{facts}}"].join("\n"),
+  });
+  assert.match(p, /看看 obra\/superpowers/);
+  assert.match(p, /322190 star/);
+  assert.match(p, /Shell/);
+  assert.match(p, /GitHub Trending daily 榜/);
+  assert.match(p, /排第 2/);
+  // 自定义模板完全取代默认模板：默认那套「先找本地副本」不该再出现
+  assert.doesNotMatch(p, /本地副本/);
+});
+
+test("自定义模板：没写 {{facts}} 时插件补一节事实，写了就不重复", () => {
+  const withFacts = buildDiscussPrompt({
+    row: discussRow(),
+    view: "trending",
+    template: ["分析 {{repo}}。", "{{facts}}"].join("\n"),
+  });
+  assert.equal(withFacts.match(/榜单事实/g), null, "用户写了 {{facts}} 就不该再补一节");
+  assert.match(withFacts, /322190/);
+
+  const withoutFacts = buildDiscussPrompt({ row: discussRow(), view: "trending", template: "分析 {{repo}}。" });
+  assert.match(withoutFacts, /## 榜单事实（插件补充）/);
+  assert.match(withoutFacts, /322190/);
+});
+
+test("自定义模板：拼错的占位符原样保留，不悄悄吞掉", () => {
+  const p = buildDiscussPrompt({
+    row: discussRow(),
+    view: "trending",
+    template: "{{repo}} {{ repoo }} {{unknown}}",
+  });
+  assert.match(p, /\{\{ repoo \}\}/);
+  assert.match(p, /\{\{unknown\}\}/);
+});
+
+test("自定义模板：空串/纯空白时退回内置模板", () => {
+  const blankLine = ["", ""].join("\n");
+  for (const template of ["", "   ", blankLine]) {
+    const p = buildDiscussPrompt({ row: discussRow(), view: "trending", template });
+    // 内置模板的两个特征句
+    assert.match(p, /本地副本/, "空白模板应退回内置模板");
+    assert.match(p, /下一步/);
+  }
+});
+
+test("normalisePrompts：丢掉空正文，补齐缺失 id 与名字", () => {
+  const list = normalisePrompts([
+    { name: "  ", text: "   " },
+    { text: "正文" },
+    { id: "dup", name: "甲", text: "A" },
+    { id: "dup", name: "乙", text: "B" },
+    "不是对象",
+    null,
+  ]);
+  assert.equal(list.length, 3, "两条空正文和两条非对象都该丢掉");
+  assert.ok(list[0].id, "缺 id 的要补一个");
+  assert.equal(list[0].name, "未命名");
+  assert.equal(list[1].id, "dup");
+  assert.notEqual(list[2].id, "dup", "重复 id 要重新生成，否则「设为默认」会误伤两份");
+});
+
+test("normalisePrompts：非数组输入返回空列表，不抛错", () => {
+  for (const raw of [null, undefined, "", 0, {}, "x"]) {
+    assert.deepEqual(normalisePrompts(raw), []);
+  }
+});
+
+test("normalisePrompts：份数与长度都有上限", () => {
+  const many = Array.from({ length: 20 }, (_, i) => ({ id: "p" + i, name: "n" + i, text: "t" + i }));
+  assert.equal(normalisePrompts(many).length, PROMPT_COUNT_LIMIT);
+  const long = normalisePrompts([{ id: "a", name: "x".repeat(200), text: "x".repeat(PROMPT_TEXT_LIMIT + 500) }])[0];
+  assert.equal(long.text.length, PROMPT_TEXT_LIMIT);
+  assert.ok(long.name.length <= 40);
+});
+
+test("pickPrompt：默认命中 → 第一份 → 内置模板，永远有可用结果", () => {
+  const prompts = [
+    { id: "a", name: "甲", text: "A" },
+    { id: "b", name: "乙", text: "B" },
+  ];
+  assert.deepEqual(pickPrompt(prompts, "b"), prompts[1]);
+  assert.deepEqual(pickPrompt(prompts, "不存在"), prompts[0], "默认悬空时用第一份");
+  assert.equal(pickPrompt([], "x").text, DEFAULT_DISCUSS_TEMPLATE);
+  assert.equal(pickPrompt(null, "").text, DEFAULT_DISCUSS_TEMPLATE);
+});
+
+test("pickPrompt 的结果能直接喂给 buildDiscussPrompt", () => {
+  const chosen = pickPrompt(normalisePrompts([{ id: "a", name: "甲", text: "只看 {{repo}} 的 README 结构" }]), "a");
+  const p = buildDiscussPrompt({ row: discussRow(), view: "trending", template: chosen.text });
+  assert.match(p, /只看 obra\/superpowers 的 README 结构/);
 });

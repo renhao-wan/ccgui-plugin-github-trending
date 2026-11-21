@@ -116,6 +116,105 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
 }
 
 /**
+ * 讨论 prompt 的默认模板。
+ *
+ * 做成「模板 + 占位符」而不是一段写死的字符串：用户在设置里可以另存几份，
+ * 决定的是**让模型干什么**（评估可投入性 / 找可借鉴的设计 / 当技术选型对比），
+ * 而仓库事实永远由插件填，不需要用户每次自己抄一遍 star 数和名次。
+ *
+ * 占位符（写错不会炸，会原样留在 prompt 里，用户自己能看见）：
+ *   {{repo}} {{url}} {{scope}} {{description}} {{language}} {{stars}}
+ *   {{gain}} {{rank}} {{age}} {{facts}}
+ */
+export const DEFAULT_DISCUSS_TEMPLATE = [
+  "我想认真了解一下这个项目，先帮我弄清楚它是什么、值不值得投入时间。",
+  "",
+  "## 仓库",
+  "{{repo}}",
+  "{{url}}",
+  "来源：{{scope}}",
+  "",
+  "## 我这边已知的事实",
+  "{{facts}}",
+  "",
+  "## 你要做的",
+  "1. 先在这个工作目录里找有没有这个仓库的本地副本（按仓库名，比如 `{{repo}}` 或只有后半段的目录）。",
+  "   找得到就直接读代码，结论以代码为准。",
+  "   找不到就读远程仓库（README、目录结构、最近的 release/issue），并在开头用一句话说明「没找到本地代码，以下基于远程信息」。",
+  "2. 用自己的话讲清楚：它解决什么问题、核心机制是什么、和同类项目比区别在哪。",
+  "3. 给一个明确的判断：什么人适合用、什么情况下不适合。",
+  "",
+  "## 格式",
+  "- 中文，术语保留英文原文。",
+  "- 用 Markdown，不要写一级标题。",
+  "- 结论要有依据。凡是推测而不是从代码或文档里读到的，明确标成「推测」，不要编造 API、参数、性能数字。",
+  "- 最后一行给我一个「下一步」建议（比如读哪个文件、跑什么命令验证）。",
+].join("\n");
+
+/** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
+export const PROMPT_TEXT_LIMIT = 20000;
+/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
+export const PROMPT_COUNT_LIMIT = 8;
+/** 名字上限：侧栏/下拉里只放得下一行。 */
+export const PROMPT_NAME_LIMIT = 40;
+
+/**
+ * 把存下来的提示词列表归一化。
+ *
+ * 设置是从磁盘读的，可能被手改、可能来自旧版本（那时候只有一个字符串）。
+ * 这里必须是**不会抛错**的：一份坏数据不能让整个设置页白屏。
+ *
+ * @param {unknown} raw
+ * @returns {Array<{ id: string, name: string, text: string }>}
+ */
+export function normalisePrompts(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const text = String(item.text === undefined || item.text === null ? "" : item.text);
+    if (!text.trim()) continue; // 空正文的条目没有任何用处，直接丢
+    let id = String(item.id || "").trim();
+    if (!id || seen.has(id)) id = "p" + (out.length + 1) + Math.random().toString(36).slice(2, 6);
+    seen.add(id);
+    out.push({
+      id,
+      name: String(item.name || "").trim().slice(0, PROMPT_NAME_LIMIT) || "未命名",
+      text: text.slice(0, PROMPT_TEXT_LIMIT),
+    });
+    if (out.length >= PROMPT_COUNT_LIMIT) break;
+  }
+  return out;
+}
+
+/**
+ * 选出这次讨论实际用哪份提示词。
+ *
+ * 三级回落：设置里的默认 → 列表第一份 → 内置模板。**永远返回一份可用模板**，
+ * 因为「没有提示词」不该表现为按钮点了没反应。
+ *
+ * @param {Array<{ id: string, name: string, text: string }>} prompts
+ * @param {string} defaultId
+ * @returns {{ id: string, name: string, text: string }}
+ */
+export function pickPrompt(prompts, defaultId) {
+  const list = Array.isArray(prompts) ? prompts : [];
+  const hit = list.find((p) => p && p.id === defaultId);
+  if (hit) return hit;
+  if (list.length > 0) return list[0];
+  return { id: "", name: "默认", text: DEFAULT_DISCUSS_TEMPLATE };
+}
+
+function fillTemplate(template, values) {
+  return String(template || DEFAULT_DISCUSS_TEMPLATE).replace(/\{\{\s*([a-z]+)\s*\}\}/g, (whole, key) => {
+    if (Object.prototype.hasOwnProperty.call(values, key)) return values[key];
+    // 不认识的占位符原样保留：比悄悄替换成空串更容易让用户发现拼错了。
+    return whole;
+  });
+}
+
+/**
  * 单个仓库的讨论 prompt。
  *
  * 与解读的区别不只是范围：讨论是**一次真正的会话**，用户会接着追问，所以
@@ -127,6 +226,7 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
  * @param {"trending"|"rising"} input.view
  * @param {string} input.period
  * @param {string} input.language
+ * @param {string} [input.template] 用户自定义的模板；空 = 内置默认
  * @returns {string}
  */
 export function buildDiscussPrompt(input) {
@@ -150,30 +250,23 @@ export function buildDiscussPrompt(input) {
     facts.push("- 较上次" + (row.rankDelta > 0 ? "上升 " : "下降 ") + Math.abs(row.rankDelta) + " 位");
   }
 
-  return [
-    "我想认真了解一下这个项目，先帮我弄清楚它是什么、值不值得投入时间。",
-    "",
-    "## 仓库",
+  const template = String((input && input.template) || "").trim() || DEFAULT_DISCUSS_TEMPLATE;
+  const text = fillTemplate(template, {
     repo,
     url,
-    // 来源单独一行，不依附于「名次」：新星库没有名次，但它同样是榜单来的，
-    // 模型需要知道自己在看什么范围的数据。
-    "来源：" + scope,
-    "",
-    "## 我这边已知的事实",
-    facts.length > 0 ? facts.join("\n") : "- （榜单里只有仓库名，没有更多信息）",
-    "",
-    "## 你要做的",
-    "1. 先在这个工作目录里找有没有这个仓库的本地副本（按仓库名，比如 `" + repo + "` 或只有后半段的目录）。",
-    "   找得到就直接读代码，结论以代码为准。",
-    "   找不到就读远程仓库（README、目录结构、最近的 release/issue），并在开头用一句话说明「没找到本地代码，以下基于远程信息」。",
-    "2. 用自己的话讲清楚：它解决什么问题、核心机制是什么、和同类项目比区别在哪。",
-    "3. 给一个明确的判断：什么人适合用、什么情况下不适合。",
-    "",
-    "## 格式",
-    "- 中文，术语保留英文原文。",
-    "- 用 Markdown，不要写一级标题。",
-    "- 结论要有依据。凡是推测而不是从代码或文档里读到的，明确标成「推测」，不要编造 API、参数、性能数字。",
-    "- 最后一行给我一个「下一步」建议（比如读哪个文件、跑什么命令验证）。",
-  ].join("\n");
+    scope,
+    description: row.description ? clip(row.description, 400) : "",
+    language: row.language ? String(row.language) : "",
+    stars: Number.isFinite(row.stars) ? String(row.stars) : "",
+    gain: Number.isFinite(row.gain) ? "+" + row.gain + "/" + (row.gainPeriod || "recent") : "",
+    rank: Number.isFinite(row.rank) ? String(row.rank) : "",
+    age: Number.isFinite(row.ageDays) ? String(row.ageDays) + " 天" : "",
+    facts: facts.length > 0 ? facts.join("\n") : "- （榜单里只有仓库名，没有更多信息）",
+  });
+  // 模板里没写 {{facts}} 时也要把事实带上：没有这些数字，模型只能猜。
+  // 用户明确写了 {{facts}} 就不重复。
+  if (template.indexOf("{{facts}}") < 0 && facts.length > 0) {
+    return text + "\n\n## 榜单事实（插件补充）\n" + facts.join("\n");
+  }
+  return text;
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildBoardMarkdown, draftWarningText } from "../src/lib/report.mjs";
+import { buildBoardMarkdown } from "../src/lib/report.mjs";
 
 const row = {
   repo: "acme/tool",
@@ -101,8 +101,4 @@ test("导出 Markdown：掉榜单独一节，且不与在榜重复", () => {
   });
   assert.match(md, /## 掉榜（2）/);
   assert.match(md, /- gone\/one\n- gone\/two/);
-});
-
-test("放入输入框的警告文案不为空（会覆盖草稿这件事必须说出来）", () => {
-  assert.match(draftWarningText(), /草稿/);
 });

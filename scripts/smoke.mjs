@@ -265,10 +265,6 @@ const sessionStartsAtAdd = [];
 let workspaceAddError = null;
 /** 登记新工作区后插件应请宿主补扫会话目录（把之前看不见的旧会话找回来）。 */
 let sessionRefreshes = 0;
-/** composer.setDraft 写入的内容；「放入输入框」不能走会议话那条路。 */
-const drafts = [];
-let composerError = null;
-let composerAvailable = true;
 /**
  * README 接口的假响应。按仓库名路由，所以能测「展开 A 再展开 B」。
  * `status` 用来覆盖 404 / 限流 / 网络错误。
@@ -420,16 +416,6 @@ const ctx = {
   // 用来验证「选择…」把结果写进设置，且设置里存的是原始路径不是展示形式。
   assets: {
     grantDirectory: async () => ({ grantId: "g-1", path: pickedWorkspaceDir }),
-  },
-  // 输入框写入：只写草稿，不发送。假宿主记下每次写入的内容。
-  // 故意做成 async：宿主契约是同步 void，但插件 await 了它，用例必须覆盖
-  // 「被 await 的同步实现」这条路径，否则真机上 await 一个 undefined 才会炸。
-  composer: {
-    setDraft: async (text) => {
-      if (!composerAvailable) throw new Error("ctx.composer is undefined");
-      if (composerError) throw composerError;
-      drafts.push(text);
-    },
   },
   // 会话：讨论功能走这个，不是 agent.start。  // 形态照 SDK 0.3.18 的 startRun 契约：新会话不带 sessionId，resolve runId + sessionId。
   sessions: {
@@ -757,15 +743,54 @@ function discussButtonFor(tree, repo) {
   return hit;
 }
 
-/** 「放入输入框」按钮，同样按 aria-label 精确定位。 */
-function draftButtonFor(tree, repo) {
-  let hit = null;
-  const label = "把 " + repo + " 的提问放进输入框";
-  walk(tree, (n) => {
-    if (hit || n.type !== "button") return;
-    if (n.props && n.props["aria-label"] === label) hit = n;
-  });
-  return hit;
+/**
+ * 起一个独立插件实例（只接管页签）。
+ *
+ * 续接表 `discussSessions` 是模块级状态，只在**同一次激活**内共享。用例之间
+ * 必须各起一个实例，否则前一条留下的 sessionId 会让后一条断言的「第一次应
+ * 新开」直接失败。
+ */
+async function freshTabInstance(storageGet) {
+  const fresh = await import(PLUGIN + "?fresh=" + Date.now() + Math.random().toString(36).slice(2));
+  let tab = null;
+  const dispose = fresh.default(
+    Object.assign({}, ctx, {
+      storage: {
+        get: async (k) => (k === "settings" ? storageGet() : null),
+        set: async () => {},
+        delete: async () => {},
+      },
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: (d) => {
+          tab = d;
+          return () => {};
+        },
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: () => () => {},
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  assert.ok(await waitFor(() => !!tab, 2000), "独立实例应注册页签");
+  renderFresh(tab.component, {}, { effects: true });
+  assert.ok(
+    await waitFor(() => !!discussButtonFor(renderFresh(tab.component, {}), "beta/two"), 2000),
+    "独立实例应渲染出榜单",
+  );
+  return {
+    click(repo) {
+      const btn = discussButtonFor(renderFresh(tab.component, {}), repo);
+      assert.ok(btn, "应有 " + repo + " 的讨论按钮");
+      btn.props.onClick();
+    },
+    text() {
+      return textOf(renderFresh(tab.component, {}));
+    },
+    tree() {
+      return renderFresh(tab.component, {});
+    },
+    dispose,
+  };
 }
 
 await check("每行都有讨论入口，点后向 sessions.startRun 开会话而不是 agent.start", async () => {
@@ -963,65 +988,6 @@ await check("README：没有 README 时给出原因，不是空白框", async ()
     if (close) close.props.onClick();
     await waitFor(() => !textOf(render()).includes("没有 README"));
   }
-});
-
-await check("放入输入框：写草稿、不建会话、不进 agent", async () => {
-  drafts.length = 0;
-  const sessionsBefore = sessionStarts.length;
-  const agentsBefore = agentStarts.length;
-  const btn = draftButtonFor(render(), "beta/two");
-  assert.ok(btn, "每行都应有「放入输入框」");
-  assert.equal(btn.props.disabled, false, "空闲时应可点");
-  btn.props.onClick();
-  assert.ok(await waitFor(() => drafts.length === 1), "应调用 composer.setDraft");
-  // 这是「轻」的那条路：不花 token、不建会话。
-  assert.equal(sessionStarts.length, sessionsBefore, "放入输入框不应开会话");
-  assert.equal(agentStarts.length, agentsBefore, "放入输入框不应起 agent");
-  // 草稿内容与「讨论」用的是同一份 prompt：用户改两个字就能发，不必重写。
-  assert.match(drafts[0], /beta\/two/);
-  assert.match(drafts[0], /https:\/\/github\.com\/beta\/two/);
-  assert.match(drafts[0], /本地副本/);
-  assert.ok(await waitFor(() => textOf(render()).includes("的提问放进输入框")), "应给出回执");
-});
-
-await check("放入输入框失败时说明原因，并提示可以改用讨论", async () => {
-  drafts.length = 0;
-  composerError = new Error("missing permission composer:draft");
-  try {
-    draftButtonFor(render(), "alpha/one").props.onClick();
-    assert.ok(
-      await waitFor(() => textOf(render()).includes("composer:draft")),
-      "权限问题应直接点名权限，而不是笼统的网络错误",
-    );
-    assert.equal(drafts.length, 0, "失败时不应写进草稿");
-  } finally {
-    composerError = null;
-    // 把错误状态清掉，别污染后面用例的界面
-    draftButtonFor(render(), "alpha/one").props.onClick();
-    await waitFor(() => textOf(render()).includes("的提问放进输入框"));
-  }
-});
-
-await check("开会话期间「放入输入框」禁用，避免草稿被另一行覆盖", async () => {
-  drafts.length = 0;
-  const gated = [];
-  const original = ctx.sessions.startRun;
-  ctx.sessions.startRun = async (def) => {
-    sessionStarts.push(def);
-    await new Promise((r) => gated.push(r));
-    return { runId: "srun-y", sessionId: null };
-  };
-  try {
-    discussButtonFor(render(), "beta/two").props.onClick();
-    assert.ok(await waitFor(() => textOf(render()).includes("打开中")), "应进入打开中");
-    const target = draftButtonFor(render(), "alpha/one");
-    assert.equal(target.props.disabled, true, "开会话期间不应还能往别的行写入草稿");
-  } finally {
-    for (const r of gated) r();
-    ctx.sessions.startRun = original;
-    assert.ok(await waitFor(() => !textOf(render()).includes("打开中")));
-  }
-  assert.equal(drafts.length, 0, "整个过程中不应写草稿");
 });
 
 await check("导出 Markdown：复制的是当前榜单，不是渲染后的文本", async () => {
@@ -1676,6 +1642,221 @@ await check("开会话挂住时会在 30 秒后放手并说明原因", async () 
   }
   assert.ok(findByText(render(), "讨论"), "按钮应回到可点状态，可以直接再点一次");
   assert.equal(discussButtonFor(render(), "alpha/one").props.disabled, false, "别的行也应解除禁用");
+});
+
+await check("讨论续接：同一份榜单里再点同一行，带上上次的 sessionId", async () => {
+  sessionStarts.length = 0;
+  const inst = await freshTabInstance(() => ({}));
+  try {
+    // 宿主契约：startRun resolve { runId, sessionId }。第一次拿到 sess-1，
+    // 第二次必须把它带回去——那是「接着上次话题」的唯一凭据。
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(!sessionStarts[0].sessionId, "第一次应新开会话");
+    // 续接用的是 startRun **返回值**里的 sessionId（入参此时本来就没有），
+    // 假宿主按契约回 sess-<n>。
+    const firstId = "sess-1";
+
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 2), "应再开一次");
+    assert.equal(sessionStarts[1].sessionId, firstId, "第二次应续接同一会话");
+    assert.ok(
+      await waitFor(() => inst.text().includes("续接")),
+      "回执要说清是续接还是新开，否则侧栏多一行少一行用户没法判断",
+    );
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：换一行仍然新开，只有同一仓库才续接", async () => {
+  sessionStarts.length = 0;
+  const inst = await freshTabInstance(() => ({}));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    inst.click("alpha/one");
+    assert.ok(await waitFor(() => sessionStarts.length === 2));
+    assert.ok(!sessionStarts[1].sessionId, "另一个仓库不该续接到上一行");
+    assert.ok(!inst.text().includes("续接"), "新开的回执不该说续接");
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：拿不到 sessionId 时退回新开，不把按钮做成一次性", async () => {
+  const original = ctx.sessions.startRun;
+  // 引擎稍后才 announce 时 resolve 的 sessionId 是 null（文档明写），
+  // 这条路径必须能继续用，否则这个仓库第二次点就报错。
+  ctx.sessions.startRun = async (def) => {
+    sessionStarts.push(def);
+    return { runId: "srun-null", sessionId: null };
+  };
+  sessionStarts.length = 0;
+  const inst = await freshTabInstance(() => ({}));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 2), "第二次仍应能开会话");
+    assert.ok(!sessionStarts[1].sessionId, "没有 id 时退回新开");
+  } finally {
+    ctx.sessions.startRun = original;
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：刷新榜单后不再续接（新话题配新上下文）", async () => {
+  sessionStarts.length = 0;
+  const inst = await freshTabInstance(() => ({}));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+
+    // 刷新 = 用户明确表示「再来一次」，旧话题的结论不能带进新榜单。
+    trendingPayload = { status: 200, body: trendingHtml(day1) };
+    findByText(inst.tree(), "刷新").props.onClick();
+    assert.ok(await waitFor(() => {
+      const btn = findByText(inst.tree(), "刷新");
+      return btn && btn.props["aria-busy"] === "false";
+    }, 3000));
+
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 2));
+    assert.ok(!sessionStarts[1].sessionId, "刷新后应新开会话");
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("设置页：提示词可以新增、设为默认、删除，并写进设置", async () => {
+  // 独立 store：主实例的设置已经激活过，直接改 kv 不会反映到 form 上。
+  const fresh = await import(PLUGIN + "?prompts=" + Date.now());
+  let freshSettings = null;
+  const saved = {};
+  const dispose3 = fresh.default(
+    Object.assign({}, ctx, {
+      storage: {
+        get: async (k) => (k === "settings" ? { prompts: [], defaultPromptId: "" } : null),
+        set: async (k, v) => {
+          if (k === "settings") Object.assign(saved, v);
+        },
+        delete: async () => {},
+      },
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: () => () => {},
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: (d) => {
+          freshSettings = d;
+          return () => {};
+        },
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  try {
+    assert.ok(await waitFor(() => !!freshSettings, 2000), "应注册设置节");
+    renderFresh(freshSettings.component, {}, { effects: true });
+    await waitFor(() => textOf(renderFresh(freshSettings.component)).includes("讨论提示词"));
+    assert.match(textOf(renderKeep(freshSettings.component, {})), /还没有自定义提示词/, "初始应说明会用内置模板");
+
+    // 表单值是组件局部 state：必须用 renderKeep，renderFresh 会把它重置回
+    // snap.settings，「新增」的结果还没写盘就丢了。
+    const keep = () => renderKeep(freshSettings.component, {});
+    findByText(keep(), "新增提示词").props.onClick();
+    await waitFor(() => textOf(keep()).includes("提示词 1"));
+    // 第一份自动成为默认：加完还要再点一次「设为默认」很别扭
+    assert.match(textOf(keep()), /默认/);
+
+    // 保存是防抖的，轮询渲染推进 effect
+    for (let i = 0; i < 60 && !(saved.prompts || []).length; i += 1) {
+      keep();
+      await sleep(30);
+    }
+    assert.equal((saved.prompts || []).length, 1, "应写入设置");
+    assert.equal(saved.defaultPromptId, saved.prompts[0].id, "第一份应成为默认");
+    assert.equal(saved.prompts[0].name, "提示词 1");
+
+    // 正文默认收起：新增完就展开一整块 14 行文本框会把设置页拉很长。
+    // 点名字才展开——顺带覆盖这条交互。
+    findByText(keep(), "提示词 1").props.onClick();
+    await waitFor(() => textOf(keep()).includes("可用占位符"));
+
+    // 改名字要同步写回列表，否则「设为默认」按钮上的 aria-label 会过期
+    const nameInput = [];
+    walk(keep(), (n) => {
+      if (n.type === "input" && n.props && n.props["aria-label"] === "提示词名字") nameInput.push(n);
+    });
+    assert.equal(nameInput.length, 1, "展开后应有名字输入框");
+    nameInput[0].props.onChange({ target: { value: "评估可投入性" } });
+    for (let i = 0; i < 60 && (saved.prompts || [])[0]?.name !== "评估可投入性"; i += 1) {
+      keep();
+      await sleep(30);
+    }
+    assert.equal(saved.prompts[0].name, "评估可投入性");
+
+    findByText(keep(), "删除").props.onClick();
+    await waitFor(() => !textOf(keep()).includes("评估可投入性"));
+    for (let i = 0; i < 60 && (saved.prompts || []).length !== 0; i += 1) {
+      keep();
+      await sleep(30);
+    }
+    assert.equal(saved.prompts.length, 0, "删除后应写回空列表");
+    assert.equal(saved.defaultPromptId, "", "默认值不能指向已删除的那份");
+  } finally {
+    dispose3();
+  }
+});
+
+await check("讨论用的是设置里选中的那份提示词", async () => {
+  const fresh = await import(PLUGIN + "?promptpick=" + Date.now());
+  const picked = {
+    prompts: [
+      { id: "a", name: "评估可投入性", text: "只判断 {{repo}} 值不值得投入。" },
+      { id: "b", name: "找可借鉴设计", text: "只看 {{repo}} 里能借鉴的设计。" },
+    ],
+    defaultPromptId: "b",
+  };
+  let freshTab = null;
+  const dispose4 = fresh.default(
+    Object.assign({}, ctx, {
+      storage: {
+        get: async (k) => (k === "settings" ? picked : null),
+        set: async () => {},
+        delete: async () => {},
+      },
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: (d) => {
+          freshTab = d;
+          return () => {};
+        },
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: () => () => {},
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  try {
+    assert.ok(await waitFor(() => !!freshTab, 2000));
+    renderFresh(freshTab.component, {}, { effects: true });
+    assert.ok(await waitFor(() => !!discussButtonFor(renderFresh(freshTab.component, {}), "beta/two"), 2000));
+    sessionStarts.length = 0;
+    discussButtonFor(renderFresh(freshTab.component, {}), "beta/two").props.onClick();
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.match(sessionStarts[0].prompt, /只看 beta\/two 里能借鉴的设计/);
+    // 事实由插件补，用户不必自己抄 star 数
+    assert.match(sessionStarts[0].prompt, /榜单事实（插件补充）/);
+    assert.ok(
+      await waitFor(() => textOf(renderFresh(freshTab.component, {})).includes("找可借鉴设计")),
+      "回执应说明用了哪份提示词",
+    );
+  } finally {
+    dispose4();
+  }
 });
 
 await check("start 期间切视图，同样不会留下孤儿进程", async () => {

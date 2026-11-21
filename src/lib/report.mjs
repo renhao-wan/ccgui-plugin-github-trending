@@ -104,13 +104,3 @@ export function buildBoardMarkdown(input) {
 
   return out.join("\n");
 }
-
-/**
- * 「讨论」用的 prompt 塞进输入框时的收尾提示。
- *
- * 单独一个函数是为了让 UI 不必自己拼字符串：`setDraft` 会整体替换用户手上
- * 已有的草稿，这句话必须每个入口都一模一样地说清楚。
- */
-export function draftWarningText() {
-  return "这会替换输入框里已有的草稿";
-}
