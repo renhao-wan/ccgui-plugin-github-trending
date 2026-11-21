@@ -565,6 +565,90 @@ function shapeDiscoverRows(rows) {
     .map((row) => ({ ...row, gain: null, gainPeriod: "", rank: null, rankDelta: null, isNew: false }));
 }
 
+// ---- src/lib/filter.mjs ----
+/**
+ * 榜单内本地筛选。纯函数，不碰网络。
+ *
+ * 为什么要有这一层：Trending 页面本身没有搜索，25 行只能靠浏览器的 Ctrl+F；
+ * 而「今天有没有 Rust 相关的东西」是扫榜时最常问的问题。
+ *
+ * 只在**已加载的行**里做子串匹配：不发请求，也不改变榜单本身。所以它不会
+ * 让某个仓库「消失」，随时把关键词清空就回来。
+ */
+
+/** 关键词上限：再长就不是「筛一眼」，而是在写查询语句了。 */
+const KEYWORD_LIMIT = 40;
+
+/**
+ * 收敛用户输入：控制字符折叠成空格、合并连续空白、限长。
+ * 保留大小写——输入框要原样显示用户打的字。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function normaliseKeyword(raw) {
+  return String(raw === undefined || raw === null ? "" : raw)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, KEYWORD_LIMIT)
+    .trim();
+}
+
+/**
+ * 一行里参与匹配的字段。
+ *
+ * 仓库名（owner/repo 与单独的名字）是用户最常输入的；描述与语言是「找方向」
+ * 时最常输入的。不索引 star 数：那是筛选条件，不是关键词。
+ *
+ * @param {object} row
+ * @returns {string}
+ */
+function matchText(row) {
+  if (!row || typeof row !== "object") return "";
+  return [row.repo, row.name, row.description, row.language]
+    .filter((v) => typeof v === "string" && v !== "")
+    .join(" ")
+    .toLowerCase();
+}
+
+/**
+ * 按关键词过滤已加载的行。
+ *
+ * @param {Array<object>} rows
+ * @param {unknown} keyword
+ * @returns {Array<object>} 空关键词时原样返回同一个数组（调用方可能比较引用）
+ */
+function filterRows(rows, keyword) {
+  const list = Array.isArray(rows) ? rows : [];
+  const want = normaliseKeyword(keyword).toLowerCase();
+  if (!want) return list;
+  return list.filter((row) => matchText(row).includes(want));
+}
+
+/**
+ * 筛选是否真的生效了（有词、且列表里有东西）。
+ * 界面据此决定要不要说「已筛选」。
+ *
+ * @param {unknown} keyword
+ * @param {Array<object>} rows
+ * @returns {boolean}
+ */
+function isFiltering(keyword, rows) {
+  return normaliseKeyword(keyword) !== "" && Array.isArray(rows) && rows.length > 0;
+}
+
+/**
+ * 导出标题里的筛选说明。空关键词返回空串，调用方据此不加后缀。
+ *
+ * @param {unknown} keyword
+ * @returns {string}
+ */
+function filterScopeNote(keyword) {
+  const want = normaliseKeyword(keyword);
+  return want ? "已筛选「" + want + "」" : "";
+}
+
 // ---- src/lib/prompt.mjs ----
 /**
  * 解读 prompt 组装。纯函数：把榜单事实拼成模型可读的清单，并做预算裁剪。
@@ -602,6 +686,7 @@ function oneLine(row) {
  * @param {Array<object>} input.repos
  * @param {Array<object>} input.dropped
  * @param {boolean} input.isFirstRun
+ * @param {string} [input.filterNote] 本地筛选说明（如「已筛选「rust」」）；空 = 未筛选
  * @param {number} [budget]
  * @returns {{ prompt: string, truncated: boolean, included: number, total: number }}
  */
@@ -612,6 +697,8 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
   // 「随便看看」给的不是榜单：随机抽样/搜索结果之间没有排名与涨跌，
   // 照搬「按排名」「今天在热什么」会让模型把一批随机仓库写成趋势判断。
   const random = input.view === "browse";
+  // 本地筛选后的这批只是全榜的一部分：不说，模型会把「剩下的 3 个」写成全部。
+  const filterNote = String((input && input.filterNote) || "").trim();
 
   const scope = String((input && input.scopeText) || "").trim() ||
     (input.view === "rising"
@@ -623,7 +710,9 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
     "",
     "## 数据范围",
     scope,
-    "共 " + repos.length + " 个仓库" + (input.isFirstRun ? "（首次抓取，无历史对比）" : ""),
+    filterNote
+      ? "这 " + repos.length + " 个是" + filterNote + "之后剩下的仓库（用户在本机筛掉了其余部分）" + (input.isFirstRun ? "（首次抓取，无历史对比）" : "")
+      : "共 " + repos.length + " 个仓库" + (input.isFirstRun ? "（首次抓取，无历史对比）" : ""),
     "",
     random ? "## 这批仓库" : "## 榜单事实（按排名）",
   ];
@@ -635,6 +724,9 @@ function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
     "- 只依据上面的「" + (random ? "这批仓库" : "榜单事实") + "」；事实里没有的信息不要编造，也不要猜技术细节。",
     "- 不要复述榜单，不要用「首先/其次/总之」这类填充词。",
     "- 用 Markdown，但不要写一级标题（不要用 `#`）。",
+    ...(filterNote
+      ? ["- 这是用户筛选后的子集：结论要落在「这几个」上，不要说成「今天的榜单里」。" ]
+      : []),
     // 随机批次最容易被模型写成趋势判断，这条必须显式在场。
     ...(random ? ["- 这批不是排行榜：没有名次、没有涨跌，也不代表今天的热点。不要写「今天在热什么」这类趋势判断。"] : []),
     "",
@@ -1297,6 +1389,7 @@ function boardItem(row, showAge = true) {
  * @param {string} input.period  daily|weekly|monthly
  * @param {string} input.language 空字符串 = 全部语言
  * @param {string} [input.scopeText] 覆盖默认范围说明（「随便看看」用：随机抽样/搜索结果）
+ * @param {string} [input.filterNote] 本地筛选说明（如「已筛选「rust」」）；空 = 未筛选
  * @param {Array<object>} input.rows
  * @param {Array<object>} input.dropped
  * @param {string} input.capturedAt 已格式化好的抓取时间（由调用方负责本地化）
@@ -1313,8 +1406,12 @@ function buildBoardMarkdown(input) {
     (input.view === "rising"
       ? "近 7 天新星库"
       : "GitHub Trending · " + (BOARD_PERIOD_LABEL[input.period] || input.period || "今日"));
+  const filterNote = String((input && input.filterNote) || "").trim();
   const heading =
-    "# 每日热点 · " + scope + (input.view === "trending" && input.language ? " · " + input.language : "");
+    "# 每日热点 · " +
+    scope +
+    (filterNote ? " · " + filterNote : "") +
+    (input.view === "trending" && input.language ? " · " + input.language : "");
 
   const out = [heading];
   // 引用块写在标题下面：粘到别处时，「这是哪天的数据」比格式更重要。
@@ -1724,6 +1821,11 @@ const DEFAULT_STATE = {
   discoverBand: "",
   /** Search API 报的总命中数，只用于说明「一共多少条里挑了这些」。 */
   discoverTotal: 0,
+  /**
+   * 榜单内本地筛选的关键词；空串 = 不筛选。
+   * 唯一数据源：输入框直接绑在这里，不存在「输入框和实际生效的词不同步」。
+   */
+  keyword: "",
   catalog: [],
   catalogLoaded: false,
   modelsLoading: false,
@@ -2078,6 +2180,25 @@ function readmeRepoKey(repo) {
 let readmeSeq = 0;
 
 /**
+ * README 的会话内缓存：同一份榜单里来回比对两三个仓库是真实场景，
+ * 每次收起再展开都重走一遍网络与解析是白费。
+ *
+ * 只存**成功**结果：404 / 限流的失败不缓存，否则一次限流会让「没有 README」
+ * 粘在这场会话的每一次展开上。上限 30 条（2000 字 × 30 ≈ 60KB），按插入序淘汰。
+ */
+const README_CACHE_LIMIT = 30;
+const readmeCache = new Map();
+
+function cacheReadme(repo, value) {
+  if (readmeCache.has(repo)) readmeCache.delete(repo);
+  readmeCache.set(repo, value);
+  while (readmeCache.size > README_CACHE_LIMIT) {
+    const oldest = readmeCache.keys().next().value;
+    readmeCache.delete(oldest);
+  }
+}
+
+/**
  * 展开 / 收起某行的 README。
  *
  * 同时只开一个：README 预览占了整行高度，开两个就得滚很远才能回到榜单，
@@ -2098,6 +2219,20 @@ async function toggleReadme(ctx, row) {
   const seq = ++readmeSeq;
   // 换行展开时先清掉上一份正文：否则新行会短暂显示上一个仓库的 README。
   set({ readmeOpen: repo, readmeLoading: true, readmeError: "", readmeText: "", readmeTruncated: false, readmeTotal: 0 });
+  // 会话内缓存命中：别再走一次网络，用户要的就是「立刻看到」。
+  // 仍要校验 seq，否则收起/刷新之后晚到的写回会重新展开一行。
+  const cached = readmeCache.get(repo);
+  if (cached) {
+    if (seq !== readmeSeq) return;
+    set({
+      readmeLoading: false,
+      readmeError: "",
+      readmeText: cached.text,
+      readmeTruncated: cached.truncated,
+      readmeTotal: cached.total,
+    });
+    return;
+  }
   try {
     const result = await fetchReadme(repo, store.snap.settings);
     if (seq !== readmeSeq) return;
@@ -2105,6 +2240,7 @@ async function toggleReadme(ctx, row) {
       set({ readmeLoading: false, readmeError: result.message });
       return;
     }
+    cacheReadme(repo, { text: result.text, truncated: result.truncated, total: result.total });
     set({
       readmeLoading: false,
       readmeError: "",
@@ -2869,7 +3005,10 @@ async function generateDigest(ctx) {
     // 「随便看看」的榜单不是排行榜：不说清楚来源，模型会把随机抽样写成
     // 「今天在热什么」，那是在编结论。
     scopeText: scopeTextOf(store.snap),
-    repos: snap.repos,
+    // 解读只看筛出来的行：屏幕上筛剩 3 个却解读 25 个，模型会写出用户看不见
+    // 的结论。筛选说明一并带进 prompt，模型才不会把「这批」说成「全部」。
+    filterNote: filterScopeNote(snap.keyword),
+    repos: filterRows(snap.repos, snap.keyword),
     dropped: snap.dropped,
     isFirstRun: snap.isFirstRun,
   });
@@ -3254,6 +3393,63 @@ function DiscoverBar({ snap, ctx }) {
   );
 }
 
+/**
+ * 榜单内本地筛选。
+ *
+ * 只在已经加载的行里过滤，不发任何请求——这和「随便看看」的搜索框是两件事：
+ * 那个是去 GitHub 查，这个是看手里这批里有没有。所以它放在状态行下面、
+ * 紧挨着列表，而不是放进工具栏。
+ *
+ * 关键词直接存在 store 里（`snap.keyword`）：唯一数据源，输入框不会和生效的
+ * 筛选条件说两套话。
+ */
+function FilterBar({ snap, total }) {
+  const R = appCtx.react;
+  const h = R.createElement;
+  const shown = filterRows(snap.repos, snap.keyword).length;
+  const filtering = isFiltering(snap.keyword, snap.repos);
+  return h(
+    "div",
+    { className: "gt-filter" },
+    h("input", {
+      type: "search",
+      className: "gt-input gt-filter-input",
+      value: snap.keyword,
+      placeholder: "在这批里筛：仓库名 / 描述 / 语言",
+      "aria-label": "在本批榜单里筛选",
+      maxLength: KEYWORD_LIMIT,
+      spellCheck: false,
+      onChange: (event) => {
+        const value = normaliseKeyword(event && event.target ? event.target.value : "");
+        set({ keyword: value });
+      },
+      // Esc 清空：和「随便看看」的搜索框保持同一个手势。
+      onKeyDown: (event) => {
+        if (event && event.key === "Escape") set({ keyword: "" });
+      },
+    }),
+    filtering
+      ? h(
+          "span",
+          { className: "gt-filter-count", role: "status" },
+          "筛出 " + shown + " / " + total + " 个",
+        )
+      : h("span", { className: "gt-filter-count gt-filter-count--idle" }, "显示全部 " + total + " 个"),
+    filtering
+      ? h(
+          "button",
+          {
+            type: "button",
+            className: "gt-btn ghost gt-filter-clear",
+            onClick: () => set({ keyword: "" }),
+            title: "清空关键词，回到完整榜单",
+          },
+          "清除",
+        )
+      : null,
+  );
+}
+
 function Toolbar({ snap, ctx }) {
   const h = appCtx.react.createElement;
   const R = appCtx.react;
@@ -3272,13 +3468,16 @@ function Toolbar({ snap, ctx }) {
     exportTimer.current = setTimeout(() => setExportStatus(""), 2000);
   };
   const exportMarkdown = () => {
+    // 导出的是「你现在看到的这批」：筛选生效时只导出筛出来的行，
+    // 并在标题里写明，否则粘出去像一份完整榜单。
     const markdown = buildBoardMarkdown({
       view: snap.view,
       period: snap.settings.period,
       language: snap.view === "trending" ? snap.settings.language : "",
       // 「随便看看」导出时得说清这批是怎么来的，否则粘出去像一份榜单。
       scopeText: scopeTextOf(snap),
-      rows: snap.repos,
+      filterNote: filterScopeNote(snap.keyword),
+      rows: filterRows(snap.repos, snap.keyword),
       dropped: snap.dropped,
       capturedAt: fmtTime(snap.loadedAt),
     });
@@ -3326,6 +3525,8 @@ function Toolbar({ snap, ctx }) {
       discoverTerm: "",
       discoverBand: "",
       discoverTotal: 0,
+      // 换视图后关键词没有意义：上一个视图筛的东西在这个视图里不存在。
+      keyword: "",
     });
     void refresh(ctx, { force: true });
   };
@@ -3796,6 +3997,9 @@ function MainTab() {
   const h = appCtx.react.createElement;
   const ctx = appCtx;
   const snap = useSnap();
+  // 列表、导出、解读共用这一份：三处看到的必须是同一批数据，
+  // 否则「导出」出来的东西和屏幕上显示的不是一回事。
+  const visible = filterRows(snap.repos, snap.keyword);
 
   appCtx.react.useEffect(() => {
     void refresh(ctx, { force: false });
@@ -3818,26 +4022,39 @@ function MainTab() {
     ),
     h(Toolbar, { snap, ctx }),
     h(StatusLine, { snap }),
+    // 只在有行时出现：没有数据的时候，「筛什么」是个假问题。
+    snap.repos.length > 0 ? h(FilterBar, { snap, total: snap.repos.length }) : null,
     h(
       "div",
       { className: "gt-scroll" },
-      snap.repos.length > 0
-        ? h("ol", { className: "gt-list" }, snap.repos.map((row) => h(RepoRow, { key: row.repo, row, ctx, discussing: snap.discussing, readme: snap })))
+      visible.length > 0
+        ? h("ol", { className: "gt-list" }, visible.map((row) => h(RepoRow, { key: row.repo, row, ctx, discussing: snap.discussing, readme: snap })))
         : snap.loading
           ? h(SkeletonList, null)
-          : snap.loaded
+          : snap.repos.length > 0
             ? h(
                 "p",
                 { className: "gt-empty" },
-                snap.errorKind
-                  ? "没有可显示的数据"
-                  : snap.view === "browse"
-                    ? snap.discoverTerm
-                      ? "没搜到叫这个名字的仓库，换个词试试"
-                      : "这一批没抽到仓库，点「换一批」再来"
-                    : "榜单为空",
+                "没有匹配「" + snap.keyword + "」的仓库。",
+                h(
+                  "button",
+                  { type: "button", className: "gt-btn ghost gt-empty-clear", onClick: () => set({ keyword: "" }) },
+                  "清空关键词",
+                ),
               )
-            : null,
+            : snap.loaded
+              ? h(
+                  "p",
+                  { className: "gt-empty" },
+                  snap.errorKind
+                    ? "没有可显示的数据"
+                    : snap.view === "browse"
+                      ? snap.discoverTerm
+                        ? "没搜到叫这个名字的仓库，换个词试试"
+                        : "这一批没抽到仓库，点「换一批」再来"
+                      : "榜单为空",
+                )
+              : null,
       snap.view === "trending" && snap.dropped.length > 0
         ? h(
             "section",
@@ -4702,6 +4919,13 @@ const CSS = `
 /* 「随便看看」的搜索框与换一批。输入框吃掉剩余宽度，但设上限：
  * 工具栏是 flex-wrap 的，输入框太宽会把右侧按钮挤到第二行。 */
 .gt-discover { gap: 6px; flex-wrap: wrap; }
+.gt-filter { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gt-filter-input { width: 240px; min-width: 0; }
+.gt-filter-input::-webkit-search-cancel-button { cursor: pointer; }
+.gt-filter-count { font-size: 12px; color: var(--gt-muted); }
+.gt-filter-count--idle { opacity: 0.6; }
+.gt-filter-clear { flex: none; }
+.gt-empty-clear { margin-left: 8px; }
 .gt-search { display: flex; align-items: center; gap: 4px; }
 .gt-input {
   font: inherit;
@@ -5220,6 +5444,8 @@ export default function activate(ctx) {
     resetDiscussSessions();
     // README 预览也作废：卸载后回来的 http 响应不能往 store 里写正文。
     readmeSeq += 1;
+    // 会话内缓存跟着这次激活失效：重新安装/换工作区后，缓存里可能已经是旧内容。
+    readmeCache.clear();
     cancelSession(activeDigest, ctx);
     try {
       cssDisposer();

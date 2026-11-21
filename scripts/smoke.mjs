@@ -711,6 +711,117 @@ await check("榜单没变时说明「排名无变化」，而不是整行空着"
   assert.ok(countByClass(render(), "gt-rank") >= 3, "名次徽章仍要在");
 });
 
+/* ------------------------------------------------------- 榜单内本地筛选 */
+
+function filterInputOf(node) {
+  let hit = null;
+  walk(node, (n) => {
+    if (hit || n.type !== "input") return;
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-filter-input")) hit = n;
+  });
+  return hit;
+}
+
+/** 关键词存在 store 里（唯一数据源），所以改完直接重新渲染就能看见效果。 */
+function typeFilter(value) {
+  const input = filterInputOf(render());
+  assert.ok(input, "有榜单时应出现筛选输入框");
+  input.props.onChange({ target: { value } });
+}
+
+const listRepos = () => {
+  const out = [];
+  walk(render(), (n) => {
+    // 仓库名取链接的 title（就是 row.repo）：屏幕上渲染成「owner / name」，
+    // 中间是空格，按文本切会得到两段。
+    if (n.type === "a" && n.props && String(n.props.className || "").includes("gt-repo")) {
+      const title = String(n.props.title || "");
+      if (title) out.push(title);
+    }
+  });
+  return out;
+};
+
+await check("榜单内筛选：只过滤已加载的行，不发请求", async () => {
+  const before = httpCalls.length;
+  typeFilter("rust");
+  const repos = listRepos();
+  assert.deepEqual(repos, ["beta/two"], "应只剩语言/描述匹配的那一行");
+  assert.equal(httpCalls.length, before, "筛选是本地的，不该打网络");
+  assert.match(textOf(render()), /筛出 1 \/ 3 个/);
+  // 状态行说的是「你在看什么数据」，仍是完整的榜单说明
+  assert.match(textOf(render()), /GitHub Trending/);
+});
+
+await check("榜单内筛选：不区分大小写，按描述也能筛", async () => {
+  typeFilter("SECOND FIXTURE");
+  assert.deepEqual(listRepos(), ["beta/two"]);
+});
+
+await check("榜单内筛选：清除后回到完整列表", async () => {
+  const clear = findByText(render(), "清除");
+  assert.ok(clear, "筛选生效时应给出清除入口");
+  clear.props.onClick();
+  assert.equal(listRepos().length, 3);
+  assert.match(textOf(render()), /显示全部 3 个/);
+});
+
+await check("榜单内筛选：无匹配时说清楚，而不是「榜单为空」", async () => {
+  typeFilter("根本没有这个东西");
+  assert.equal(listRepos().length, 0);
+  assert.match(textOf(render()), /没有匹配「根本没有这个东西」的仓库/);
+  findByText(render(), "清空关键词").props.onClick();
+  assert.equal(listRepos().length, 3);
+});
+
+await check("榜单内筛选：导出的是筛出来的行，并在标题里写明", async () => {
+  const prev = globalThis.navigator;
+  let copied = "";
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { writeText: async (t) => { copied = t; } } },
+  });
+  try {
+    typeFilter("rust");
+    findByText(render(), "导出 Markdown").props.onClick();
+    assert.ok(await waitFor(() => copied.length > 0), "应写入剪贴板");
+    assert.match(copied, /已筛选「rust」/, "标题要说明这是筛选后的子集");
+    assert.match(copied, /beta\/two/);
+    assert.doesNotMatch(copied, /alpha\/one/, "筛掉的行不能出现在导出里");
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: prev });
+    typeFilter("");
+    renderFresh(tab(), {});
+  }
+});
+
+await check("榜单内筛选：切视图后关键词自动清空", async () => {
+  typeFilter("rust");
+  findByText(render(), "随便看看").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("a random pick")));
+  assert.equal(filterInputOf(render()) ? filterInputOf(render()).props.value : "", "", "换视图后不该留着旧关键词");
+  // 切回来，别把视图留给后面的用例
+  findByText(render(), "Trending").props.onClick();
+  assert.ok(await waitFor(() => listRepos().length === 3));
+});
+
+await check("榜单内筛选：解读只喂筛出来的行，并说明是子集", async () => {
+  agentStarts.length = 0;
+  typeFilter("rust");
+  findByText(render(), "生成解读").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("测试解读正文")));
+  const prompt = agentStarts[0].prompt;
+  assert.match(prompt, /已筛选「rust」/);
+  assert.match(prompt, /之后剩下的仓库/);
+  assert.doesNotMatch(prompt, /alpha\/one/, "筛掉的行不能进 prompt");
+  // 复位，别把筛选与解读留给后面的用例
+  typeFilter("");
+  renderFresh(tab(), {});
+  // 下一条用例断言「只应跑过一轮」，这里这轮要清掉。
+  agentStarts.length = 0;
+});
+
 await check("生成解读：按 runId 过滤、流式写入", async () => {
   findByText(render(), "生成解读").props.onClick();
   assert.ok(await waitFor(() => textOf(render()).includes("测试解读正文")), "应写入解读");
@@ -1020,7 +1131,8 @@ await check("README：同一时刻只展开一个，换行展开会顶掉上一�
 });
 
 await check("README：没有 README 时给出原因，不是空白框", async () => {
-  readmeRoutes.set("beta/two", { status: 404, body: JSON.stringify({ message: "Not Found" }) });
+  // 用 delta/four：它还没被展开过，否则会命中会话内缓存里的成功结果。
+  readmeRoutes.set("delta/four", { status: 404, body: JSON.stringify({ message: "Not Found" }) });
   try {
     // 先收起当前展开的
     let close = null;
@@ -1031,7 +1143,7 @@ await check("README：没有 README 时给出原因，不是空白框", async ()
     assert.ok(await waitFor(() => !textOf(render()).includes("一个很长的说明")));
     let btn = null;
     walk(render(), (n) => {
-      if (!btn && n.type === "button" && n.props && n.props["aria-label"] === "展开 beta/two 的 README") btn = n;
+      if (!btn && n.type === "button" && n.props && n.props["aria-label"] === "展开 delta/four 的 README") btn = n;
     });
     btn.props.onClick();
     assert.ok(await waitFor(() => textOf(render()).includes("没有 README")), "404 要说清是没有 README");
@@ -1040,10 +1152,61 @@ await check("README：没有 README 时给出原因，不是空白框", async ()
     // 收回到干净状态，别把展开态留给后面的用例
     let close = null;
     walk(render(), (n) => {
-      if (!close && n.type === "button" && n.props && n.props["aria-label"] === "收起 beta/two 的 README") close = n;
+      if (!close && n.type === "button" && n.props && n.props["aria-label"] === "收起 delta/four 的 README") close = n;
     });
     if (close) close.props.onClick();
     await waitFor(() => !textOf(render()).includes("没有 README"));
+  }
+});
+
+await check("README：会话内再展开不重新请求", async () => {
+  // 上一条用例结束时 beta/two 是收起的，且刚展开过一次（正文应已进缓存）。
+  readmeRoutes.clear();
+  httpCalls.length = 0;
+  const openBtn = () => {
+    let hit = null;
+    walk(render(), (n) => {
+      if (!hit && n.type === "button" && n.props && n.props["aria-label"] === "展开 beta/two 的 README") hit = n;
+    });
+    return hit;
+  };
+  openBtn().props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("一个很长的说明")), "第二次展开也应立刻看到正文");
+  const readmeCalls = httpCalls.filter((c) => c.url.includes("/readme"));
+  assert.equal(readmeCalls.length, 0, "同一会话内重复展开不该再走网络");
+});
+
+await check("README：失败结果不缓存，看着恢复了就能重新读到", async () => {
+  // 用 delta/four：同样没被缓存过，否则会先命中已有正文。
+  readmeRoutes.set("delta/four", { status: 500, body: "boom" });
+  try {
+    let open = null;
+    walk(render(), (n) => {
+      if (!open && n.type === "button" && n.props && n.props["aria-label"] === "展开 delta/four 的 README") open = n;
+    });
+    open.props.onClick();
+    assert.ok(await waitFor(() => /HTTP 500|读取 README 失败/.test(textOf(render()))), "应说明失败");
+    // 修好后再展开：失败没被缓存，必须重新请求并成功
+    readmeRoutes.set("delta/four", { status: 200, body: "# delta/four\n\n恢复了" });
+    let close = null;
+    walk(render(), (n) => {
+      if (!close && n.type === "button" && n.props && n.props["aria-label"] === "收起 delta/four 的 README") close = n;
+    });
+    if (close) close.props.onClick();
+    let again = null;
+    walk(render(), (n) => {
+      if (!again && n.type === "button" && n.props && n.props["aria-label"] === "展开 delta/four 的 README") again = n;
+    });
+    again.props.onClick();
+    assert.ok(await waitFor(() => textOf(render()).includes("恢复了")), "失败不该粘住");
+  } finally {
+    readmeRoutes.clear();
+    let close = null;
+    walk(render(), (n) => {
+      if (!close && n.type === "button" && n.props && n.props["aria-label"] === "收起 delta/four 的 README") close = n;
+    });
+    if (close) close.props.onClick();
+    await waitFor(() => !textOf(render()).includes("恢复了"));
   }
 });
 

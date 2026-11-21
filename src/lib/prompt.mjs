@@ -34,6 +34,7 @@ function oneLine(row) {
  * @param {Array<object>} input.repos
  * @param {Array<object>} input.dropped
  * @param {boolean} input.isFirstRun
+ * @param {string} [input.filterNote] 本地筛选说明（如「已筛选「rust」」）；空 = 未筛选
  * @param {number} [budget]
  * @returns {{ prompt: string, truncated: boolean, included: number, total: number }}
  */
@@ -44,6 +45,8 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
   // 「随便看看」给的不是榜单：随机抽样/搜索结果之间没有排名与涨跌，
   // 照搬「按排名」「今天在热什么」会让模型把一批随机仓库写成趋势判断。
   const random = input.view === "browse";
+  // 本地筛选后的这批只是全榜的一部分：不说，模型会把「剩下的 3 个」写成全部。
+  const filterNote = String((input && input.filterNote) || "").trim();
 
   const scope = String((input && input.scopeText) || "").trim() ||
     (input.view === "rising"
@@ -55,7 +58,9 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
     "",
     "## 数据范围",
     scope,
-    "共 " + repos.length + " 个仓库" + (input.isFirstRun ? "（首次抓取，无历史对比）" : ""),
+    filterNote
+      ? "这 " + repos.length + " 个是" + filterNote + "之后剩下的仓库（用户在本机筛掉了其余部分）" + (input.isFirstRun ? "（首次抓取，无历史对比）" : "")
+      : "共 " + repos.length + " 个仓库" + (input.isFirstRun ? "（首次抓取，无历史对比）" : ""),
     "",
     random ? "## 这批仓库" : "## 榜单事实（按排名）",
   ];
@@ -67,6 +72,9 @@ export function buildDigestPrompt(input, budget = DEFAULT_BUDGET) {
     "- 只依据上面的「" + (random ? "这批仓库" : "榜单事实") + "」；事实里没有的信息不要编造，也不要猜技术细节。",
     "- 不要复述榜单，不要用「首先/其次/总之」这类填充词。",
     "- 用 Markdown，但不要写一级标题（不要用 `#`）。",
+    ...(filterNote
+      ? ["- 这是用户筛选后的子集：结论要落在「这几个」上，不要说成「今天的榜单里」。" ]
+      : []),
     // 随机批次最容易被模型写成趋势判断，这条必须显式在场。
     ...(random ? ["- 这批不是排行榜：没有名次、没有涨跌，也不代表今天的热点。不要写「今天在热什么」这类趋势判断。"] : []),
     "",

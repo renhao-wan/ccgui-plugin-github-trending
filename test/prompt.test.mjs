@@ -347,6 +347,19 @@ test("续接策略：每种模式都有说明文字，且互不相同", () => {
   assert.equal(resumeModeHint("乱写"), resumeModeHint(DEFAULT_RESUME_MODE));
 });
 
+test("筛选说明：数据范围里写明「筛选后剩下几个」，并提醒结论要落在子集上", () => {
+  const { prompt } = buildDigestPrompt(base({ filterNote: "已筛选「rust」" }));
+  assert.match(prompt, /这 2 个是已筛选「rust」之后剩下的仓库/);
+  assert.match(prompt, /不要说成「今天的榜单里」/);
+  assert.doesNotMatch(prompt, /共 2 个仓库/, "不能同时说「共 N 个」和「筛剩 N 个」");
+});
+
+test("筛选说明：未筛选时不出现任何筛选措辞", () => {
+  const { prompt } = buildDigestPrompt(base());
+  assert.doesNotMatch(prompt, /筛选|子集/);
+  assert.match(prompt, /共 2 个仓库/);
+});
+
 test("随便看看的解读：不冒充「今天的榜单」，也不写趋势判断", () => {
   const { prompt } = buildDigestPrompt(base({ view: "browse", scopeText: "从热门仓库里随机抽的一批（★1k–3k）" }));
   assert.match(prompt, /这批里/, "结论句应说「这批里」而不是「今天」");

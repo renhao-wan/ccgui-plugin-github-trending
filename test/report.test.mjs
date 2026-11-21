@@ -114,6 +114,28 @@ test("随便看看：scopeText 写进导出标题，不冒充 Trending 榜", () 
   assert.doesNotMatch(md, /GitHub Trending/);
 });
 
+test("导出 Markdown：筛选说明写进标题，不冒充全量榜单", () => {
+  const md = buildBoardMarkdown({
+    view: "trending",
+    period: "daily",
+    scopeText: "GitHub Trending · daily",
+    filterNote: "已筛选「rust」",
+    rows: [{ repo: "rust-lang/rust" }],
+    dropped: [],
+  });
+  assert.match(md, /^# 每日热点 · GitHub Trending · daily · 已筛选「rust」/m);
+});
+
+test("导出 Markdown：未筛选时不加后缀", () => {
+  const md = buildBoardMarkdown({
+    view: "trending",
+    period: "daily",
+    rows: [{ repo: "a/b" }],
+    dropped: [],
+  });
+  assert.doesNotMatch(md, /已筛选/);
+});
+
 test("随便看看：不写「X 天前创建」（随机批次里是噪音）", () => {
   const row = { repo: "a/b", stars: 100, ageDays: 900 };
   const browse = buildBoardMarkdown({ view: "browse", scopeText: "随机抽的一批", rows: [row], dropped: [] });
