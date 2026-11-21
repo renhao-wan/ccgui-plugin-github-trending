@@ -1763,7 +1763,7 @@ const PERIODS = [
 const RISING_PERIOD = { key: "rising", label: "新星库" };
 
 /** 视图的中文名，给下拉/状态行/导出标题共用同一套说法。 */
-const VIEW_LABEL = { trending: "Trending", rising: "新星库（7 天）", browse: "随便看看" };
+const VIEW_LABEL = { trending: "Trending", rising: "新星库", browse: "随便看看" };
 
 /**
  * 「你现在看的是什么数据」的一句话说明。
@@ -1898,6 +1898,7 @@ function setSettings(patch) {
 async function persistSettings(ctx, patch) {
   if (patch) setSettings(patch);
   try {
+    await whenSettingsLoaded();
     await ctx.storage.set("settings", store.snap.settings);
     return true;
   } catch {
@@ -1940,19 +1941,24 @@ const THIN_ICON = {
  * 两个位置显示两种图形，用户根本认不出是同一个插件。改几何时两边必须一起改
  * （`test/icon.test.mjs` 会比对两边的数值）。
  *
- * 下面这些坐标是 make-icon.mjs 里那几行比例换算到 16×16 的结果
- * （柱宽 8%、间距 4.8%、底边 80%、三档高度 30/45/62%）：
- *   三根竖线 x = 5.95 / 8 / 10.05，底端 12.16，顶端 8.64 / 6.24 / 3.52
+ * 几何来源是 make-icon.mjs 的比例常量（柱宽 5.5%、间距 8.5%、底边 80%、
+ * 三档高度 30/46/62%），换算到 16×16：
+ *   视觉范围   x 5.76 / 8 / 10.24，底边 12.80，顶端 8.00 / 5.44 / 2.88
  *
- * 柱宽就是 `strokeWidth`：PNG 里是填充胶囊，这里用等宽的圆头描边，两者等价。
+ * **`V` 的端点是笔画中心线，不是视觉边界**：圆头还会从端点向外伸出一个
+ * 半径（strokeWidth/2 = 0.44）。所以端点要在视觉边界的基础上内缩：
+ *   底端 12.80 - 0.44 = 12.36，顶端 8.00 + 0.44 = 8.44（其余同理）
+ * 少了这一步，应用内图标会比 PNG 大约 5.5%，两处并排看就是「一大一小」。
+ *
+ * **间距必须大于柱宽**：等宽或更窄时，缩到 16px 下三根柱会糊成一块。
  * 换算过来的包围盒占画布约 34%×62%，与斜杠面板那 32%×62% 基本一致——
  * 符号画得比别人的大，缩到 18px 就会显得填满了。
  *
  * 16px 下不画基线、不做双色：一根异色柱只会变成一个偏色的点。
  */
 const ICON_GEOM = {
-  strokeWidth: 1.28,
-  bars: ["M5.95 8.64V12.16", "M8 6.24V12.16", "M10.05 3.52V12.16"],
+  strokeWidth: 0.88,
+  bars: ["M5.76 8.44V12.36", "M8 5.88V12.36", "M10.24 3.32V12.36"],
 };
 
 function Icon(props) {
@@ -3190,6 +3196,43 @@ function forgetDiscussSession(repo, engine) {
   });
 }
 
+/**
+ * 激活后磁盘上的设置是否已经读回来了。
+ *
+ * 读盘是异步的（`activate` 里 fire-and-forget）。这之前 `store.snap.settings`
+ * 还是 `DEFAULT_SETTINGS`，写盘会把磁盘上那份整个盖掉——包括 `discussSessionIds`
+ * 和用户的提示词。所以所有写盘都要先等这一步。
+ */
+let settingsLoaded = Promise.resolve();
+function whenSettingsLoaded() {
+  return settingsLoaded;
+}
+
+/**
+ * 把插件写进设置的一份补丁放到**当前** settings 上，然后落盘。
+ *
+ * 不能直接 `ctx.storage.set("settings", store.snap.settings)` 之外再传一份
+ * 「渲染时抄下来的 form」：设置页里的 `form` 是它那一刻的快照，
+ * `discussSessionIds` 这种**只在会话建立时**才变、设置页根本不编辑的字段，
+ * 在快照里是旧值。用户开会话之后去改一下语言，保存时整份 form 回写，
+ * 刚记下的 sessionId 就被这份旧快照覆盖成空——内存表与磁盘同时丢。
+ * 这正是「点同一个仓库还是会开多个会话」的另一半原因。
+ *
+ * 所以所有写入都以 `store.snap.settings` 为底、只盖 patch 里的键。
+ * @returns {Promise<boolean>} 是否落盘成功（失败不影响主流程，但调用方要能知道）
+ */
+function saveSettings(ctx, patch) {
+  // 补丁先落到内存（store 的订阅者立刻要看到），写盘则等设置读回来之后再发，
+  // 否则会用默认值把磁盘上的会话表与提示词盖掉。
+  setSettings(patch || {});
+  return whenSettingsLoaded().then(() =>
+    Promise.resolve(ctx.storage.set("settings", store.snap.settings)).then(
+      () => true,
+      () => false,
+    ),
+  );
+}
+
 /** 把当前表写回设置。失败不报错：这只是省一次重复开会话，不影响主流程。 */
 function persistDiscussSessions(ctx) {
   const rows = {};
@@ -3200,7 +3243,21 @@ function persistDiscussSessions(ctx) {
     if (trimmed.id || Object.keys(trimmed.byEngine || {}).length > 0) rows[repo] = trimmed;
   }
   setSettings({ discussSessionIds: trimDiscussRows(rows) });
-  return Promise.resolve(ctx.storage.set("settings", store.snap.settings)).catch(() => {});
+  return saveSettings(ctx);
+}
+
+/**
+ * 会话表的落盘串行队列。
+ *
+ * 讨论这条路会在两个时刻记 id：`startRun` resolve 时（宿主当场给）和
+ * `plugin-run` 回执时（引擎稍后才 announce）。两次几乎同时发生，并发写盘
+ * 有可能后发的先到、把先记的 id 盖掉。排队执行，写盘顺序与记录顺序一致。
+ */
+let discussPersistChain = Promise.resolve();
+function queuePersistDiscussSessions(ctx) {
+  const run = () => persistDiscussSessions(ctx);
+  discussPersistChain = discussPersistChain.then(run, run);
+  return discussPersistChain;
 }
 
 /** 榜单换了一份。不是清空表——清不清由 resumeMode 决定。 */
@@ -3209,6 +3266,79 @@ function markDiscussSessionsStale() {
   // 不该因此把落盘的会话判成不可用。
   if (!discussTouched) return;
   discussSessionsStale = true;
+}
+
+/**
+ * 尚未拿到 sessionId 的会话启动。
+ *
+ * SDK 写明 `startRun` 成功时可能返回 `sessionId: null`——引擎稍后才 announce，
+ * 那一刻宿主经 `plugin-run://<pluginId>` 事件把 `{ runId, sessionId }` 回执过来。
+ * 不接这个回执，id 永远拿不到：表永远是空的，用户点同一个仓库每一次都新开一条。
+ *
+ * 以 `runId` 为键（同一时刻可能有多轮），由回执里的 repo/engine 补记。
+ * 条目有上限：回执可能永远不来（用户中途关了宿主），不能让表无限长。
+ */
+const PENDING_SESSION_LIMIT = 20;
+/**
+ * 等回执的最长时间。回执可能永远不来（宿主旧版本、用户在途中关了会话），
+ * 超时后必须放手：一直挡着等于这个仓库的「讨论」按钮永久不可用。
+ */
+const PENDING_SESSION_TTL_MS = 90000;
+/** runId → { repo, engine, at }：等回执的轮次。 */
+const pendingSessionStarts = new Map();
+
+function holdPendingSession(runId, repo, engine) {
+  if (!runId || !repo) return;
+  pendingSessionStarts.set(runId, { repo, engine: String(engine || ""), at: Date.now() });
+  while (pendingSessionStarts.size > PENDING_SESSION_LIMIT) {
+    const oldest = pendingSessionStarts.keys().next().value;
+    pendingSessionStarts.delete(oldest);
+  }
+}
+
+/**
+ * 某个仓库在某个引擎下是否正有一条「建了但还拿不到 id」的会话。
+ *
+ * 这是回执到达前的空窗：`startRun` 已经 resolve（按钮回到可点），id 还在路上。
+ * 这期间再点一次，表里查不到 id，就会又开一条——用户看到的就是「点两下两条」。
+ * 所以空窗内直接拒绝，让用户等一两秒。超时的挂起项在这里惰性清掉。
+ */
+function pendingSessionFor(repo, engine) {
+  const want = String(engine || "");
+  const now = Date.now();
+  for (const [runId, row] of pendingSessionStarts) {
+    if (now - row.at > PENDING_SESSION_TTL_MS) {
+      pendingSessionStarts.delete(runId);
+      continue;
+    }
+    if (row.repo === repo && row.engine === want) return true;
+  }
+  return false;
+}
+
+function resetPendingSessions() {
+  pendingSessionStarts.clear();
+}
+
+/**
+ * 处理宿主对本插件 `startRun` 轮次的回执。
+ *
+ * 回执里带 `sessionId` 时立刻补记——这是「宿主当场没给、稍后才 announce」那条路
+ * 唯一能拿到 id 的地方。拿到后 `persistDiscussSessions` 落盘，下次点击走
+ * `selectSession` 直接打开，不再新开。
+ *
+ * `done` / `error` 都意味着这一轮已经不需要再等了，顺手清掉挂起项。
+ */
+function handlePluginRunEvent(ctx, event) {
+  if (!event || typeof event !== "object") return;
+  const runId = typeof event.runId === "string" ? event.runId : "";
+  const pending = runId ? pendingSessionStarts.get(runId) : null;
+  const sessionId = typeof event.sessionId === "string" ? event.sessionId.trim() : "";
+  if (pending && sessionId) {
+    rememberDiscussSession(pending.repo, sessionId, pending.engine);
+    void queuePersistDiscussSessions(ctx);
+  }
+  if (runId && (event.kind === "done" || event.kind === "error")) pendingSessionStarts.delete(runId);
 }
 
 /**
@@ -3221,6 +3351,7 @@ function resetDiscussSessions() {
   discussSessions = new Map();
   discussSessionsStale = false;
   discussTouched = false;
+  resetPendingSessions();
 }
 
 /**
@@ -3296,6 +3427,16 @@ async function discussRepo(ctx, row) {
     // 打开一条根本不是这个引擎的会话；那条记录现在也不会被覆盖，切回去还在。
     const resumeId = sessionIdFor(known, entry.engine);
     const resumable = Boolean(resumeId);
+    // 上一条会话刚建、id 还在路上（引擎稍后才 announce）。这时再开一条就是
+    // 用户反馈的「点同一个仓库多出好几条」，所以空窗内直接挡住。
+    // 「总是新开」是用户明确要的，不挡。
+    if (
+      !resumable &&
+      normaliseResumeMode(settings.resumeMode) !== "never" &&
+      pendingSessionFor(row.repo, entry.engine)
+    ) {
+      return bailed("上一次会话还在建立中，稍等一两秒再点（不会重复开会话）");
+    }
     if (shouldResume(settings.resumeMode, discussSessionsStale, resumable) && typeof ctx.sessions.selectSession === "function") {
       try {
         await withTimeout(
@@ -3309,7 +3450,7 @@ async function discussRepo(ctx, row) {
         discussSessionsStale = false;
         // 命中即刷新位置，否则这个仓库会一直是「最久没用过的」，下一份新会话
         // 进来就被淘汰掉。顺序真的变了才写盘。
-        if (touchDiscussSession(row.repo)) void persistDiscussSessions(ctx);
+        if (touchDiscussSession(row.repo)) void queuePersistDiscussSessions(ctx);
         set({
           discussing: "",
           discussError: "",
@@ -3368,12 +3509,16 @@ async function discussRepo(ctx, row) {
     );
 
     // 记住这一行的 sessionId 和它所属引擎，供下次点击时直接打开它。
-    // `started.sessionId` 可能为 null——那就不记，下次照常新开。
+    // `started.sessionId` 可能为 null——引擎稍后才 announce，回执走
+    // `plugin-run://` 事件。这时先把 runId 挂起，等回执补记；否则 id 永远
+    // 拿不到，同一个仓库点几次就开几条会话。
     const sessionId = started && typeof started.sessionId === "string" && started.sessionId ? started.sessionId : "";
-    rememberDiscussSession(row.repo, sessionId, entry.engine);
+    const startedRunId = started && typeof started.runId === "string" ? started.runId : "";
+    if (sessionId) rememberDiscussSession(row.repo, sessionId, entry.engine);
+    else holdPendingSession(startedRunId, row.repo, entry.engine);
     // 落盘：内存表熬不过重装/重新激活/宿主重启，而用户的观感是「每点一次
     // 就多一条会话」。写盘失败不影响这次点击，所以不 await 它的错误。
-    void persistDiscussSessions(ctx);
+    void queuePersistDiscussSessions(ctx);
     // 这份榜单已经「认领」过，后面的点击不再算跨榜单。
     discussTouched = true;
     discussSessionsStale = false;
@@ -3601,21 +3746,6 @@ async function generateDigest(ctx) {
 }
 
 /* ---------- 渲染 ---------- */
-
-function Chip(props) {
-  const h = appCtx.react.createElement;
-  return h(
-    "button",
-    {
-      type: "button",
-      className: "gt-chip" + (props.active ? " gt-chip--on" : ""),
-      onClick: props.onClick,
-      disabled: props.disabled,
-      "aria-pressed": props.active ? "true" : "false",
-    },
-    props.children,
-  );
-}
 
 function Dot({ color }) {
   const h = appCtx.react.createElement;
@@ -3926,6 +4056,158 @@ function FilterBar({ snap, total }) {
   );
 }
 
+/**
+ * 「视图 / 时间档」的选择器。
+ *
+ * 宽屏下就是一个分段控件（segmented control）：选项**全部可见、单击切换**。
+ * 视图切换是这个插件最高频的操作，收进下拉等于每次都多一次点击，而且
+ * 「随便看看」「新星库」这类入口一旦藏起来，用户根本不知道还有别的视图。
+ *
+ * 窄屏才降级：时间档换成一个紧凑下拉（新星库与随便看看没有时间档，
+ * 所以这一格在它们下面整个不出现），视图那组在任何宽度都保持原样。
+ */
+function Segmented(props) {
+  const h = appCtx.react.createElement;
+  return h(
+    "div",
+    {
+      className: "gt-seg",
+      role: "group",
+      "aria-label": props.label,
+    },
+    (props.items || []).map((it) =>
+      h(
+        "button",
+        {
+          key: it.key,
+          type: "button",
+          className: "gt-seg-item" + (it.key === props.value ? " is-on" : ""),
+          onClick: () => props.onChange(it.key),
+          "aria-pressed": it.key === props.value ? "true" : "false",
+        },
+        it.label,
+      ),
+    ),
+  );
+}
+
+/**
+ * 「更多」菜单：窄屏下收走低频动作（复制 Markdown、设置）。
+ *
+ * 和 `Dropdown` 的区别是语义：这里是**执行一个动作**，不是「选一个值」。
+ * 所以用 `role="menu"` / `role="menuitem"`，Enter 执行、Esc 关闭，
+ * 不做「高亮项循环移动」——菜单项本来就少，方向键在这里没有收益。
+ */
+function OverflowMenu(props) {
+  const R = appCtx.react;
+  const h = R.createElement;
+  const { open, setOpen, up, triggerRef, openPopover } = usePopover();
+  const focusState = R.useState(-1);
+  const focusIdx = focusState[0];
+  const itemRefs = R.useRef([]);
+  const items = Array.isArray(props.items) ? props.items.filter(Boolean) : [];
+  const setFocusIndex = focusState[1];
+
+  R.useEffect(() => {
+    if (!open) return;
+    const el = itemRefs.current[focusIdx];
+    if (el && typeof el.focus === "function") el.focus();
+  }, [open, focusIdx]);
+
+  const openMenu = () => {
+    if (!items.length) return;
+    setFocusIndex(0);
+    openPopover(Math.min(260, items.length * 36 + 8));
+  };
+  const run = (item) => {
+    setOpen(false);
+    if (item && typeof item.onSelect === "function") item.onSelect();
+  };
+
+  const move = (step) => {
+    if (!items.length) return;
+    setFocusIndex((focusIdx + step + items.length) % items.length);
+  };
+
+  const onKeyDown = (ev) => {
+    // 和 Dropdown 同一套路：handler 挂容器，靠 className 认来源，
+    // 触发器与容器不能各挂一个（同一事件会冒泡两遍）。
+    const t = ev && ev.target;
+    const onTrigger = Boolean(
+      t && typeof t.className === "string" && t.className.split(/\s+/).includes("gt-more-trigger"),
+    );
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (!open) openMenu();
+      else move(ev.key === "ArrowDown" ? 1 : -1);
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      if (open) run(items[focusIdx]);
+      else openMenu();
+    } else if (ev.key === " ") {
+      if (onTrigger) {
+        ev.preventDefault();
+        if (open) run(items[focusIdx]);
+        else openMenu();
+      }
+    } else if (ev.key === "Escape" && open) {
+      ev.preventDefault();
+      setOpen(false);
+    } else if (ev.key === "Tab" && open) {
+      // 遮罩是 fixed 全屏，不关掉会留下一层看不见的遮罩继续吞点击。
+      setOpen(false);
+    }
+  };
+
+  return h(
+    "div",
+    {
+      className: "gt-more" + (open ? " is-open" : "") + (up ? " is-up" : ""),
+      onKeyDown,
+    },
+    h(
+      "button",
+      {
+        type: "button",
+        className: "gt-more-trigger",
+        ref: triggerRef,
+        "aria-haspopup": "menu",
+        "aria-expanded": open,
+        "aria-label": props.label || "更多",
+        title: props.label || "更多",
+        onClick: () => (open ? setOpen(false) : openMenu()),
+      },
+      "⋮",
+    ),
+    open ? h("div", { className: "gt-more-scrim", onClick: () => setOpen(false) }) : null,
+    open
+      ? h(
+          "div",
+          { className: "gt-more-menu", role: "menu" },
+          items.map((item, i) =>
+            h(
+              "button",
+              {
+                key: item.key || String(i),
+                type: "button",
+                ref: (el) => {
+                  itemRefs.current[i] = el;
+                },
+                className: "gt-more-item" + (i === focusIdx ? " is-active" : ""),
+                role: "menuitem",
+                disabled: item.disabled,
+                onClick: () => run(item),
+                onMouseEnter: () => setFocusIndex(i),
+              },
+              item.label,
+              item.hint ? h("span", { className: "gt-more-hint" }, item.hint) : null,
+            ),
+          ),
+        )
+      : null,
+  );
+}
+
 function Toolbar({ snap, ctx }) {
   const h = appCtx.react.createElement;
   const R = appCtx.react;
@@ -4020,20 +4302,37 @@ function Toolbar({ snap, ctx }) {
   return h(
     "div",
     { className: "gt-toolbar" },
-    h(
-      "div",
-      { className: "gt-group", role: "group", "aria-label": "数据视图" },
-      h(Chip, { active: snap.view === "trending", onClick: () => onView("trending") }, "Trending"),
-      h(Chip, { active: snap.view === "rising", onClick: () => onView("rising") }, "新星库（7 天）"),
-      h(Chip, { active: snap.view === "browse", onClick: () => onView("browse") }, "随便看看"),
-    ),
+    // 视图切换永远平铺、永远单击可用：这是最高频的操作，也是「还有别的视图」
+    // 的唯一入口。
+    h(Segmented, {
+      label: "数据视图",
+      value: snap.view,
+      onChange: onView,
+      items: [
+        { key: "trending", label: VIEW_LABEL.trending },
+        { key: "rising", label: VIEW_LABEL.rising },
+        { key: "browse", label: VIEW_LABEL.browse },
+      ],
+    }),
+    // 时间档宽屏平铺、窄屏换成紧凑下拉。两份都渲染、由 @container 决定谁可见：
+    // 组件拿不到容器宽度，用 CSS 切换比 js 宽度探测可靠。新星库/随便看看
+    // 没有时间档，这一格整个不出现。
     snap.view === "trending"
       ? h(
           "div",
-          { className: "gt-group", role: "group", "aria-label": "时间档" },
-          PERIODS.map((p) =>
-            h(Chip, { key: p.key, active: snap.settings.period === p.key, onClick: () => onPeriod(p.key) }, p.label),
-          ),
+          { className: "gt-period" },
+          h("span", { className: "gt-period-seg" }, h(Segmented, {
+            label: "时间档",
+            value: snap.settings.period,
+            onChange: onPeriod,
+            items: PERIODS,
+          })),
+          h("span", { className: "gt-period-dd" }, h(Dropdown, {
+            items: PERIODS.map((p) => ({ value: p.key, label: p.label })),
+            value: snap.settings.period,
+            onChange: onPeriod,
+            placeholder: "时间档",
+          })),
         )
       : null,
     // 搜索与换一批只在「随便看看」里出现：它们换掉的是列表本身，
@@ -4048,7 +4347,7 @@ function Toolbar({ snap, ctx }) {
         "button",
         {
           type: "button",
-          className: "gt-btn gt-btn--export",
+          className: "gt-btn gt-btn--export gt-when-wide",
           onClick: exportMarkdown,
           disabled: snap.loading || snap.repos.length === 0,
           title: "把当前榜单复制成 Markdown",
@@ -4081,7 +4380,22 @@ function Toolbar({ snap, ctx }) {
         },
         snap.generating ? "停止生成" : "生成解读",
       ),
-      h("button", { type: "button", className: "gt-btn", onClick: () => ctx.ui.openSettings() }, "设置"),
+      h("button", { type: "button", className: "gt-btn gt-when-wide", onClick: () => ctx.ui.openSettings() }, "设置"),
+      // 窄屏才出现：收起「复制 Markdown / 设置」这两个低频动作（省 ~156px）。
+      // 它们各自的按钮仍在 DOM 里，只是由 @container 隐藏——菜单项复用同一套
+      // 处理函数，不会出现两种行为。
+      h("span", { className: "gt-when-narrow" }, h(OverflowMenu, {
+        label: "更多操作",
+        items: [
+          {
+            key: "export",
+            label: exportStatus || "复制 Markdown",
+            disabled: snap.loading || snap.repos.length === 0,
+            onSelect: exportMarkdown,
+          },
+          { key: "settings", label: "设置", onSelect: () => ctx.ui.openSettings() },
+        ],
+      })),
     ),
   );
 }
@@ -4557,23 +4871,47 @@ function MainTab() {
 /* ---------- 设置页 ---------- */
 
 /**
+ * 弹出层的公共骨架：开合状态、触发器 ref、靠近视口底部时向上弹。
+ *
+ * `Dropdown`（选一个值）与 `OverflowMenu`（执行一个动作）的键盘语义不同，
+ * 但这三件事完全一样。抽出来是为了两处不会各错一处——「向上弹」这种逻辑
+ * 复制一份就容易只改一边。
+ */
+function usePopover() {
+  const R = appCtx.react;
+  const openState = R.useState(false);
+  const upState = R.useState(false);
+  const triggerRef = R.useRef(null);
+  const up = upState[0];
+  const setUp = upState[1];
+
+  /** 打开前估一下菜单高度：下方不够且上方更宽裕时向上弹，免得被视口裁掉。 */
+  const openPopover = (estHeight) => {
+    const el = triggerRef.current;
+    let shouldUp = false;
+    if (el && typeof el.getBoundingClientRect === "function" && typeof window !== "undefined") {
+      const rect = el.getBoundingClientRect();
+      const below = (window.innerHeight || 800) - rect.bottom;
+      shouldUp = below < estHeight + 12 && rect.top > below;
+    }
+    setUp(shouldUp);
+    openState[1](true);
+  };
+
+  return { open: openState[0], setOpen: openState[1], up, triggerRef, openPopover };
+}
+
+/**
  * 自绘下拉：原生 <select> 的展开层由系统绘制，不跟宿主的深浅色主题。
  * 键盘、方向键、Esc、点击外部关闭都对齐宿主习惯。
  */
 function Dropdown(props) {
   const R = appCtx.react;
   const h = R.createElement;
-  const openState = R.useState(false);
-  const open = openState[0];
-  const setOpen = openState[1];
+  const { open, setOpen, up, triggerRef, openPopover } = usePopover();
   const focusState = R.useState(-1);
   const focusIdx = focusState[0];
   const setFocusIdx = focusState[1];
-  // 触发器下方空间不够时向上弹，避免菜单被视口底部裁掉
-  const upState = R.useState(false);
-  const up = upState[0];
-  const setUp = upState[1];
-  const triggerRef = R.useRef(null);
   const itemRefs = R.useRef([]);
 
   const items = Array.isArray(props.items) ? props.items : [];
@@ -4593,14 +4931,7 @@ function Dropdown(props) {
     let i = selectedIdx;
     if (i < 0) i = items.findIndex((it) => !it.disabled);
     setFocusIdx(i < 0 ? 0 : i);
-    const est = Math.min(260, items.length * 32 + 8);
-    const el = triggerRef.current;
-    if (el && typeof el.getBoundingClientRect === "function" && typeof window !== "undefined") {
-      const rect = el.getBoundingClientRect();
-      const below = (window.innerHeight || 800) - rect.bottom;
-      setUp(below < est + 12 && rect.top > below);
-    }
-    setOpen(true);
+    openPopover(Math.min(260, items.length * 32 + 8));
   };
 
   const choose = (item) => {
@@ -4789,8 +5120,17 @@ function SettingsSection() {
   const baseline = R.useRef("");
   const saveTimer = R.useRef(null);
   const ready = R.useRef(false);
+  // 用户在本页改过哪些键。
+  //
+  // 保存时**只写这些键**，不整份 form 回写。`discussSessionIds` 只在开会话
+  // 时由插件自己更新，设置页从来不编辑它；而 `form` 是本页渲染那一刻的快照。
+  // 用户开会话之后回来改一下语言，整份 form 回写就会把刚记下的 sessionId
+  // 覆盖成空——下次再点同一个仓库又开一条新的。磁盘与内存同时丢。
+  const touchedKeys = R.useRef(null);
 
   const patch = (key, value) => {
+    if (!touchedKeys.current) touchedKeys.current = new Set();
+    touchedKeys.current.add(key);
     setForm((prev) => Object.assign({}, prev || snap.settings, { [key]: value }));
   };
 
@@ -4841,7 +5181,19 @@ function SettingsSection() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       void (async () => {
-        const ok = await persistSettings(ctx, form);
+        // 只回写用户真正改过的键（见 touchedKeys 的注释）。
+        const changes = {};
+        const keys = touchedKeys.current || new Set();
+        if (keys.size === 0) {
+          // 这次「变化」不是用户改的（多半是磁盘设置异步读回来了）。
+          // 基线要跟上，否则之后每次渲染都会再判一次「变了」、闪一次「已保存」。
+          baseline.current = key;
+          setSaveStatus("saved");
+          return;
+        }
+        const latest = form || {};
+        for (const k of keys) changes[k] = latest[k];
+        const ok = await saveSettings(ctx, changes);
         if (ok) {
           baseline.current = key;
           setSaveStatus("saved");
@@ -4921,6 +5273,11 @@ function SettingsSection() {
     // "" = 内置模板，它永远可选，所以回落目标就是它而不是「第一份」：
     // 用户删掉正在用的那份时，得到的是可预期的默认，而不是另一份自定义。
     const fixed = usable.some((p) => p.id === wanted) ? wanted : "";
+    // 这两个键由提示词编辑器直接改，同样要登记进「用户改过」的集合，
+    // 否则保存时会漏掉它们（见 touchedKeys）。
+    if (!touchedKeys.current) touchedKeys.current = new Set();
+    touchedKeys.current.add("prompts");
+    touchedKeys.current.add("defaultPromptId");
     setForm((prev) => Object.assign({}, prev || snap.settings, { prompts: list, defaultPromptId: fixed }));
   };
 
@@ -5434,7 +5791,44 @@ const CSS = `
 .gt-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .gt-group { display: flex; align-items: center; gap: 4px; }
 .gt-group--end { margin-left: auto; }
-.gt-chip, .gt-btn {
+
+/* 分段控件：视觉上是一个选择器，但选项全部可见、单击切换。
+ * 用一条外框 + 内部分格，而不是并排的独立按钮——否则看起来仍像 3 个按钮。 */
+.gt-seg {
+  display: inline-flex; align-items: center; padding: 2px; gap: 2px;
+  border: 1px solid var(--gt-border); border-radius: 8px;
+  background: var(--gt-surface);
+}
+.gt-seg-item {
+  font: inherit; font-size: 12px; line-height: 1; padding: 5px 9px;
+  border: 0; border-radius: 6px; background: transparent; color: var(--gt-muted);
+  cursor: pointer; white-space: nowrap;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.gt-seg-item:hover { background: var(--gt-raised); color: var(--gt-text); }
+.gt-seg-item.is-on {
+  background: var(--gt-raised); color: var(--gt-text); font-weight: 600;
+}
+.gt-seg-item:focus-visible { outline: 2px solid var(--gt-accent); outline-offset: -1px; }
+
+/* 时间档的两份渲染：宽屏分段控件、窄屏紧凑下拉。
+ * 组件拿不到容器宽度，所以两份都在 DOM 里，由 @container 决定谁可见；
+ * 隐藏的那份不可聚焦，键盘不会 Tab 进看不见的控件。 */
+.gt-period { display: inline-flex; align-items: center; gap: 4px; }
+.gt-period-seg { display: inline-flex; }
+.gt-period-dd { display: none; }
+.gt-period-dd .gt-dd { width: auto; }
+.gt-period-dd .gt-dd-trigger { height: 28px; padding: 0 8px; gap: 5px; font-size: 12px; }
+/* 紧凑触发器的宽度只有 53px，而 .gt-dd-menu 是 left:0; right:0 ——
+ * 菜单会跟着变成 53px，中文全部竖排。紧凑模式必须给菜单单独定宽。 */
+.gt-period-dd .gt-dd-menu {
+  left: 0; right: auto; min-width: 132px;
+}
+
+/* 低频动作的显隐：宽屏平铺，窄屏收进「更多」菜单。 */
+.gt-when-narrow { display: none; }
+
+.gt-btn {
   font: inherit;
   font-size: 12px;
   line-height: 1;
@@ -5453,22 +5847,49 @@ const CSS = `
 .gt-btn--refresh { min-width: 86px; }
 /* 「导出 Markdown / 已复制 / 复制失败」来回切时宽度不跳。 */
 .gt-btn--export { min-width: 104px; }
-.gt-chip:hover, .gt-btn:hover { background: var(--gt-raised); }
-.gt-chip--on {
-  background: var(--gt-raised);
-  border-color: var(--gt-accent);
-  font-weight: 600;
-}
+.gt-btn:hover { background: var(--gt-raised); }
 .gt-btn--primary { border-color: var(--gt-accent); font-weight: 600; }
-.gt-chip:disabled, .gt-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.gt-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 /* 抓取中按钮不能用 opacity:.45 冒充禁用：那样转圈也被一起淡掉了。
  * 底色压暗、光标改成等待，转圈保持不透明。放在 disabled 之后才盖得住。 */
 .gt-btn--busy:disabled { opacity: 1; cursor: progress; background: var(--gt-raised); }
 .gt-btn--busy .gt-spinner { border-color: var(--gt-border); border-top-color: var(--gt-accent); }
-.gt-chip:focus-visible, .gt-btn:focus-visible, .gt-input:focus-visible, .gt-repo:focus-visible {
+.gt-btn:focus-visible, .gt-input:focus-visible, .gt-repo:focus-visible {
   outline: 2px solid var(--gt-accent);
   outline-offset: 2px;
 }
+
+/* 「更多」菜单：结构和 Dropdown 同源，语义是「执行动作」不是「选值」。 */
+.gt-more { position: relative; display: inline-flex; }
+.gt-more-trigger {
+  width: 28px; height: 28px; padding: 0; border-radius: 7px;
+  display: flex; align-items: center; justify-content: center;
+  font: inherit; font-size: 15px; line-height: 1;
+  border: 1px solid var(--gt-border); background: transparent;
+  color: inherit; cursor: pointer;
+}
+.gt-more-trigger:hover { background: var(--gt-raised); }
+.gt-more-trigger:focus-visible { outline: 2px solid var(--gt-accent); outline-offset: 2px; }
+.gt-more.is-open .gt-more-trigger { border-color: var(--gt-accent); }
+.gt-more-scrim { position: fixed; inset: 0; z-index: 80; }
+.gt-more-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 81;
+  min-width: 168px; max-height: 260px; overflow-y: auto; padding: 4px;
+  display: flex; flex-direction: column; gap: 1px;
+  background: var(--gt-surface); border: 1px solid var(--gt-border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+}
+.gt-more.is-up .gt-more-menu { top: auto; bottom: calc(100% + 6px); }
+.gt-more-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 7px 9px; border: 0; border-radius: 5px;
+  font: inherit; font-size: 13px; text-align: left;
+  background: transparent; color: inherit; cursor: pointer; outline: none;
+}
+.gt-more-item.is-active { background: var(--gt-raised); }
+.gt-more-item:disabled { opacity: 0.45; cursor: not-allowed; }
+.gt-more-item:disabled.is-active { background: transparent; }
+.gt-more-hint { font-size: 11px; color: var(--gt-muted); }
 .gt-stamp { font-size: 11px; opacity: 0.55; white-space: nowrap; }
 /* 「随便看看」的搜索框与换一批。输入框吃掉剩余宽度，但设上限：
  * 工具栏是 flex-wrap 的，输入框太宽会把右侧按钮挤到第二行。 */
@@ -5563,7 +5984,7 @@ const CSS = `
   .gt-spinner { animation: none; }
   .gt-skel::after { animation: none; opacity: 0; }
   .gt-list { animation: none; }
-  .gt-row, .gt-chip, .gt-btn, .gt-discuss { transition: none; }
+  .gt-row, .gt-btn, .gt-discuss { transition: none; }
 }
 .gt-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 18px; }
 .gt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; animation: gt-fade-in 180ms ease; }
@@ -5924,12 +6345,36 @@ const CSS = `
 }
 .gt-settings-foot { font-size: 12px; color: var(--gt-muted); margin: 16px 0 0; }
 
+/* 工具栏分三档，断点来自实测的「装不下」宽度（内容宽 + 左右各 18px 内边距）：
+ *
+ *   ≥ 805  全平铺  视图 + 时间档 + 更新于 + 复制 + 刷新 + 生成 + 设置   (769)
+ *   ≥ 677  收低频  视图 + 时间档 + 更新于 + 刷新 + 生成 + ⋮            (641)
+ *   ≥ 595  换下拉  视图 + 下拉   + 更新于 + 刷新 + 生成 + ⋮            (559)
+ *   < 595  再收时间戳                                                  (461)
+ *
+ * 断点之间留了 16px 余量：字体、缩放、不同平台的字宽都会让实测值偏一点，
+ * 卡在正好贴边会在别人的机器上折行。 */
+@container (max-width: 804px) {
+  .gt-when-wide { display: none; }
+  .gt-when-narrow { display: inline-flex; }
+}
+@container (max-width: 676px) {
+  .gt-period-seg { display: none; }
+  .gt-period-dd { display: inline-flex; }
+}
+@container (max-width: 594px) {
+  .gt-stamp { display: none; }
+}
 @container (max-width: 720px) {
   .gt-section { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 20px 0; }
 }
 @container (max-width: 520px) {
-  .gt-group--end { margin-left: 0; width: 100%; }
   .gt-row { padding: 8px 6px; }
+  /* 极窄档：461px 是这一行内容的最小宽度，再少几十像素就得收紧。
+   * 收的是内边距和间距，不是隐藏按钮——刷新和生成解读在这里仍然是高频。 */
+  .gt-toolbar { gap: 6px; }
+  .gt-seg-item { padding: 5px 7px; }
+  .gt-period-dd .gt-dd-trigger { padding: 0 6px; }
 }
 `;
 
@@ -5984,13 +6429,42 @@ export default function activate(ctx) {
   const settingsDisposer = ctx.ui.registerSettingsSection({
     key: "main",
     label: () => "每日热点",
+    // 设置区标题栏的图标。不传的话宿主回落到插件的 artwork（docs/icon.png，
+    // 带橙色底板），同一个插件在页签、侧栏是单色线条，到设置页变成彩色方块。
+    // 这里和上面两处用同一个 `Icon`：`stroke="currentColor"`，跟随宿主文字色。
+    icon: Icon,
     component: SettingsSection,
   });
 
+  /**
+   * 宿主对 `startRun` 轮次的回执。引擎稍后才 announce sessionId，那条路只有
+   * 这个事件能拿到 id——不订阅的话「同一个仓库只开一条会话」永远不成立。
+   */
+  let runEventDisposer = null;
+  if (ctx.events && typeof ctx.events.on === "function") {
+    try {
+      runEventDisposer = ctx.events.on("plugin-run://" + PLUGIN_ID, (event) => {
+        if (mySeq !== activateSeq) return;
+        handlePluginRunEvent(ctx, event);
+      });
+    } catch {
+      /* 宿主不支持这个话题：退回「拿不到 id 就新开」，不影响主流程 */
+    }
+  }
+
   // 恢复设置与非敏感缓存；失败不影响激活。
+  //
+  // `settingsLoaded` 是一个**可等待**的信号：读盘完成（成功或失败）之前，
+  // 任何 saveSettings 都必须等着，否则会拿 DEFAULT_SETTINGS 把磁盘上那份
+  // 整个盖掉——会话表、提示词、token 都在里面。
+  let markSettingsLoaded = () => {};
+  settingsLoaded = new Promise((resolve) => {
+    markSettingsLoaded = resolve;
+  });
   void (async () => {
     try {
       const saved = await ctx.storage.get("settings");
+      // 已卸载 / 已重新激活：这次读回来的值属于上一代，不能写进现在的 store。
       if (mySeq !== activateSeq) return;
       if (saved && typeof saved === "object") {
         const merged = Object.assign({}, DEFAULT_SETTINGS);
@@ -6016,6 +6490,10 @@ export default function activate(ctx) {
       }
     } catch {
       /* 用默认设置 */
+    } finally {
+      // 无论成功失败都要放行：读失败时写盘会以默认值为底，这是既有行为，
+      // 但绝不能让写盘永远挂住。
+      markSettingsLoaded();
     }
     await pruneHistory(ctx);
   })();
@@ -6038,6 +6516,11 @@ export default function activate(ctx) {
     // 会话内缓存跟着这次激活失效：重新安装/换工作区后，缓存里可能已经是旧内容。
     readmeCache.clear();
     cancelSession(activeDigest, ctx);
+    try {
+      if (runEventDisposer) runEventDisposer();
+    } catch {
+      /* 忽略 */
+    }
     try {
       cssDisposer();
     } catch {

@@ -257,6 +257,14 @@ const sessionSelects = [];
 let sessionStartError = null;
 let sessionSelectError = null;
 /**
+ * `startRun` 返回的 sessionId。默认当场给（`sess-N`）；设成 null 就模拟
+ * 「引擎稍后才 announce」——那条路只能靠 `plugin-run://` 回执补记 id，
+ * 而它正是「点同一个仓库还是会开多个会话」的主因。
+ */
+let sessionAnnounceLater = false;
+/** 最近一次 startRun 的 runId；回执用它匹配挂起项。 */
+let lastSessionRunId = "";
+/**
  * 宿主的侧栏工作区表。宿主只扫「已登记工作区」对应的会话目录，所以这张表
  * 是「会话能不能出现在侧栏」的前提。初始放入 pickedWorkspaceDir，模拟
  * 「用户已经在设置里选了一个真实工作区」。
@@ -298,6 +306,8 @@ let readmeDefault = {
 };
 const cssCalls = [];
 const eventHandlers = new Set();
+/** 订阅过的话题：断言插件确实接了 plugin-run 回执这条总线。 */
+const eventTopics = new Set();
 
 let tabDef = null;
 let navDef = null;
@@ -382,8 +392,19 @@ let agentMode = "stream"; // stream | error | silent | slow-start | hang
 let agentStartDelay = 200;
 let agentRunIdx = 0;
 
-function emit(ev) {
-  for (const cb of Array.from(eventHandlers)) cb(ev);
+/**
+ * 推一个事件。
+ *
+ * 给了 topic 就只送到订阅了那个 topic 的处理函数——这是宿主的真实行为
+ * （`agent://` 与 `plugin-run://` 是两条独立总线）。不给就是全广播，旧用例
+ * 靠这个，不用逐个补 topic。
+ */
+function emit(ev, topic) {
+  const want = String(topic || "");
+  for (const entry of Array.from(eventHandlers)) {
+    if (want && entry.topic !== want) continue;
+    entry.cb(ev);
+  }
 }
 
 const ctx = {
@@ -465,9 +486,11 @@ const ctx = {
     },
   },
   events: {
-    on: (_topic, cb) => {
-      eventHandlers.add(cb);
-      return () => eventHandlers.delete(cb);
+    on: (topic, cb) => {
+      eventTopics.add(String(topic));
+      const entry = { topic: String(topic), cb };
+      eventHandlers.add(entry);
+      return () => eventHandlers.delete(entry);
     },
     emit: () => {},
   },
@@ -481,7 +504,11 @@ const ctx = {
     startRun: async (def) => {
       sessionStarts.push(def);
       if (sessionStartError) throw sessionStartError;
-      return { runId: "srun-" + sessionStarts.length, sessionId: "sess-" + sessionStarts.length };
+      const runId = "srun-" + sessionStarts.length;
+      lastSessionRunId = runId;
+      // 「引擎稍后才 announce」：当场不回 id，id 只能从 plugin-run 回执拿。
+      if (sessionAnnounceLater) return { runId, sessionId: null };
+      return { runId, sessionId: "sess-" + sessionStarts.length };
     },
     // 打开一个**已有**会话：宿主侧只是切视图，不跑模型、不花 token。
     // 插件的「再点一次讨论」就该走这里，而不是再 startRun 一轮。
@@ -729,6 +756,128 @@ await check("榜单没变时说明「排名无变化」，而不是整行空着"
   assert.ok(await waitFor(() => /排名无变化/.test(textOf(render()))), "应说明排名无变化");
   assert.equal(countByClass(render(), "gt-move"), 0, "没有变化就不该有标签");
   assert.ok(countByClass(render(), "gt-rank") >= 3, "名次徽章仍要在");
+});
+
+/* ------------------------------------------------------- 工具栏 */
+
+/** 工具栏里的分段控件：从容器 class 认，而不是按文本猜。 */
+function segmented(node, label) {
+  let hit = null;
+  walk(node, (n) => {
+    if (hit) return;
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-seg") && n.props["aria-label"] === label) hit = n;
+  });
+  return hit;
+}
+
+function segItems(node, label) {
+  const seg = segmented(node, label);
+  assert.ok(seg, "应有「" + label + "」分段控件");
+  const out = [];
+  walk(seg, (n) => {
+    if (n === seg) return;
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-seg-item")) out.push(n);
+  });
+  return out;
+}
+
+/** 找「更多」菜单容器。 */
+function overflowMenu(node) {
+  let hit = null;
+  walk(node, (n) => {
+    if (hit) return;
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-more")) hit = n;
+  });
+  return hit;
+}
+
+function moreItems(node) {
+  const out = [];
+  walk(node, (n) => {
+    const c = n.props && n.props.className;
+    if (typeof c === "string" && c.split(/\s+/).includes("gt-more-item")) out.push(n);
+  });
+  return out;
+}
+
+await check("工具栏：视图是分段控件，三个选项全部可见、单击切换", async () => {
+  assert.ok(await waitFor(() => countByType(render(), "li") === 3));
+  const items = segItems(render(), "数据视图");
+  assert.deepEqual(items.map((n) => textOf(n)), ["Trending", "新星库", "随便看看"], "三个视图都应平铺可见");
+  // 当前视图在同一容器内高亮，而不是靠另一个组件重复说明
+  const on = items.filter((n) => String(n.props.className).includes("is-on"));
+  assert.equal(on.length, 1, "同一时刻只有一个视图是高亮的");
+  assert.equal(textOf(on[0]), "Trending");
+  // 单击即可切换，不需要先展开
+  items[1].props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("近 7 天新建的高增长仓库")));
+  // 切回趋势：外部 store 是模块级的，留着新星库会让后面的用例看不到时间档
+  segItems(render(), "数据视图")[0].props.onClick();
+  assert.ok(await waitFor(() => countByType(render(), "li") === 3), "切回趋势应重新拉回榜单");
+});
+
+await check("工具栏：时间档宽屏分段、窄屏下拉两份都在，由 CSS 决定可见", async () => {
+  const tree = render();
+  // 宽屏那份：今日 / 本周 / 本月 平铺
+  const periods = segItems(tree, "时间档");
+  assert.deepEqual(periods.map((n) => textOf(n)), ["今日", "本周", "本月"]);
+  // 窄屏那份：触发器的文本就是当前值
+  const dd = findTrigger(tree, "今日");
+  assert.ok(dd, "窄屏档应有一个紧凑下拉，触发器的文本是当前值");
+  // 两份都渲染、由 @container 切换可见：组件在冒烟里拿不到真实容器宽度，
+  // 用 js 宽度探测会让「宽屏显示下拉」这种 bug 无法被测试发现。
+  assert.equal(segmented(tree, "时间档").props.className.includes("gt-period"), false);
+});
+
+await check("工具栏：窄屏「更多」菜单里能复制 Markdown、能打开设置", async () => {
+  const openedBefore = openedSettings;
+  // 菜单开合是组件局部 state：要用 renderKeep，否则每次渲染都从头收起。
+  const renderTab = () => renderKeep(tabDef.component, {});
+  const menu = () => overflowMenu(renderTab());
+  // 收起状态不渲染菜单项
+  assert.equal(moreItems(render()).length, 0, "未展开时不该渲染菜单项");
+
+  menu().props.onKeyDown({ key: "ArrowDown", preventDefault() {}, target: { className: "gt-more-trigger" } });
+  assert.ok(String(menu().props.className).split(/\s+/).includes("is-open"), "方向键应展开");
+
+  const items = moreItems(renderTab());
+  assert.deepEqual(items.map((n) => textOf(n)), ["复制 Markdown", "设置"], "低频动作应都在菜单里");
+
+  // 点「设置」走的是同一个 openSettings，不是第二套逻辑
+  items[1].props.onClick();
+  assert.equal(String(menu().props.className).includes("is-open"), false, "选中后应收起");
+  assert.equal(openedSettings, openedBefore + 1, "应打开设置页");
+
+  // Esc / Tab 关闭：scrim 是全屏的，留着会吞掉后续点击
+  for (const key of ["Escape", "Tab"]) {
+    menu().props.onKeyDown({ key: "ArrowDown", preventDefault() {}, target: { className: "gt-more-trigger" } });
+    assert.ok(String(menu().props.className).includes("is-open"), key + " 前应已展开");
+    menu().props.onKeyDown({ key, preventDefault() {}, target: { className: "gt-more-item" } });
+    assert.equal(String(menu().props.className).includes("is-open"), false, key + " 应关闭菜单");
+  }
+
+  // 复制 Markdown 也走同一条路径：剪贴板桩会把内容记下来
+  const prev = globalThis.navigator;
+  let copied = "";
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { writeText: async (t) => { copied = t; } } },
+  });
+  try {
+    menu().props.onKeyDown({ key: "ArrowDown", preventDefault() {}, target: { className: "gt-more-trigger" } });
+    const exportItem = moreItems(renderTab()).find((n) => textOf(n).includes("复制 Markdown"));
+    assert.ok(exportItem, "未复制前菜单项就是「复制 Markdown」");
+    exportItem.props.onClick();
+    assert.ok(await waitFor(() => copied.length > 0), "菜单里的复制应写入剪贴板");
+    // 这里只验「走的是同一个导出」：前面几条用例已经换过榜单，
+    // 不写死某个仓库名，免得它一改就被这条用例绊住。
+    assert.match(copied, /github\.com/, "复制的应是当前榜单的 Markdown");
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: prev });
+  }
 });
 
 /* ------------------------------------------------------- 榜单内本地筛选 */
@@ -1678,7 +1827,7 @@ await check("解读有复制按钮，复制的是 Markdown 原文", async () => 
 });
 
 await check("切到新星库走 Search API 并渲染", async () => {
-  const chip = findByText(render(), "新星库（7 天）");
+  const chip = findByText(render(), "新星库");
   chip.props.onClick();
   assert.ok(await waitFor(() => textOf(render()).includes("fresh repo")), "应渲染新星库");
   const text = textOf(render());
@@ -1690,7 +1839,7 @@ await check("切到新星库走 Search API 并渲染", async () => {
 await check("限流时保留已有列表并给出可读提示", async () => {
   // 先在新星库拿到正常数据
   searchPayload = GOOD_SEARCH;
-  findByText(render(), "新星库（7 天）").props.onClick();
+  findByText(render(), "新星库").props.onClick();
   assert.ok(await waitFor(() => textOf(render()).includes("fresh repo")), "先有数据");
   const before = countByType(render(), "li");
   assert.ok(before > 0, "应有列表行");
@@ -1742,7 +1891,7 @@ await check("连接层持续失败时给出人能看懂的提示", async () => {
     ctx.bridge.invoke = original;
     // 这两条用例停在 Trending 视图；下一条「页面结构变化」靠点 Trending 触发刷新，
     // 同一视图点一下是早退。先切回新星库，把视图状态还原成原顺序里的样子。
-    findByText(render(), "新星库（7 天）").props.onClick();
+    findByText(render(), "新星库").props.onClick();
     await waitFor(() => textOf(render()).includes("fresh repo") || !textOf(render()).includes("正在刷新"));
   }
 });
@@ -2196,7 +2345,7 @@ await check("快速切换视图时晚到的响应不覆盖新视图", async () =
   findByText(render(), "Trending").props.onClick();
   await sleep(10);
   // 立刻切到新星库（Trending 还在路上）
-  findByText(render(), "新星库（7 天）").props.onClick();
+  findByText(render(), "新星库").props.onClick();
   assert.ok(await waitFor(() => textOf(render()).includes("fresh repo")), "新星库应先到");
   await sleep(250); // 等慢的 Trending 响应回来
   const text = textOf(render());
@@ -2222,7 +2371,7 @@ await check("生成解读时切视图会停止这一轮，不串台到新视图"
 
   const beforeInterrupts = agentInterrupts.length;
   // 切到新星库
-  findByText(render(), "新星库（7 天）").props.onClick();
+  findByText(render(), "新星库").props.onClick();
   assert.ok(await waitFor(() => agentInterrupts.length > beforeInterrupts), "切视图应 interrupt 旧轮次");
   assert.ok(findByText(render(), "生成解读") === null || findByText(render(), "生成解读"), "按钮应复位");
 
@@ -2500,6 +2649,209 @@ await check("讨论续接：会话表落盘，重新激活后仍能直接打开"
   }
 });
 
+await check("讨论续接：宿主当场不给 sessionId 时，靠 plugin-run 回执补齐，下次仍直接打开", async () => {
+  // SDK 写明 startRun 可能返回 sessionId: null——引擎稍后才 announce，
+  // 那一刻宿主经 plugin-run://<pluginId> 事件回执 { runId, sessionId }。
+  // 不接这个回执，id 永远拿不到，用户点同一个仓库每一次都新开一条。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  sessionAnnounceLater = true;
+  const saved = {};
+  let inst = await freshTabInstance(() => ({}), (k, v) => {
+    if (k === "settings") Object.assign(saved, v);
+  });
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    // 当场这一下没有 id，表里不该有记录——记空串等于占着额度还不复用。
+    assert.ok(
+      !(saved.discussSessionIds && saved.discussSessionIds["beta/two"]),
+      "拿不到 id 时不该写一条空记录",
+    );
+
+    // 引擎稍后 announce：宿主把 id 经回执送回来。
+    assert.ok(eventTopics.has("plugin-run://" + MANIFEST.id), "应订阅 plugin-run 回执话题");
+    emit(
+      {
+        runId: lastSessionRunId,
+        sessionId: "sess-announced",
+        engine: "claude",
+        workspacePath: storageDir,
+        kind: "done",
+        error: null,
+      },
+      "plugin-run://" + MANIFEST.id,
+    );
+    assert.ok(
+      await waitFor(
+        () => saved.discussSessionIds && saved.discussSessionIds["beta/two"] &&
+          saved.discussSessionIds["beta/two"].byEngine.claude === "sess-announced",
+      ),
+      "回执里的 sessionId 应补记并落盘",
+    );
+
+    // 再点同一行：现在有 id 了，应直接打开，不再新开。
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionSelects.length === 1), "补齐 id 后应直接打开旧会话");
+    assert.equal(sessionSelects[0].sessionId, "sess-announced");
+    assert.equal(sessionStarts.length, 1, "不该再 startRun");
+  } finally {
+    sessionAnnounceLater = false;
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：回执乱序到达也只认自己的 runId，不误记别的仓库", async () => {
+  // 同一时刻可能有多轮在飞。回执以 runId 为准：对不上的一律不理，
+  // 否则会把 A 仓库的会话记到 B 仓库名下，下次点 B 直接打开 A 的会话。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  sessionAnnounceLater = true;
+  const saved = {};
+  const inst = await freshTabInstance(() => ({}), (k, v) => {
+    if (k === "settings") Object.assign(saved, v);
+  });
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+
+    emit(
+      { runId: "someone-else", sessionId: "sess-x", engine: "claude", kind: "done", error: null },
+      "plugin-run://" + MANIFEST.id,
+    );
+    // 等一拍，确认没有任何写入发生
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(
+      !(saved.discussSessionIds && saved.discussSessionIds["beta/two"]),
+      "别的 runId 的回执不该记到本仓库名下",
+    );
+  } finally {
+    sessionAnnounceLater = false;
+    inst.dispose();
+  }
+});
+
+await check("设置页保存不覆盖 discussSessionIds（否则刚记下的 id 会被抹掉）", async () => {
+  // 设置页的 form 是渲染那一刻的快照，discussSessionIds 不在表单里。
+  // 整份回写会把开会话时刚记下的 id 覆盖成空——内存与磁盘同时丢，
+  // 用户下次点同一个仓库又开一条。这里断言「只写用户改过的键」。
+  //
+  // 设置区属于这个实例自己的 store，所以不能借用全局那一个 settingsDef：
+  // 必须像下面「讨论会尊重设置里选的工作区」一样自己接住注册。
+  let ownSettings = null;
+  let saved = null;
+  const fresh = await import(PLUGIN + "?settings-keep-sessions=" + Date.now());
+  const dispose = fresh.default(
+    Object.assign({}, ctx, {
+      storage: {
+        get: async (k) =>
+          k === "settings"
+            ? {
+                discussSessionIds: {
+                  "beta/two": { id: "sess-keep", engine: "claude", byEngine: { claude: "sess-keep" } },
+                },
+              }
+            : null,
+        set: async (k, v) => {
+          if (k === "settings") saved = v;
+        },
+        delete: async () => {},
+      },
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: () => () => {},
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: (d) => {
+          ownSettings = d;
+          return () => {};
+        },
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  try {
+    assert.ok(await waitFor(() => !!ownSettings, 2000), "独立实例应注册设置区");
+    // 等设置从磁盘读回来，否则基线是默认值，round-trip 会被当成一次用户改动。
+    renderFresh(ownSettings.component, {}, { effects: true });
+    assert.ok(await waitFor(() => textOf(renderFresh(ownSettings.component)).includes("中文解读")));
+    await sleep(80);
+
+    const input = (() => {
+      let hit = null;
+      walk(renderFresh(ownSettings.component, {}, { effects: true }), (n) => {
+        if (!hit && n.type === "input" && n.props && n.props.placeholder === "留空 = 全部语言") hit = n;
+      });
+      return hit;
+    })();
+    assert.ok(input, "应有语言筛选输入框");
+    input.props.onChange({ target: { value: "python" } });
+    for (let i = 0; i < 40 && !saved; i += 1) {
+      renderKeep(ownSettings.component, {});
+      await sleep(40);
+    }
+    assert.ok(saved, "改动应触发保存");
+    assert.equal(saved.language, "python", "用户改过的键要写进去");
+    assert.ok(
+      saved.discussSessionIds && saved.discussSessionIds["beta/two"] &&
+        saved.discussSessionIds["beta/two"].byEngine.claude === "sess-keep",
+      "保存不能抹掉会话表",
+    );
+  } finally {
+    dispose();
+  }
+});
+
+await check("讨论续接：id 还在路上时再点同一行会被挡住，不会开第二条", async () => {
+  // startRun 已经 resolve（按钮回到可点），但 sessionId 还没回执。这期间再点
+  // 一次，表里查不到 id，就会又开一条——用户看到的正是「点两下多出两条」。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  sessionAnnounceLater = true;
+  const inst = await freshTabInstance(() => ({}));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => inst.text().includes("还在建立中")), "应说明为什么这次没开");
+    assert.equal(sessionStarts.length, 1, "空窗内不该再 startRun");
+    assert.equal(sessionSelects.length, 0, "也还没有 id 可以打开");
+  } finally {
+    sessionAnnounceLater = false;
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：设置成「总是新开」时，空窗不挡（用户明确要的就是新开）", async () => {
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  sessionAnnounceLater = true;
+  const inst = await freshTabInstance(() => ({ resumeMode: "never" }));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 2), "never 模式下应照常新开");
+  } finally {
+    sessionAnnounceLater = false;
+    inst.dispose();
+  }
+});
+
+await check("设置区标题栏用单色 Icon，不用带颜色的 artwork", async () => {
+  // 页签和侧栏都是 stroke="currentColor" 的线条图标；设置区不传 icon 时
+  // 宿主回落到 docs/icon.png（橙色底板），同一个插件在设置页变成彩色方块。
+  assert.ok(settingsDef, "应注册设置区");
+  assert.equal(typeof settingsDef.icon, "function", "设置区应传 icon");
+  const rendered = settingsDef.icon({ className: "x" });
+  assert.equal(rendered.type, "svg", "设置区图标应是 svg");
+  assert.equal(rendered.props.stroke, "currentColor", "应跟随宿主文字色，不带自己的颜色");
+  assert.ok(!/^#/.test(String(rendered.props.fill)), "不应有硬编码填充色");
+});
+
 await check("讨论续接：打开旧会话失败时退回新开，并清掉失效 id", async () => {
   // 会话可能已被归档/删除，或宿主换了版本不再认这个 id。不能让按钮变成
   // 「一点就报错」的死路，也不能把那个 id 一直留着。
@@ -2556,24 +2908,35 @@ await check("讨论续接：超过上限时淘汰最久没用过的，且写入�
   }
 });
 
-await check("讨论续接：拿不到 sessionId 时退回新开，不把按钮做成一次性", async () => {
+await check("讨论续接：回执一直不来时，等待窗口过后仍能新开，不会把按钮锁死", async () => {
+  // 引擎稍后才 announce 时 resolve 的 sessionId 是 null（文档明写）。
+  // 这期间再点会被挡住——但不能永远挡住：回执可能永远不来（旧宿主、
+  // 用户中途关会话）。窗口过后必须放手，否则这个仓库的按钮永久不可用。
   const original = ctx.sessions.startRun;
-  // 引擎稍后才 announce 时 resolve 的 sessionId 是 null（文档明写），
-  // 这条路径必须能继续用，否则这个仓库第二次点就报错。
   ctx.sessions.startRun = async (def) => {
     sessionStarts.push(def);
     return { runId: "srun-null", sessionId: null };
   };
   sessionStarts.length = 0;
   const inst = await freshTabInstance(() => ({}));
+  // 只把 Date.now 往前拨，不碰 setTimeout：窗口是惰性判定的。
+  const realNow = Date.now;
   try {
     inst.click("beta/two");
     assert.ok(await waitFor(() => sessionStarts.length === 1));
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+
     inst.click("beta/two");
-    assert.ok(await waitFor(() => sessionStarts.length === 2), "第二次仍应能开会话");
+    assert.ok(await waitFor(() => inst.text().includes("还在建立中")), "窗口内应挡住");
+    assert.equal(sessionStarts.length, 1, "窗口内不该再开");
+
+    const later = realNow() + 120000;
+    Date.now = () => later;
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 2), "窗口过后应能再开");
     assert.ok(!sessionStarts[1].sessionId, "没有 id 时退回新开");
   } finally {
+    Date.now = realNow;
     ctx.sessions.startRun = original;
     inst.dispose();
   }
@@ -2898,7 +3261,7 @@ await check("start 期间切视图，同样不会留下孤儿进程", async () =
   findByText(render(), "生成解读").props.onClick();
   await sleep(40);
   const before = agentInterrupts.length;
-  const risingChip = findByText(render(), "新星库（7 天）");
+  const risingChip = findByText(render(), "新星库");
   assert.ok(risingChip, "应有新星库按钮");
   risingChip.props.onClick();
   assert.ok(
@@ -2924,7 +3287,7 @@ await check("首次抓取时显示骨架屏与转圈，不再是空屏", async (
 
   trendingDelay = 200;
   // 切一次视图再切回来：会清空列表并重新抓取，等于首次加载的观感
-  findByText(render(), "新星库（7 天）").props.onClick();
+  findByText(render(), "新星库").props.onClick();
   await waitFor(() => textOf(render()).includes("fresh repo"));
   findByText(render(), "Trending").props.onClick();
 
