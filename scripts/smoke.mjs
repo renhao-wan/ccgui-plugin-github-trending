@@ -252,7 +252,10 @@ const agentStarts = [];
 const agentInterrupts = [];
 /** sessions.startRun 的入参；讨论功能的核心断言对象。 */
 const sessionStarts = [];
+/** sessions.selectSession 的入参：打开已有会话（不跑模型）走这条。 */
+const sessionSelects = [];
 let sessionStartError = null;
+let sessionSelectError = null;
 /**
  * 宿主的侧栏工作区表。宿主只扫「已登记工作区」对应的会话目录，所以这张表
  * 是「会话能不能出现在侧栏」的前提。初始放入 pickedWorkspaceDir，模拟
@@ -479,6 +482,13 @@ const ctx = {
       sessionStarts.push(def);
       if (sessionStartError) throw sessionStartError;
       return { runId: "srun-" + sessionStarts.length, sessionId: "sess-" + sessionStarts.length };
+    },
+    // 打开一个**已有**会话：宿主侧只是切视图，不跑模型、不花 token。
+    // 插件的「再点一次讨论」就该走这里，而不是再 startRun 一轮。
+    selectSession: async (engine, sessionId, workspacePath) => {
+      sessionSelects.push({ engine, sessionId, workspacePath });
+      if (sessionSelectError) throw sessionSelectError;
+      return true;
     },
     interruptRun: async () => {},
     refresh: async () => {
@@ -852,6 +862,43 @@ await check("生成解读：按 runId 过滤、流式写入", async () => {
   );
 });
 
+await check("生成解读：复用同一条后台会话，不再每次新开", async () => {
+  // 每点一次解读就新开一条会话，侧栏会被「只读、写过一次就没人再看」的
+  // 会话塞满。这里验证：第一次新开并把 id 落盘，第二次带上它。
+  const original = ctx.agent.start;
+  const seen = [];
+  let n = 0;
+  ctx.agent.start = async (opts) => {
+    seen.push(opts);
+    n += 1;
+    const runId = "digest-run-" + n;
+    // 复刻真实宿主的事件流：订阅者靠 runId 对上号，正文也是流式推过来的。
+    setTimeout(() => {
+      emit({ runId, kind: "delta", data: "## 今天在热什么\n\n测试解读正文" });
+      emit({ runId, kind: "done", data: null });
+    }, 10);
+    return { runId, sessionId: "digest-" + n };
+  };
+  const saved = {};
+  const inst = await freshTabInstance(() => ({}), (k, v) => {
+    if (k === "settings") Object.assign(saved, v);
+  });
+  try {
+    inst.clickDigest();
+    assert.ok(await waitFor(() => seen.length === 1), "第一次应起一轮");
+    assert.ok(!seen[0].sessionId, "第一次没有可复用 id");
+    assert.ok(await waitFor(() => saved.digestSessionId === "digest-1"), "应把会话 id 落盘");
+    assert.ok(await waitFor(() => inst.text().includes("测试解读正文")));
+
+    inst.clickDigest();
+    assert.ok(await waitFor(() => seen.length === 2), "第二次应再起一轮");
+    assert.equal(seen[1].sessionId, "digest-1", "第二次应复用同一条会话");
+  } finally {
+    ctx.agent.start = original;
+    inst.dispose();
+  }
+});
+
 await check("解读正文渲染成 Markdown，表格变成真表格", async () => {
   const tree = render();
   let digest = null;
@@ -928,14 +975,16 @@ function discussButtonFor(tree, repo) {
  * 必须各起一个实例，否则前一条留下的 sessionId 会让后一条断言的「第一次应
  * 新开」直接失败。
  */
-async function freshTabInstance(storageGet) {
+async function freshTabInstance(storageGet, storageSet) {
   const fresh = await import(PLUGIN + "?fresh=" + Date.now() + Math.random().toString(36).slice(2));
   let tab = null;
   const dispose = fresh.default(
     Object.assign({}, ctx, {
       storage: {
         get: async (k) => (k === "settings" ? storageGet() : null),
-        set: async () => {},
+        set: async (k, v) => {
+          if (storageSet) storageSet(k, v);
+        },
         delete: async () => {},
       },
       ui: Object.assign({}, ctx.ui, {
@@ -959,6 +1008,14 @@ async function freshTabInstance(storageGet) {
     click(repo) {
       const btn = discussButtonFor(renderFresh(tab.component, {}), repo);
       assert.ok(btn, "应有 " + repo + " 的讨论按钮");
+      btn.props.onClick();
+    },
+    button(repo) {
+      return discussButtonFor(renderFresh(tab.component, {}), repo);
+    },
+    clickDigest() {
+      const btn = findByText(renderFresh(tab.component, {}), "生成解读");
+      assert.ok(btn, "应有生成解读按钮");
       btn.props.onClick();
     },
     text() {
@@ -1381,33 +1438,48 @@ await check("复制 Markdown：剪贴板不可用时报失败，不静默", asyn
 
 await check("开会话期间按钮显示打开中，避免连点开出多个会话", async () => {
   sessionStarts.length = 0;
+  sessionSelects.length = 0;
   sessionStartError = null;
-  // 让 startRun 挂住，观察中间态
+  // 让 startRun 挂住，观察中间态。必须用独立实例：主实例上的 beta/two
+  // 前面已经开过会话，第二次点击会走「直接打开」那条路，观察不到中间态。
   const gated = [];
   const original = ctx.sessions.startRun;
+  const inst = await freshTabInstance(() => ({}));
   ctx.sessions.startRun = async (def) => {
     sessionStarts.push(def);
     await new Promise((r) => gated.push(r));
     return { runId: "srun-x", sessionId: null };
   };
-  discussButtonFor(render(), "beta/two").props.onClick();
-  assert.ok(await waitFor(() => sessionStarts.length === 1), "应开始开会话");
-  assert.ok(await waitFor(() => textOf(render()).includes("打开中")), "按钮应显示打开中");
-  // 别的行这时应该被禁用
-  const other = discussButtonFor(render(), "alpha/one");
-  assert.equal(other.props.disabled, true, "别的行在开会话期间应禁用");
-  for (const r of gated) r();
-  ctx.sessions.startRun = original;
-  assert.ok(await waitFor(() => !textOf(render()).includes("打开中")), "完成后应复位");
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1), "应开始开会话");
+    assert.ok(await waitFor(() => inst.text().includes("打开中")), "按钮应显示打开中");
+    // 别的行这时应该被禁用
+    assert.equal(inst.button("alpha/one").props.disabled, true, "别的行在开会话期间应禁用");
+    for (const r of gated) r();
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")), "完成后应复位");
+  } finally {
+    ctx.sessions.startRun = original;
+    inst.dispose();
+  }
 });
 
 await check("开会话失败时说明原因，不静默吞掉", async () => {
   sessionStartError = new Error("missing permission host:session");
   sessionStarts.length = 0;
-  discussButtonFor(render(), "beta/two").props.onClick();
-  assert.ok(await waitFor(() => textOf(render()).includes("缺少会话权限")), "应给人看得懂的提示");
-  assert.ok(findByText(render(), "讨论"), "按钮应回到可点状态");
-  sessionStartError = null;
+  sessionSelects.length = 0;
+  const inst = await freshTabInstance(() => ({}));
+  try {
+    inst.click("beta/two");
+    assert.ok(
+      await waitFor(() => inst.text().includes("缺少会话权限")),
+      "应给人看得懂的提示",
+    );
+    assert.ok(inst.button("beta/two"), "按钮应回到可点状态");
+  } finally {
+    sessionStartError = null;
+    inst.dispose();
+  }
 });
 
 await check("宿主没有 sessions 时按钮给出升级提示", async () => {
@@ -1426,25 +1498,31 @@ await check("宿主没有 sessions 时按钮给出升级提示", async () => {
 await check("开会话成功后回执会话去了侧栏，并说明本页不跳转", async () => {
   sessionStartError = null;
   sessionStarts.length = 0;
-  discussButtonFor(render(), "beta/two").props.onClick();
-  // 成功了却一声不响，用户会以为按钮没反应，进而连点开出好几轮真 token。
-  assert.ok(
-    await waitFor(() => textOf(render()).includes("已在侧栏为 beta/two 开了会话")),
-    "应回执会话已开",
-  );
-  assert.match(textOf(render()), /不会自动跳转/, "要说明本页不跳转");
+  sessionSelects.length = 0;
+  const inst = await freshTabInstance(() => ({}));
+  try {
+    inst.click("beta/two");
+    // 成功了却一声不响，用户会以为按钮没反应，进而连点开出好几轮真 token。
+    assert.ok(
+      await waitFor(() => inst.text().includes("已在侧栏为 beta/two 开了会话")),
+      "应回执会话已开",
+    );
+    assert.match(inst.text(), /不会自动跳转/, "要说明本页不跳转");
 
-  // 再点另一行：上一条回执必须先收掉，否则页面会同时声称两个会话都在等。
-  discussButtonFor(render(), "alpha/one").props.onClick();
-  assert.ok(
-    await waitFor(() => textOf(render()).includes("已在侧栏为 alpha/one 开了会话")),
-    "应换成新的一条回执",
-  );
-  assert.ok(!textOf(render()).includes("beta/two 开了会话"), "旧回执应被替换");
+    // 再点另一行：上一条回执必须先收掉，否则页面会同时声称两个会话都在等。
+    inst.click("alpha/one");
+    assert.ok(
+      await waitFor(() => inst.text().includes("已在侧栏为 alpha/one 开了会话")),
+      "应换成新的一条回执",
+    );
+    assert.ok(!inst.text().includes("beta/two 开了会话"), "旧回执应被替换");
 
-  // 刷新是用户明确表示的「再来一次」，回执要让位给榜单本身的状态说明。
-  findByText(render(), "刷新").props.onClick();
-  assert.ok(await waitFor(() => !textOf(render()).includes("已在侧栏")), "刷新后回执应消失");
+    // 刷新是用户明确表示的「再来一次」，回执要让位给榜单本身的状态说明。
+    findByText(inst.tree(), "刷新").props.onClick();
+    assert.ok(await waitFor(() => !inst.text().includes("已在侧栏")), "刷新后回执应消失");
+  } finally {
+    inst.dispose();
+  }
 });
 
 await check("生成中刷新榜单，停止按钮仍然点得动", async () => {
@@ -1837,6 +1915,10 @@ function dropdownFor(node, label) {
 const isOpen = (node) => Boolean(node && /(?:^|\s)is-open(?:\s|$)/.test(String(node.props.className)));
 
 await check("设置页：分节布局，改动自动保存", async () => {
+  // 先清掉磁盘上的设置：前面的讨论用例会把会话表写回 settings 落盘，
+  // 留着的话 `kv.has("settings")` 一开始就为真，读到的是那次写入的那份，
+  // 于是根本等不到防抖保存，断言比的是旧值。
+  kv.delete("settings");
   renderFresh(settingsDef.component, {}, { effects: true });
   await waitFor(() => textOf(renderFresh(settingsDef.component)).includes("中文解读"));
 
@@ -2184,34 +2266,37 @@ await check("开会话挂住时会在 30 秒后放手并说明原因", async () 
   assert.equal(discussButtonFor(render(), "alpha/one").props.disabled, false, "别的行也应解除禁用");
 });
 
-await check("讨论续接：同一份榜单里再点同一行，带上上次的 sessionId", async () => {
+await check("讨论续接：同一份榜单里再点同一行，直接打开已有会话而不是再跑一轮", async () => {
   sessionStarts.length = 0;
+  sessionSelects.length = 0;
   const inst = await freshTabInstance(() => ({}));
   try {
     // 宿主契约：startRun resolve { runId, sessionId }。第一次拿到 sess-1，
-    // 第二次必须把它带回去——那是「接着上次话题」的唯一凭据。
+    // 第二次要**打开**它（selectSession）——再 startRun 一轮会白烧一次推理，
+    // 而且用户要的只是「接着上次聊」。
     inst.click("beta/two");
     assert.ok(await waitFor(() => sessionStarts.length === 1));
     assert.ok(!sessionStarts[0].sessionId, "第一次应新开会话");
-    // 续接用的是 startRun **返回值**里的 sessionId（入参此时本来就没有），
-    // 假宿主按契约回 sess-<n>。
-    const firstId = "sess-1";
-
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+
     inst.click("beta/two");
-    assert.ok(await waitFor(() => sessionStarts.length === 2), "应再开一次");
-    assert.equal(sessionStarts[1].sessionId, firstId, "第二次应续接同一会话");
+    assert.ok(await waitFor(() => sessionSelects.length === 1), "第二次应打开已有会话");
+    assert.equal(sessionStarts.length, 1, "第二次不该再 startRun（不花 token）");
+    assert.equal(sessionSelects[0].sessionId, "sess-1", "应打开同一个 sessionId");
+    assert.equal(sessionSelects[0].engine, "claude");
+    assert.equal(sessionSelects[0].workspacePath, storageDir);
     assert.ok(
-      await waitFor(() => inst.text().includes("续接")),
-      "回执要说清是续接还是新开，否则侧栏多一行少一行用户没法判断",
+      await waitFor(() => inst.text().includes("直接打开")),
+      "回执要说清是「直接打开」还是新开，否则侧栏多一行少一行用户没法判断",
     );
   } finally {
     inst.dispose();
   }
 });
 
-await check("讨论续接：换一行仍然新开，只有同一仓库才续接", async () => {
+await check("讨论续接：换一行仍然新开，只有同一仓库才复用", async () => {
   sessionStarts.length = 0;
+  sessionSelects.length = 0;
   const inst = await freshTabInstance(() => ({}));
   try {
     inst.click("beta/two");
@@ -2219,9 +2304,66 @@ await check("讨论续接：换一行仍然新开，只有同一仓库才续接"
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
     inst.click("alpha/one");
     assert.ok(await waitFor(() => sessionStarts.length === 2));
-    assert.ok(!sessionStarts[1].sessionId, "另一个仓库不该续接到上一行");
-    assert.ok(!inst.text().includes("续接"), "新开的回执不该说续接");
+    assert.ok(!sessionStarts[1].sessionId, "另一个仓库不该复用上一行的会话");
+    assert.equal(sessionSelects.length, 0, "另一个仓库不该 selectSession");
+    assert.ok(!inst.text().includes("直接打开"), "新开的回执不该说打开了旧会话");
   } finally {
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：会话表落盘，重新激活后仍能直接打开", async () => {
+  // 内存表熬不过重装/重激活/宿主重启。只放内存里的话，用户看到的就是
+  // 「每点一次都新开一条」——这正是反馈里的原话。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  const saved = {};
+  let inst = await freshTabInstance(() => ({}), (k, v) => {
+    if (k === "settings") Object.assign(saved, v);
+  });
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    assert.ok(await waitFor(() => saved.discussSessionIds && saved.discussSessionIds["beta/two"] === "sess-1"), "会话 id 应写进设置");
+  } finally {
+    inst.dispose();
+  }
+
+  // 新实例 = 重新激活：只读磁盘上那份设置，内存表是空的。
+  inst = await freshTabInstance(() => saved);
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionSelects.length === 1), "重新激活后应直接打开旧会话");
+    assert.equal(sessionSelects[0].sessionId, "sess-1");
+    assert.equal(sessionStarts.length, 1, "不该再 startRun");
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：打开旧会话失败时退回新开，并清掉失效 id", async () => {
+  // 会话可能已被归档/删除，或宿主换了版本不再认这个 id。不能让按钮变成
+  // 「一点就报错」的死路，也不能把那个 id 一直留着。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  const saved = { discussSessionIds: { "beta/two": "sess-gone" } };
+  sessionSelectError = new Error("session not found");
+  let lastSaved = null;
+  const inst = await freshTabInstance(() => saved, (k, v) => {
+    if (k === "settings") lastSaved = v;
+  });
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1), "打开失败应退回新开");
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    // 失效 id 必须被换掉；新开成功后会写成新拿到的那个。
+    assert.ok(
+      await waitFor(() => lastSaved && lastSaved.discussSessionIds["beta/two"] === "sess-1"),
+      "失效 id 应被换成新会话",
+    );
+  } finally {
+    sessionSelectError = null;
     inst.dispose();
   }
 });
@@ -2273,8 +2415,9 @@ await check("讨论续接：刷新榜单后不再续接（新话题配新上下�
   }
 });
 
-await check("续接策略 always：刷新榜单后仍然接着聊", async () => {
+await check("续接策略 always：刷新榜单后仍然直接打开旧会话", async () => {
   sessionStarts.length = 0;
+  sessionSelects.length = 0;
   const inst = await freshTabInstance(() => ({ resumeMode: "always" }));
   try {
     inst.click("beta/two");
@@ -2289,8 +2432,9 @@ await check("续接策略 always：刷新榜单后仍然接着聊", async () => 
     }, 3000));
 
     inst.click("beta/two");
-    assert.ok(await waitFor(() => sessionStarts.length === 2));
-    assert.equal(sessionStarts[1].sessionId, "sess-1", "always 模式下换榜单也要续接");
+    assert.ok(await waitFor(() => sessionSelects.length === 1), "always 模式下换榜单也要打开旧会话");
+    assert.equal(sessionSelects[0].sessionId, "sess-1");
+    assert.equal(sessionStarts.length, 1, "always 模式下不该再 startRun");
   } finally {
     inst.dispose();
   }
@@ -2298,6 +2442,7 @@ await check("续接策略 always：刷新榜单后仍然接着聊", async () => 
 
 await check("续接策略 never：同一份榜单里也每次新开", async () => {
   sessionStarts.length = 0;
+  sessionSelects.length = 0;
   const inst = await freshTabInstance(() => ({ resumeMode: "never" }));
   try {
     inst.click("beta/two");
@@ -2305,14 +2450,15 @@ await check("续接策略 never：同一份榜单里也每次新开", async () =
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
     inst.click("beta/two");
     assert.ok(await waitFor(() => sessionStarts.length === 2));
-    assert.ok(!sessionStarts[1].sessionId, "never 模式下不该续接");
-    assert.ok(!inst.text().includes("续接"), "回执不该说续接");
+    assert.ok(!sessionStarts[1].sessionId, "never 模式下不该复用");
+    assert.equal(sessionSelects.length, 0, "never 模式下不该 selectSession");
+    assert.ok(!inst.text().includes("直接打开"), "回执不该说打开了旧会话");
   } finally {
     inst.dispose();
   }
 });
 
-await check("设置页：续接策略用下拉，默认是「同一份榜单内续接」", async () => {
+await check("设置页：续接策略用下拉，默认是「同一份榜单内复用」", async () => {
   const fresh = await import(PLUGIN + "?resume=" + Date.now());
   let freshSettings = null;
   const saved = {};
@@ -2344,21 +2490,21 @@ await check("设置页：续接策略用下拉，默认是「同一份榜单内�
     const keep = () => renderKeep(freshSettings.component, {});
     // 默认值；未设置过时不该显示成空
     // 下拉的触发器是 button 但文本在子节点里，用 findTrigger 按 gt-dd-trigger 认。
-    const trigger = findTrigger(keep(), "同一份榜单内续接");
-    assert.ok(trigger, "默认应显示「同一份榜单内续接」");
+    const trigger = findTrigger(keep(), "同一份榜单内复用");
+    assert.ok(trigger, "默认应显示「同一份榜单内复用」");
     assert.match(textOf(keep()), /榜单刷新、换日\/周\/月之后新开/, "应把当前策略的含义写出来");
 
     // 换成 always 并写盘
     trigger.props.onClick();
-    await waitFor(() => isOpen(dropdownFor(keep(), "同一份榜单内续接")));
+    await waitFor(() => isOpen(dropdownFor(keep(), "同一份榜单内复用")));
     // 菜单项是 .gt-dd-item 的 div（不是 button），findByText 认不到。
     let option = null;
     walk(keep(), (n) => {
       if (option) return;
       const c = n.props && n.props.className;
-      if (typeof c === "string" && c.split(/\s+/).includes("gt-dd-item") && textOf(n).includes("总是续接")) option = n;
+      if (typeof c === "string" && c.split(/\s+/).includes("gt-dd-item") && textOf(n).includes("总是复用")) option = n;
     });
-    assert.ok(option, "菜单里应有「总是续接」");
+    assert.ok(option, "菜单里应有「总是复用」");
     option.props.onClick();
     for (let i = 0; i < 60 && saved.resumeMode !== "always"; i += 1) {
       keep();

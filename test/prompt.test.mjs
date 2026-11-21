@@ -162,6 +162,18 @@ test("讨论 prompt 要求先找本地副本，找不到再读远程并说明", 
   assert.match(p, /GitHub Trending weekly 榜（python）/);
 });
 
+test("讨论 prompt 明确禁止 git clone 与写入工作区", () => {
+  // 实测过：只说「找不到就读远程」，模型会执行 git clone，把几百 MB 塞进
+  // 插件自己的数据目录（用户永远不会去清理那里）。必须显式禁止并给出替代。
+  const p = buildDiscussPrompt({ row: discussRow(), view: "trending", period: "daily" });
+  assert.match(p, /不要 git clone/);
+  assert.match(p, /不要下载仓库/);
+  assert.match(p, /不会去清理/);
+  assert.match(p, /移到你的项目目录/);
+  // 只写「不要」而不给出「怎么办」时，模型常常换个方式接着写文件。
+  assert.match(p, /只读远程的公开页面/);
+});
+
 test("讨论 prompt 禁止编造，推测要标出来", () => {
   const p = buildDiscussPrompt({ row: discussRow(), view: "trending", period: "daily", language: "" });
   assert.match(p, /推测/);

@@ -88,6 +88,10 @@ const DEFAULT_SETTINGS = {
   defaultPromptId: "",
   /** 同一个仓库再点一次「讨论」时：session / always / never，见 prompt.mjs 的 RESUME_MODES。 */
   resumeMode: DEFAULT_RESUME_MODE,
+  /** 仓库 → 会话 id 的落盘表。内存表熬不过重装/重启，这份才是「只该有一条会话」的保证。 */
+  discussSessionIds: {},
+  /** 「生成解读」固定复用的后台会话 id；空 = 还没建过。 */
+  digestSessionId: "",
 };
 
 const DEFAULT_STATE = {
@@ -126,6 +130,8 @@ const DEFAULT_STATE = {
   discussWarning: "",
   /** 这次开会话是续接了旧会话还是新开的；空串 = 没开会话。用于回执说明。 */
   discussResumed: false,
+  /** 这次是**直接打开**已有会话（selectSession，不跑模型）；false = 新开或旧宿主续接。 */
+  discussOpened: false,
   /** 这次开会话用的是哪份提示词的名字；空串 = 内置默认。 */
   discussPromptName: "",
   /**
@@ -830,6 +836,7 @@ async function refresh(ctx, options) {
     discussWorkspace: "",
     discussWarning: "",
     discussResumed: false,
+    discussOpened: false,
     discussPromptName: "",
     readmeOpen: "",
     readmeLoading: false,
@@ -1243,6 +1250,11 @@ let discussSeq = 0;
  * 「只要拿得到就接着聊」，那就不能因为换了一份榜单就把 id 扔掉。`session`
  * 模式靠 `discussSessionsStale` 这个标记来区分，而不是靠清空表。
  *
+ * 这张表**要落盘**。只放内存里的话，插件重装 / 重新激活 / 宿主重启之后表就空了，
+ * 用户看到的就是「每点一次都新开一条会话」——而侧栏里明明已经有四五条同一个
+ * 仓库的会话。会话 ID 是宿主给的字符串，不含任何隐私内容，存进 settings 里
+ * （`discussSessionIds`）比让它随着一次重装载入丢失更划算。
+ *
  * sessionId 可能拿不到：`startRun` 文档写明引擎稍后才 announce，此时返回 null。
  * 那条路径存空串（表示「开过但没有 id」），再点时仍然新开——续接是加分项，
  * 拿不到 id 时不能因此让按钮失败。
@@ -1253,32 +1265,73 @@ let discussSessions = new Map();
  *
  * 用标记而不是清空表，是因为「总是续接」模式下换榜单不该丢掉会话。标记只影响
  * `session` 模式，见 shouldResume。
+ *
+ * 注意：**本次激活还没用过讨论时，刷新不算「换榜单」**。插件激活、页签首次
+ * 加载都会走一遍 refresh，若那也算，`session` 模式就永远判定为「榜单已换」，
+ * 落盘的会话 id 一次都用不上——用户看到的就是「不管设置里怎么选，每点一次都
+ * 新开会话」。所以标记由 discussTouched 把着。
  */
 let discussSessionsStale = false;
+/** 本次激活内是否真的用讨论开过/打开过会话；没开过时 stale 语义没有意义。 */
+let discussTouched = false;
+
+/** 落盘上限：一个仓库一个 id，40 条足够覆盖最近几周的扫榜。 */
+const DISCUSS_SESSION_LIMIT = 40;
+
+function normaliseDiscussSessions(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const keys = Object.keys(raw).filter((k) => readmeRepoKey(k));
+  // 只留最近写入的若干条；对象本身没有顺序保证，这里按 key 排序只为结果稳定。
+  for (const k of keys.sort().slice(-DISCUSS_SESSION_LIMIT)) {
+    const v = raw[k];
+    // 空串是有意义的：表示「开过但这个引擎没给 id」，下次仍新开。
+    if (typeof v === "string") out[k] = v;
+  }
+  return out;
+}
+
+/** 把当前表写回设置。失败不报错：这只是省一次重复开会话，不影响主流程。 */
+function persistDiscussSessions(ctx) {
+  const rows = {};
+  for (const [repo, id] of discussSessions) rows[repo] = id;
+  setSettings({ discussSessionIds: rows });
+  return Promise.resolve(ctx.storage.set("settings", store.snap.settings)).catch(() => {});
+}
 
 /** 榜单换了一份。不是清空表——清不清由 resumeMode 决定。 */
 function markDiscussSessionsStale() {
+  // 本次激活内还没用过讨论：这份「换榜单」与上次开会话没有因果关系，
+  // 不该因此把落盘的会话判成不可用。
+  if (!discussTouched) return;
   discussSessionsStale = true;
 }
 
-/** 彻底清空（卸载 / 重新激活时用：那些会话 ID 不一定还有效）。 */
+/**
+ * 彻底清空（卸载 / 重新激活时用）。
+ *
+ * 注意：清的是**内存表**，磁盘上的那份要留着。重新激活后 settings 会把它读回来，
+ * 那才是「同一个仓库只该有一条会话」的保证。
+ */
 function resetDiscussSessions() {
   discussSessions = new Map();
   discussSessionsStale = false;
+  discussTouched = false;
 }
 
 /**
- * 为一行榜单开一个会话。
+ * 为一行榜单打开（或新建）讨论会话。
+ *
+ * 两条完全不同的路径，不能混：
+ *
+ * 1. **已经有这个仓库的会话** → `sessions.selectSession` 直接把侧栏切过去。
+ *    这条路**不花 token**，用户看到的就是「接着上次聊」。这正是用户点第二次
+ *    时期望的行为；用 `startRun` 带上 sessionId 虽然也能续上，但那会真的再跑
+ *    一轮模型——为了「打开一个已有会话」花一次推理，没有道理。
+ * 2. **没有会话** → `startRun` 新建一条，并把返回的 sessionId 落盘记住。
  *
  * 不走 activeDigest 那套「start 在飞时点停止」的状态机：会话一旦建起来就归
  * 宿主聊天托管，插件的责任只有「别开两轮」和「失败要说清楚」。
- *
- * **不会跳转**，这是 API 决定的：`startRun` 只承诺「会话立刻出现在侧栏」，
- * 入参里没有任何切视图的字段。真正切视图的是 `selectSession(engine,
- * sessionId, workspacePath)`，而新会话的 sessionId 从 `startRun` 拿不到可靠值
- * （文档：引擎稍后才 announce 时为 null）。所以这里不硬凑一条「订阅回执再补
- * 跳」的链子——那种延迟跳转会在用户已经切去别处之后把人拽回来。代价是本页
- * 停在原地，由 `discussNotice` 在提示行里说明会话去哪了。
  */
 async function discussRepo(ctx, row) {
   const snap = store.snap;
@@ -1299,6 +1352,7 @@ async function discussRepo(ctx, row) {
     discussWorkspace: "",
     discussWarning: "",
     discussResumed: false,
+    discussOpened: false,
     discussPromptName: "",
   });
   const settings = snap.settings;
@@ -1331,6 +1385,40 @@ async function discussRepo(ctx, row) {
     const models = (entry.models || []).filter((m) => m && typeof m.id === "string" && m.id.trim());
     const model = String(settings.model || "").trim() || (models[0] ? models[0].id : undefined);
 
+    // 已经有这个仓库的会话：直接切过去，不跑模型。
+    // 策略交给 shouldResume：never 时明确要求新开，其余情况优先复用。
+    const known = discussSessions.get(row.repo);
+    const resumable = typeof known === "string" && known !== "";
+    if (shouldResume(settings.resumeMode, discussSessionsStale, resumable) && typeof ctx.sessions.selectSession === "function") {
+      try {
+        await withTimeout(
+          ctx.sessions.selectSession(entry.engine, known, workspace),
+          DISCUSS_TIMEOUT_MS,
+          "会话打开",
+        );
+        if (seq !== discussSeq) return;
+        // 打开成功也算「这份榜单认领过」：后面的点击继续走这条路。
+        discussTouched = true;
+        discussSessionsStale = false;
+        set({
+          discussing: "",
+          discussError: "",
+          discussNotice: row.repo,
+          discussWorkspace: registration.visible ? baseName(workspace) : "",
+          discussWarning: registration.visible ? "" : registration.error,
+          discussResumed: true,
+          discussOpened: true,
+          discussPromptName: "",
+        });
+        return;
+      } catch (error) {
+        // 打开失败（会话被归档/删除、宿主版本变了）不能把按钮卡死：
+        // 落到下面新建一条，并把这个失效的 id 清掉。
+        discussSessions.delete(row.repo);
+        void persistDiscussSessions(ctx);
+      }
+    }
+
     // 设置里可能维护了多份提示词，用选中的那份；没设置过就用内置模板。
     const chosen = pickPrompt(settings.prompts, settings.defaultPromptId);
     const prompt = buildDiscussPrompt({
@@ -1344,18 +1432,20 @@ async function discussRepo(ctx, row) {
       template: chosen.text,
     });
 
-    // 能不能续接由上一步选的策略决定，不写死。拿不到 id（引擎稍后才
-    // announce）时任何策略下都新开：续接是加分项，不能因此让按钮失败。
-    const known = discussSessions.get(row.repo);
-    const resumeId = shouldResume(settings.resumeMode, discussSessionsStale, typeof known === "string" && known !== "")
-      ? known
-      : "";
+    // 走到这里只有两种可能：没有可复用的会话，或者宿主不支持 selectSession。
+    // 后者退回复用式 startRun（会真的再跑一轮），只为兼容旧宿主。
+    const fallbackResume =
+      typeof ctx.sessions.selectSession === "function"
+        ? ""
+        : shouldResume(settings.resumeMode, discussSessionsStale, resumable)
+          ? known
+          : "";
 
     // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。
     // 续接时传 sessionId 会切回那个会话并沿用它的模型/强度（文档明确覆盖会被忽略）。
     const started = await withTimeout(
       ctx.sessions.startRun({
-        sessionId: resumeId || undefined,
+        sessionId: fallbackResume || undefined,
         engine: entry.engine,
         model: model || undefined,
         prompt,
@@ -1369,7 +1459,11 @@ async function discussRepo(ctx, row) {
     // `started.sessionId` 可能为 null——那就存空串，下次照常新开。
     const sessionId = started && typeof started.sessionId === "string" && started.sessionId ? started.sessionId : "";
     discussSessions.set(row.repo, sessionId);
+    // 落盘：内存表熬不过重装/重新激活/宿主重启，而用户的观感是「每点一次
+    // 就多一条会话」。写盘失败不影响这次点击，所以不 await 它的错误。
+    void persistDiscussSessions(ctx);
     // 这份榜单已经「认领」过，后面的点击不再算跨榜单。
+    discussTouched = true;
     discussSessionsStale = false;
 
     // 不跳转这件事必须写在页面上。侧栏多一行对正在扫榜的人是很容易错过的，
@@ -1381,7 +1475,7 @@ async function discussRepo(ctx, row) {
         discussNotice: row.repo,
         discussWorkspace: registration.visible ? baseName(workspace) : "",
         discussWarning: registration.visible ? "" : registration.error,
-        discussResumed: Boolean(resumeId),
+        discussResumed: Boolean(fallbackResume),
         // 用哪份提示词要说出来：用户维护了好几份，回执不写名字就分不清刚才
         // 点的是哪一套要求。内置默认时不显示（那是没有选择的选择）。
         discussPromptName: chosen.id ? chosen.name : "",
@@ -1524,7 +1618,12 @@ async function generateDigest(ctx) {
   session.timer = setTimeout(() => finish(new Error("生成超时")), AGENT_TIMEOUT_MS);
 
   try {
+    // 解读固定复用同一条后台会话：每点一次就新开一条，侧栏（以及宿主的会话库）
+    // 会被一堆「只读、写过一次就没人再看」的会话塞满。传 sessionId 即续接，
+    // 上下文连续反而更好用——上次解读过的榜单这次还认得。
+    // 拿不到 id（旧版本/首轮/会话被删）时传 undefined，宿主新开，返回值再存回去。
     const started = await ctx.agent.start({
+      sessionId: settings.digestSessionId || undefined,
       engine,
       model,
       workspacePath: workspace,
@@ -1535,6 +1634,13 @@ async function generateDigest(ctx) {
     });
     const runId = started && started.runId ? started.runId : null;
     session.runId = runId;
+    // agent.start 可能回 sessionId（有的引擎只回 runId）。拿到就落盘，
+    // 下次续接；拿不到说明宿主不给这条路径，那就保持现状，不硬凑。
+    const startedSessionId =
+      started && typeof started.sessionId === "string" && started.sessionId ? started.sessionId : "";
+    if (startedSessionId && startedSessionId !== settings.digestSessionId) {
+      persistSettings(ctx, { digestSessionId: startedSessionId }).catch(() => {});
+    }
 
     // 用户在 start 期间点了停止 / 切了视图 / 卸载了插件：这一轮已经作废，
     // 但宿主的进程刚起来，必须当场打断。
@@ -1934,6 +2040,7 @@ function Toolbar({ snap, ctx }) {
     discussWorkspace: "",
     discussWarning: "",
     discussResumed: false,
+    discussOpened: false,
     discussPromptName: "",
     readmeOpen: "",
     readmeLoading: false,
@@ -2113,17 +2220,19 @@ function StatusLine({ snap }) {
             h(
               "span",
               null,
-              (snap.discussResumed ? "已在侧栏续接为 " : "已在侧栏为 ") +
-                snap.discussNotice +
-                " " +
-                (snap.discussResumed ? "的会话（接着上次的话题）" : "开了会话"),
+              snap.discussOpened
+                ? "已直接打开 " + snap.discussNotice + " 上次的会话（没有重跑模型）"
+                : (snap.discussResumed ? "已在侧栏续接为 " : "已在侧栏为 ") +
+                    snap.discussNotice +
+                    " " +
+                    (snap.discussResumed ? "的会话（接着上次的话题）" : "开了会话"),
             ),
             h(
               "span",
               { className: "gt-notice-hint" },
               // 说清会话挂在哪个分组下：侧栏工作区一多，光说「在侧栏」等于没说。
               (snap.discussWorkspace ? "分组「" + snap.discussWorkspace + "」· " : "") +
-                "本页不会自动跳转，点侧栏里那一行打开",
+                (snap.discussOpened ? "侧栏已切到这个会话" : "本页不会自动跳转，点侧栏里那一行打开"),
             ),
             // 用户维护了好几份提示词，回执不说名字就分不清刚才用的是哪套要求。
             snap.discussPromptName
@@ -3322,7 +3431,7 @@ function SettingsSection() {
         "div",
         { className: "gt-section-label" },
         h("h2", null, "网络"),
-        h("p", null, "只访问 github.com 与 api.github.com。"),
+        h("p", null, "只访问 github.com、api.github.com 与 raw.githubusercontent.com。"),
       ),
       h(
         "div",
@@ -3958,6 +4067,12 @@ export default function activate(ctx) {
         // 悬空或不存在时回落内置模板（id ""）——它不可删除，所以一定有东西可用。
         const usable = merged.prompts.filter((p) => p.text.trim() !== "");
         if (!usable.some((p) => p.id === merged.defaultPromptId)) merged.defaultPromptId = "";
+        // 会话表从磁盘读回来：内存表在重装/重激活/宿主重启后是空的，只有这份
+        // 落盘的映射能让「已经开过会话的仓库」继续走直接打开那条路。
+        merged.discussSessionIds = normaliseDiscussSessions(merged.discussSessionIds);
+        merged.digestSessionId =
+          typeof merged.digestSessionId === "string" ? merged.digestSessionId.trim() : "";
+        discussSessions = new Map(Object.entries(merged.discussSessionIds));
         set({ settings: merged });
       }
     } catch {
@@ -4003,6 +4118,7 @@ export default function activate(ctx) {
       discussWorkspace: "",
       discussWarning: "",
       discussResumed: false,
+      discussOpened: false,
       discussPromptName: "",
       readmeOpen: "",
       readmeLoading: false,
