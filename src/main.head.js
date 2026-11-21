@@ -1529,6 +1529,38 @@ async function discussRepo(ctx, row) {
   }
 }
 
+/**
+ * 起一轮解读，并在「带着旧 sessionId 被拒」时清掉 id 重开一次。
+ *
+ * 宿主对已删除/不属于当前工作区的 sessionId 是直接拒绝整轮，不会帮你新开。
+ * 只重试一次、且只对带 id 的那次生效——没有 id 还失败说明是别的原因，
+ * 重试只会把真实错误盖成 timeout。
+ *
+ * @returns {Promise<{ runId?: string, sessionId?: string }>}
+ */
+async function startDigestRun(ctx, entry, model, workspace, prompt, resumeId) {
+  const once = (sessionId) =>
+    ctx.agent.start({
+      sessionId: sessionId || undefined,
+      engine: entry.engine,
+      model,
+      workspacePath: workspace,
+      prompt,
+      // 宿主里 claude 不支持隔离只读，传 true 会被整轮拒绝（不是降级）。
+      // 只有 catalog 明确声明支持的引擎（Pi、Codex 规划）才请求只读。
+      readOnly: supportsReadOnly(entry),
+    });
+
+  if (!resumeId) return once("");
+  try {
+    return await once(resumeId);
+  } catch (error) {
+    // 清掉这条失效记录，下一轮才不会又拿着它去撞。写盘失败不影响本轮。
+    persistSettings(ctx, { digestSessionId: "" }).catch(() => {});
+    return await once("");
+  }
+}
+
 async function generateDigest(ctx) {
   const snap = store.snap;
   if (snap.repos.length === 0) {
@@ -1657,17 +1689,13 @@ async function generateDigest(ctx) {
     // 解读固定复用同一条后台会话：每点一次就新开一条，侧栏（以及宿主的会话库）
     // 会被一堆「只读、写过一次就没人再看」的会话塞满。传 sessionId 即续接，
     // 上下文连续反而更好用——上次解读过的榜单这次还认得。
-    // 拿不到 id（旧版本/首轮/会话被删）时传 undefined，宿主新开，返回值再存回去。
-    const started = await ctx.agent.start({
-      sessionId: settings.digestSessionId || undefined,
-      engine,
-      model,
-      workspacePath: workspace,
-      prompt: built.prompt,
-      // 宿主里 claude 不支持隔离只读，传 true 会被整轮拒绝（不是降级）。
-      // 只有 catalog 明确声明支持的引擎（Pi、Codex 规划）才请求只读。
-      readOnly: supportsReadOnly(entry),
-    });
+    //
+    // 复用有两层兜底，缺一层就会把用户卡死：
+    // 1. 没有 id（首轮/旧版本）→ 不传，宿主新开；
+    // 2. **id 失效**（用户把那条会话删了 / 换了工作区）→ 宿主会直接拒绝整轮。
+    //    这时必须清掉 id 再新开一次，否则之后**每一次**解读都失败，而界面上
+    //    只有一句看不懂的报错。第二层只在「带 id 的那次」生效，不会掩盖真实错误。
+    const started = await startDigestRun(ctx, entry, model, workspace, built.prompt, settings.digestSessionId);
     const runId = started && started.runId ? started.runId : null;
     session.runId = runId;
     // agent.start 可能回 sessionId（有的引擎只回 runId）。拿到就落盘，
@@ -1677,7 +1705,6 @@ async function generateDigest(ctx) {
     if (startedSessionId && startedSessionId !== settings.digestSessionId) {
       persistSettings(ctx, { digestSessionId: startedSessionId }).catch(() => {});
     }
-
     // 用户在 start 期间点了停止 / 切了视图 / 卸载了插件：这一轮已经作废，
     // 但宿主的进程刚起来，必须当场打断。
     if (session.cancelled || seq !== digestSeq) {

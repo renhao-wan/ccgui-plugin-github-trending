@@ -899,6 +899,45 @@ await check("生成解读：复用同一条后台会话，不再每次新开", a
   }
 });
 
+await check("生成解读：旧会话被删时清掉 id 重开，不会每次都失败", async () => {
+  // 宿主对已删除的 sessionId 是直接拒绝整轮，不会帮你新开。没有这层兜底的话，
+  // 用户在侧栏删掉那条解读会话之后，**每一次**点「生成解读」都会报错，
+  // 而界面上只有一句看不懂的话。
+  const original = ctx.agent.start;
+  const calls = [];
+  let n = 0;
+  ctx.agent.start = async (opts) => {
+    calls.push(opts);
+    if (opts.sessionId === "digest-gone") throw new Error("session not found: digest-gone");
+    n += 1;
+    const runId = "digest-run-" + n;
+    setTimeout(() => {
+      emit({ runId, kind: "delta", data: "## 今天在热什么\n\n测试解读正文" });
+      emit({ runId, kind: "done", data: null });
+    }, 10);
+    return { runId, sessionId: "digest-" + n };
+  };
+  const saved = {};
+  const inst = await freshTabInstance(
+    () => ({ digestSessionId: "digest-gone" }),
+    (k, v) => {
+      if (k === "settings") Object.assign(saved, v);
+    },
+  );
+  try {
+    inst.clickDigest();
+    assert.ok(await waitFor(() => calls.length === 2), "应带旧 id 试一次、失败后不带 id 再来一次");
+    assert.equal(calls[0].sessionId, "digest-gone");
+    assert.ok(!calls[1].sessionId, "重试应不带 sessionId");
+    // 关键是能真的出结果，而不是停在报错
+    assert.ok(await waitFor(() => inst.text().includes("测试解读正文")), "重试后应正常生成");
+    assert.ok(await waitFor(() => saved.digestSessionId === "digest-1"), "应把新 id 落盘");
+  } finally {
+    ctx.agent.start = original;
+    inst.dispose();
+  }
+});
+
 await check("解读正文渲染成 Markdown，表格变成真表格", async () => {
   const tree = render();
   let digest = null;
