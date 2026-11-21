@@ -27,6 +27,12 @@ const AGENT_TIMEOUT_MS = 120000;
  * startRun 只是 spawn，不包含推理，30s 足够；超时后用户可以直接再点一次。
  */
 const DISCUSS_TIMEOUT_MS = 30000;
+/**
+ * 登记侧栏工作区的超时。这只是宿主本地的一张表，正常几十毫秒就回来了；给它
+ * 10s 是为了不让一个卡住的 IPC 把「讨论」按钮一直挂在「打开中」——超时后照常
+ * 开会话，只在回执里说明会话可能不在侧栏显示。
+ */
+const WORKSPACE_REGISTER_TIMEOUT_MS = 10000;
 const TRENDING_TEXT_LIMIT = 2_000_000;
 
 /**
@@ -84,6 +90,10 @@ const DEFAULT_STATE = {
    * 所以「已经开了」这件事必须由页面说出来，否则点完跟没点一样。
    */
   discussNotice: "",
+  /** 会话实际挂在哪个侧栏工作区分组下（目录名）；空串 = 没登记成功。 */
+  discussWorkspace: "",
+  /** 会话建起来了、但没挂进侧栏工作区时的说明。不阻塞会话，只解释为什么可能看不见。 */
+  discussWarning: "",
   catalog: [],
   catalogLoaded: false,
   modelsLoading: false,
@@ -448,6 +458,8 @@ async function refresh(ctx, options) {
     errorKind: "",
     discussError: "",
     discussNotice: "",
+    discussWorkspace: "",
+    discussWarning: "",
   });
 
   let result;
@@ -543,6 +555,80 @@ async function pluginDataDir(ctx) {
  */
 async function resolveWorkspace(ctx, settings) {
   return pickWorkspace(settings, await pluginDataDir(ctx));
+}
+
+/** 用于比较的两个路径是否指向同一个目录：大小写、分隔符、尾部分隔符都不敏感。 */
+function samePathKey(p) {
+  return String(p || "")
+    .trim()
+    .replace(/[\\/]+$/, "")
+    .replace(/\//g, "\\")
+    .toLowerCase();
+}
+
+/** 侧栏分组名：宿主用目录名命名工作区，回执里照实说，用户才好去侧栏找。 */
+function baseName(p) {
+  const s = String(p || "").trim().replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("\\"), s.lastIndexOf("/"));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+let workspaceRegistrations = new Map();
+
+/**
+ * 确保会话所在目录已经是宿主的侧栏工作区——「点了讨论，侧栏却没有会话」的根因修复。
+ *
+ * 宿主扫描会话目录时以工作区表为起点：`~/.claude/projects/<编码路径>/` 里写了
+ * 多少 jsonl 都没用，只要对应目录不在侧栏工作区里，宿主就不会把它收进会话表，
+ * 侧栏自然看不见（本机实测：所有已登记工作区的会话都在表里，plugin-data 下的
+ * 会话一条都没有，但 jsonl 明明写得好好的）。
+ *
+ * 所以开会话前先登记工作目录。副作用是该目录会以目录名出现在侧栏工作区列表里，
+ * 这恰好是「会话挂在哪个工作区下」的可见形式，用户随时可以在侧栏移除。
+ *
+ * 失败不阻断会话：宿主版本没有 workspaces API、权限没到位、或登记被拒时，仍照常
+ * startRun，由调用方把「可能看不见」写进回执——按钮不能假死。
+ *
+ * 同一路径登记成功后就记住：不必每点一行都再查一遍列表；失败的不缓存，
+ * 下次点击还会重试（偶发 IPC 失败不该让本页从此都看不见会话）。
+ */
+async function ensureWorkspaceRegistered(ctx, workspace) {
+  const key = samePathKey(workspace);
+  if (!key) return { visible: false, error: "" };
+  const cached = workspaceRegistrations.get(key);
+  if (cached) return cached;
+  const remember = (result) => {
+    if (result.visible) workspaceRegistrations.set(key, result);
+    return result;
+  };
+  if (!ctx || !ctx.workspaces || typeof ctx.workspaces.add !== "function") {
+    return { visible: false, error: "当前宿主不支持登记侧栏工作区，会话可能不会出现在侧栏" };
+  }
+  try {
+    if (typeof ctx.workspaces.list === "function") {
+      const rows = await withTimeout(ctx.workspaces.list(), WORKSPACE_REGISTER_TIMEOUT_MS, "工作区列表");
+      const listed = (Array.isArray(rows) ? rows : []).some(
+        (r) => r && samePathKey(r.path || r.workspacePath || r.dir) === key,
+      );
+      if (listed) return remember({ visible: true, error: "" });
+    }
+    await withTimeout(ctx.workspaces.add(workspace), WORKSPACE_REGISTER_TIMEOUT_MS, "登记工作区");
+    // 新登记的工作区宿主还没扫过。补一次会话目录刷新：之前点过「讨论」、
+    // jsonl 已经落盘但没进侧栏的会话能立刻找回来。startRun 建的新会话
+    // 不依赖这次刷新（文档写明会立即出现在侧栏），所以这里不等待、失败也不报。
+    if (ctx.sessions && typeof ctx.sessions.refresh === "function") {
+      void Promise.resolve(ctx.sessions.refresh()).catch(() => {});
+    }
+    return remember({ visible: true, error: "" });
+  } catch (error) {
+    // 用原始 message 判权限：messageOf 会把 missing permission 归到网络那一套，
+    // 这里的失败是 manifest 权限，不是网络授权。
+    const raw = error && error.message ? String(error.message) : String(error || "");
+    const hint = /host:workspace|permission|not declared/i.test(raw)
+      ? "缺少登记工作区的权限，请重新安装插件（manifest 已声明 host:workspace）"
+      : "登记侧栏工作区失败：" + messageOf(error);
+    return remember({ visible: false, error: hint });
+  }
 }
 
 /** 界面展示统一用本机分隔符；传给宿主与存储的仍是原始路径。 */
@@ -767,7 +853,7 @@ async function discussRepo(ctx, row) {
   const seq = ++discussSeq;
   // 新的一轮先把上一条「已开会话」提示收掉：否则连续点两行，页面会同时说
   // 两个仓库都开了会话，而实际只留了最后那条。
-  set({ discussing: row.repo, discussError: "", discussNotice: "" });
+  set({ discussing: row.repo, discussError: "", discussNotice: "", discussWorkspace: "", discussWarning: "" });
   const settings = snap.settings;
   const bailed = (message) => {
     if (seq === discussSeq) set({ discussing: "", discussError: message });
@@ -778,6 +864,11 @@ async function discussRepo(ctx, row) {
     if (seq !== discussSeq) return;
     // 工作目录是会话的 cwd，拿不到就没法保证 agent 在哪读文件。
     if (!workspace) return bailed("读不到插件数据目录，请到设置里点「选择…」指定一个 AI 工作区");
+
+    // 会话要出现在侧栏，前提是它挂在一个宿主已登记的工作区下。不登记就
+    // startRun，jsonl 会照写、进程会照跑，但侧栏里一条都看不到——先登记再开会话。
+    const registration = await ensureWorkspaceRegistered(ctx, workspace);
+    if (seq !== discussSeq) return;
 
     // 引擎目录可能还没加载（用户直接从页签点进来看榜单）。
     if (!store.snap.catalogLoaded) {
@@ -815,7 +906,14 @@ async function discussRepo(ctx, row) {
     );
     // 不跳转这件事必须写在页面上。侧栏多一行对正在扫榜的人是很容易错过的，
     // 不给提示就会被理解成「按钮没反应」，进而连点，多开一轮真 token。
-    if (seq === discussSeq) set({ discussing: "", discussError: "", discussNotice: row.repo });
+    if (seq === discussSeq)
+      set({
+        discussing: "",
+        discussError: "",
+        discussNotice: row.repo,
+        discussWorkspace: registration.visible ? baseName(workspace) : "",
+        discussWarning: registration.visible ? "" : registration.error,
+      });
   } catch (error) {
     // 用原始 message 判权限，不要过 messageOf：那边把 "missing permission"
     // 一概当网络授权问题，会把「没装 host:session」误报成「重新安装插件」。
@@ -1096,7 +1194,19 @@ function Toolbar({ snap, ctx }) {
   const onView = (view) => {
     if (view === snap.view) return;
     if (snap.generating) abortDigest(ctx);
-    set({ view, digest: "", digestStopped: false, dropped: [], isFirstRun: true, repos: [], loaded: false, discussError: "", discussNotice: "" });
+    set({
+      view,
+      digest: "",
+      digestStopped: false,
+      dropped: [],
+      isFirstRun: true,
+      repos: [],
+      loaded: false,
+      discussError: "",
+      discussNotice: "",
+      discussWorkspace: "",
+      discussWarning: "",
+    });
     void refresh(ctx, { force: true });
   };
   const onPeriod = (period) => {
@@ -1104,7 +1214,17 @@ function Toolbar({ snap, ctx }) {
     if (snap.generating) abortDigest(ctx);
     setSettings({ period });
     void persistSettings(ctx, { period });
-    set({ loaded: false, repos: [], digest: "", digestStopped: false, dropped: [], discussError: "", discussNotice: "" });
+    set({
+      loaded: false,
+      repos: [],
+      digest: "",
+      digestStopped: false,
+      dropped: [],
+      discussError: "",
+      discussNotice: "",
+      discussWorkspace: "",
+      discussWarning: "",
+    });
     void refresh(ctx, { force: true });
   };
 
@@ -1198,7 +1318,15 @@ function StatusLine({ snap }) {
             "p",
             { className: "gt-notice gt-notice--ok", role: "status" },
             h("span", null, "已在侧栏为 " + snap.discussNotice + " 开了会话"),
-            h("span", { className: "gt-notice-hint" }, "本页不会自动跳转，点侧栏里那一行打开"),
+            h(
+              "span",
+              { className: "gt-notice-hint" },
+              // 说清会话挂在哪个分组下：侧栏工作区一多，光说「在侧栏」等于没说。
+              (snap.discussWorkspace ? "分组「" + snap.discussWorkspace + "」· " : "") +
+                "本页不会自动跳转，点侧栏里那一行打开",
+            ),
+            // 会话真的建起来了，只是没挂进侧栏工作区：不能说成失败，更不能不说。
+            snap.discussWarning ? h("span", { className: "gt-notice-hint" }, snap.discussWarning) : null,
           ),
       // 榜单自己的错误不能被回执顶掉：两件事并列说清楚，别二选一。
       snap.httpError
@@ -2504,6 +2632,9 @@ const CSS = `
 export default function activate(ctx) {
   appCtx = ctx;
   const mySeq = ++activateSeq;
+  // 重新激活时工作区表可能变了（用户在侧栏删过、或换了 AI 工作区），
+  // 上次的「已登记」结论不能直接沿用。
+  workspaceRegistrations = new Map();
 
   const cssDisposer = ctx.theme.injectCss(CSS);
 
@@ -2596,6 +2727,8 @@ export default function activate(ctx) {
       discussing: "",
       discussError: "",
       discussNotice: "",
+      discussWorkspace: "",
+      discussWarning: "",
     });
   };
 

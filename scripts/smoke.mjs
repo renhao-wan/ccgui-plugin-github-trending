@@ -253,6 +253,18 @@ const agentInterrupts = [];
 /** sessions.startRun 的入参；讨论功能的核心断言对象。 */
 const sessionStarts = [];
 let sessionStartError = null;
+/**
+ * 宿主的侧栏工作区表。宿主只扫「已登记工作区」对应的会话目录，所以这张表
+ * 是「会话能不能出现在侧栏」的前提。初始放入 pickedWorkspaceDir，模拟
+ * 「用户已经在设置里选了一个真实工作区」。
+ */
+const registeredWorkspaces = new Set([pickedWorkspaceDir]);
+const workspaceAdds = [];
+/** add 被调用那一刻 sessionStarts 的长度：用来断言「先登记、再开会话」。 */
+const sessionStartsAtAdd = [];
+let workspaceAddError = null;
+/** 登记新工作区后插件应请宿主补扫会话目录（把之前看不见的旧会话找回来）。 */
+let sessionRefreshes = 0;
 const cssCalls = [];
 const eventHandlers = new Set();
 
@@ -391,6 +403,19 @@ const ctx = {
       return { runId: "srun-" + sessionStarts.length, sessionId: "sess-" + sessionStarts.length };
     },
     interruptRun: async () => {},
+    refresh: async () => {
+      sessionRefreshes += 1;
+    },
+  },
+  // 工作区登记：不登记的话宿主不扫这个目录，侧栏里就没有会话。
+  workspaces: {
+    list: async () => Array.from(registeredWorkspaces, (p) => ({ path: p })),
+    add: async (p) => {
+      workspaceAdds.push(p);
+      sessionStartsAtAdd.push(sessionStarts.length);
+      if (workspaceAddError) throw workspaceAddError;
+      registeredWorkspaces.add(p);
+    },
   },
   agent: {
     // 与宿主真实契约一致：PluginAgentCatalogEntry[]
@@ -707,6 +732,12 @@ await check("每行都有讨论入口，点后向 sessions.startRun 开会话而
   // 新会话不带 sessionId，否则会续接到别人的会话上
   assert.ok(!def.sessionId, "新会话不应带 sessionId");
   assert.equal(def.workspacePath, storageDir, "会话 cwd 应是 AI 工作区");
+  // 默认的 AI 工作区是插件数据目录，不在侧栏工作区表里。宿主只扫已登记
+  // 工作区的会话目录——不先登记，会话进程照跑、jsonl 照写，侧栏就是没有。
+  assert.deepEqual(workspaceAdds, [storageDir], "开会话前应把默认工作目录登记成侧栏工作区");
+  assert.equal(sessionStartsAtAdd[0], 0, "登记必须先于 startRun，不能并行");
+  assert.ok(await waitFor(() => sessionRefreshes >= 1), "登记新工作区后应请宿主补扫会话目录");
+  assert.ok(textOf(render()).includes("分组「"), "回执应说明会话挂在哪个侧栏分组下");
 });
 
 await check("讨论会尊重设置里选的工作区", async () => {
@@ -743,7 +774,55 @@ await check("讨论会尊重设置里选的工作区", async () => {
     discussButtonFor(renderFresh(freshTab.component, {}), "beta/two").props.onClick();
     assert.ok(await waitFor(() => sessionStarts.length === 1), "应再次开会话");
     assert.equal(sessionStarts[0].workspacePath, pickedWorkspaceDir, "应使用用户指定的工作区");
+    // 这个目录本来就在侧栏工作区表里，不该再登记一次。
+    assert.deepEqual(workspaceAdds, [storageDir], "已登记的工作区不应重复登记");
   } finally {
+    dispose2();
+  }
+});
+
+await check("登记侧栏工作区失败时不阻断会话，但要说清可能看不见", async () => {
+  // 独立目录 + 独立实例：主实例对 storageDir 的登记已经成功并缓存了。
+  const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), "gt-unreg-"));
+  const picked = { workspacePath: freshDir };
+  const fresh = await import(PLUGIN + "?discuss-noreg=" + Date.now());
+  let freshTab = null;
+  const dispose2 = fresh.default(
+    Object.assign({}, ctx, {
+      storage: {
+        get: async (k) => (k === "settings" ? picked : null),
+        set: async () => {},
+        delete: async () => {},
+      },
+      ui: Object.assign({}, ctx.ui, {
+        registerCenterTab: (d) => {
+          freshTab = d;
+          return () => {};
+        },
+        registerSidebarNav: () => () => {},
+        registerSettingsSection: () => () => {},
+        registerCommand: () => () => {},
+      }),
+    }),
+  );
+  workspaceAddError = new Error("missing permission host:workspace");
+  const addsBefore = workspaceAdds.length;
+  const startsBefore = sessionStarts.length;
+  try {
+    assert.ok(await waitFor(() => !!freshTab, 2000));
+    renderFresh(freshTab.component, {}, { effects: true });
+    assert.ok(await waitFor(() => !!discussButtonFor(renderFresh(freshTab.component, {}), "beta/two"), 2000));
+    discussButtonFor(renderFresh(freshTab.component, {}), "beta/two").props.onClick();
+    // 登记失败只是「侧栏可能看不见」，会话本身必须照开——否则按钮等于坏了。
+    assert.ok(await waitFor(() => sessionStarts.length === startsBefore + 1), "登记失败也应把会话开出来");
+    assert.equal(workspaceAdds.length, addsBefore + 1, "应尝试登记且只尝试一次");
+    assert.equal(sessionStarts[startsBefore].workspacePath, freshDir);
+    assert.ok(
+      await waitFor(() => textOf(renderFresh(freshTab.component, {})).includes("重新安装插件")),
+      "回执应说明是权限问题导致会话可能看不见",
+    );
+  } finally {
+    workspaceAddError = null;
     dispose2();
   }
 });
