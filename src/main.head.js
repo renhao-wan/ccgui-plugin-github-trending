@@ -27,6 +27,7 @@ const AGENT_TIMEOUT_MS = 120000;
  * startRun 只是 spawn，不包含推理，30s 足够；超时后用户可以直接再点一次。
  */
 const DISCUSS_TIMEOUT_MS = 30000;
+
 /**
  * 登记侧栏工作区的超时。这只是宿主本地的一张表，正常几十毫秒就回来了；给它
  * 10s 是为了不让一个卡住的 IPC 把「讨论」按钮一直挂在「打开中」——超时后照常
@@ -96,6 +97,17 @@ const DEFAULT_STATE = {
   discussWarning: "",
   /** 把讨论 prompt 放进输入框（而不是开会话）后的回执；与 discussNotice 互斥。 */
   draftNotice: "",
+  /**
+   * README 预览。同一时刻只展开一个仓库：
+   * `open` 是仓库全名，空串 = 全部收起。
+   */
+  readmeOpen: "",
+  readmeLoading: false,
+  readmeError: "",
+  /** 已处理（去 badge/HTML、截断）的正文；渲染时直接过 Markdown 子集。 */
+  readmeText: "",
+  readmeTruncated: false,
+  readmeTotal: 0,
   catalog: [],
   catalogLoaded: false,
   modelsLoading: false,
@@ -353,6 +365,91 @@ async function fetchRising(settings) {
   return { ok: true, repos: parsed.repos };
 }
 
+/* ---------- README 预览 ---------- */
+
+/**
+ * README 的接口选在 api.github.com 而不是 raw.githubusercontent.com：前者已经在
+ * `network:api.github.com` 的授权里，后者要新增一条网络权限、重装后才生效，而
+ * 换来的只是省一次 API 配额（README 是低频动作，配额不是瓶颈）。设置里的 Token
+ * 也自动复用——私有仓的 README 因此能读。
+ *
+ * `Accept: application/vnd.github.raw` 让接口直接回文件正文而不是 base64 JSON；
+ * 但网关可能无视它，所以 `readmeTextFromBody` 两种形状都认。
+ */
+async function fetchReadme(repo, settings) {
+  const url = "https://api.github.com/repos/" + repo + "/readme";
+  const headers = {
+    Accept: "application/vnd.github.raw",
+    "User-Agent": "ccgui-github-trending",
+  };
+  const token = String((settings && settings.token) || "").trim();
+  if (token) headers.Authorization = "Bearer " + token;
+
+  const res = await httpGet(url, headers);
+  if (res.status === 404) return { ok: false, message: "这个仓库没有 README" };
+  if (res.status === 403 || res.status === 429) {
+    return {
+      ok: false,
+      message: token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（10 次/分钟），可在设置里填 Token",
+    };
+  }
+  if (res.status < 200 || res.status >= 300) return { ok: false, message: "GitHub 返回 HTTP " + res.status };
+
+  const prepared = prepareReadme(readmeTextFromBody(res.body));
+  if (!prepared) return { ok: false, message: "README 是空的" };
+  const clipped = truncateReadme(prepared);
+  return { ok: true, text: clipped.text, truncated: clipped.truncated, total: clipped.total };
+}
+
+/** 只允许「看上去像 GitHub 仓库名」的输入拼进 URL，避免路径注入到别的接口路径上。 */
+function readmeRepoKey(repo) {
+  const s = String(repo || "").trim();
+  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(s) ? s : "";
+}
+
+let readmeSeq = 0;
+
+/**
+ * 展开 / 收起某行的 README。
+ *
+ * 同时只开一个：README 预览占了整行高度，开两个就得滚很远才能回到榜单，
+ * 而用户的动作本身就是「看这一行的 README」。
+ *
+ * 不做「所有展开过的都缓存」：一个会话里翻十几个仓库、每个都常驻一份全文，
+ * 收益抵不上缓存失效判断的复杂度。收起即丢弃，再展开就重拉。
+ */
+async function toggleReadme(ctx, row) {
+  const repo = readmeRepoKey(row && row.repo);
+  if (!repo) return;
+  if (store.snap.readmeOpen === repo) {
+    // 收起：作废在飞的请求，否则回来时会把已经收起的行重新展开。
+    readmeSeq += 1;
+    set({ readmeOpen: "", readmeLoading: false, readmeError: "", readmeText: "", readmeTruncated: false, readmeTotal: 0 });
+    return;
+  }
+  const seq = ++readmeSeq;
+  // 换行展开时先清掉上一份正文：否则新行会短暂显示上一个仓库的 README。
+  set({ readmeOpen: repo, readmeLoading: true, readmeError: "", readmeText: "", readmeTruncated: false, readmeTotal: 0 });
+  try {
+    const result = await fetchReadme(repo, store.snap.settings);
+    if (seq !== readmeSeq) return;
+    if (!result.ok) {
+      set({ readmeLoading: false, readmeError: result.message });
+      return;
+    }
+    set({
+      readmeLoading: false,
+      readmeError: "",
+      readmeText: result.text,
+      readmeTruncated: result.truncated,
+      readmeTotal: result.total,
+    });
+  } catch (error) {
+    if (seq !== readmeSeq) return;
+    set({ readmeLoading: false, readmeError: "读取 README 失败：" + messageOf(error) });
+  }
+}
+
 /* ---------- 快照读写 ---------- */
 
 async function readSnapshot(ctx, period, language) {
@@ -482,6 +579,12 @@ async function refresh(ctx, options) {
     discussWorkspace: "",
     discussWarning: "",
     draftNotice: "",
+    readmeOpen: "",
+    readmeLoading: false,
+    readmeError: "",
+    readmeText: "",
+    readmeTruncated: false,
+    readmeTotal: 0,
   });
 
   let result;
@@ -1198,7 +1301,7 @@ function movementClass(row) {
   return delta > 0 ? " gt-move--up" : " gt-move--down";
 }
 
-function RepoRow({ row, ctx, discussing }) {
+function RepoRow({ row, ctx, discussing, readme }) {
   const h = appCtx.react.createElement;
   const href = safeHref(row.url);
   const movement = movementLabel(row);
@@ -1216,6 +1319,8 @@ function RepoRow({ row, ctx, discussing }) {
   // 态反而会让人以为在等什么，等它复位又是一次没必要的闪动。
   // 唯一要挡的是 opening 期间：那一刻用户按发送，草稿可能刚被另一行覆盖。
   const draftBlocked = Boolean(discussing);
+  // readme 传的是整块快照，展开状态由 readmeOpen 决定——同一时刻只开一行。
+  const readmeOpen = Boolean(readme) && readme.readmeOpen === repoName;
 
   return h(
     "li",
@@ -1246,6 +1351,20 @@ function RepoRow({ row, ctx, discussing }) {
           "button",
           {
             type: "button",
+            className: "gt-btn gt-discuss gt-discuss--lead",
+            onClick: () => void toggleReadme(ctx, row),
+            // 不跟 discussing 联动：读 README 和开会话是两件互不冲突的事，
+            // 唯一要防的是同一时刻开两个 README（那由 readmeOpen 单例保证）。
+            "aria-expanded": readmeOpen ? "true" : "false",
+            title: readmeOpen ? "收起 README" : "就地展开 README，不用跳浏览器",
+            "aria-label": (readmeOpen ? "收起 " : "展开 ") + row.repo + " 的 README",
+          },
+          readmeOpen ? "收起 README" : "README",
+        ),
+        h(
+          "button",
+          {
+            type: "button",
             className: "gt-btn gt-discuss",
             onClick: () => void draftRepo(ctx, row),
             disabled: draftBlocked,
@@ -1258,7 +1377,7 @@ function RepoRow({ row, ctx, discussing }) {
           "button",
           {
             type: "button",
-            className: "gt-btn gt-discuss gt-discuss--start" + (busy ? " gt-discuss--busy" : ""),
+            className: "gt-btn gt-discuss" + (busy ? " gt-discuss--busy" : ""),
             onClick: () => void discussRepo(ctx, row),
             disabled: blocked || busy,
             title: "在 AI 工作区里开一个会话，分析这个项目",
@@ -1282,7 +1401,54 @@ function RepoRow({ row, ctx, discussing }) {
           : null,
         Number.isFinite(row.ageDays) ? h("span", { className: "gt-stat" }, row.ageDays + " 天前创建") : null,
       ),
+      readmeOpen ? h(ReadmePanel, { readme, href }) : null,
     ),
+  );
+}
+
+/**
+ * 行内 README 预览。
+ *
+ * 挂在行内（而不是浮层/新页签）是为了「扫到哪个看哪个」：浮层会盖住榜单，
+ * 关掉之后又是滚回原处，来回两三次人就不看了。
+ *
+ * 正文一律走自写的 Markdown 子集渲染，不拼 HTML——README 是远端不可信内容。
+ */
+function ReadmePanel({ readme, href }) {
+  const h = appCtx.react.createElement;
+  const status = readme.readmeLoading
+    ? h(
+        "p",
+        { className: "gt-readme-note" },
+        h("span", { className: "gt-spinner", "aria-hidden": "true" }),
+        "正在读 README…",
+      )
+    : readme.readmeError
+      ? h("p", { className: "gt-readme-note gt-readme-note--error" }, readme.readmeError)
+      : readme.readmeText
+        ? h(
+            "p",
+            { className: "gt-readme-note" },
+            readme.readmeTruncated
+              ? "只显示前 " + readme.readmeText.length + " 字（共 " + readme.readmeTotal + " 字）"
+              : "README 全文",
+            href
+              ? h(
+                  "a",
+                  { className: "gt-readme-more", href, target: "_blank", rel: "noreferrer noopener" },
+                  "在 GitHub 上查看",
+                )
+              : null,
+          )
+        : null;
+
+  return h(
+    "section",
+    { className: "gt-readme", "aria-busy": readme.readmeLoading ? "true" : "false" },
+    status,
+    readme.readmeText
+      ? h("div", { className: "gt-readme-body" }, renderMarkdown(readme.readmeText))
+      : null,
   );
 }
 
@@ -1340,6 +1506,12 @@ function Toolbar({ snap, ctx }) {
       discussWorkspace: "",
       discussWarning: "",
       draftNotice: "",
+      readmeOpen: "",
+    readmeLoading: false,
+    readmeError: "",
+    readmeText: "",
+    readmeTruncated: false,
+    readmeTotal: 0,
     });
     void refresh(ctx, { force: true });
   };
@@ -1359,6 +1531,12 @@ function Toolbar({ snap, ctx }) {
       discussWorkspace: "",
       discussWarning: "",
       draftNotice: "",
+      readmeOpen: "",
+    readmeLoading: false,
+    readmeError: "",
+    readmeText: "",
+    readmeTruncated: false,
+    readmeTotal: 0,
     });
     void refresh(ctx, { force: true });
   };
@@ -1578,14 +1756,27 @@ function inlineNodes(inlines, keyBase) {
 /**
  * 解析结果缓存。流式输出时每个 delta 都会重渲染整棵解读树，而解析要扫全文；
  * 内容没变（别处 set 触发的重渲染）就不该再解析一遍。
- * 只缓存最后一次：解读面板同一时刻只有一份正文。
+ *
+ * 存最近 4 份而不是 1 份：现在同时有两个 Markdown 消费者（解读正文、行内
+ * README 预览），单槽缓存会互相顶掉——每渲染一次榜单都要重新解析一遍 README。
+ * 4 份足够覆盖「一个展开的 README + 一份解读 + 切换时的过渡」，且总量有上限。
  */
-let mdCache = { text: null, blocks: null };
+const mdCache = new Map();
+const MD_CACHE_LIMIT = 4;
 
 function markdownBlocks(text) {
   const src = String(text || "");
-  if (mdCache.text !== src) mdCache = { text: src, blocks: parseMarkdown(src) };
-  return mdCache.blocks;
+  const hit = mdCache.get(src);
+  if (hit) {
+    // 命中后挪到队尾：Map 保持插入序，删第一个就是删最久没用的。
+    mdCache.delete(src);
+    mdCache.set(src, hit);
+    return hit;
+  }
+  const blocks = parseMarkdown(src);
+  mdCache.set(src, blocks);
+  while (mdCache.size > MD_CACHE_LIMIT) mdCache.delete(mdCache.keys().next().value);
+  return blocks;
 }
 
 /** 块节点 → 元素。表格单独包一层可横向滚动，窄窗口下不会把整页撑宽。 */
@@ -1796,7 +1987,7 @@ function MainTab() {
       "div",
       { className: "gt-scroll" },
       snap.repos.length > 0
-        ? h("ol", { className: "gt-list" }, snap.repos.map((row) => h(RepoRow, { key: row.repo, row, ctx, discussing: snap.discussing })))
+        ? h("ol", { className: "gt-list" }, snap.repos.map((row) => h(RepoRow, { key: row.repo, row, ctx, discussing: snap.discussing, readme: snap })))
         : snap.loading
           ? h(SkeletonList, null)
           : snap.loaded
@@ -2542,16 +2733,16 @@ const CSS = `
 /* 讨论入口：平时压得很轻，不抢仓库名的注意力；悬停/聚焦时才浮起来。
  * 25 行各摆一个显眼按钮会让整个榜显得吵闹，而且误触是一轮真 token。 */
 .gt-discuss {
-  margin-left: auto; flex: none; padding: 2px 9px;
+  flex: none; padding: 2px 9px;
   font-size: 11px; border-radius: 6px; opacity: 0;
   transition: opacity 120ms ease;
 }
+/* 只有最左边那个按钮吃 auto 外边距：三个都写的话余量会被均分，
+ * 悬停时按钮之间空出一大块、整行标题横向抖一下。 */
+.gt-discuss--lead { margin-left: auto; }
 .gt-row:hover .gt-discuss, .gt-row:focus-within .gt-discuss { opacity: 1; }
 .gt-discuss:focus-visible { opacity: 1; }
 .gt-discuss--busy { opacity: 1; }
-/* 两个按钮一起淡入时，「讨论」要压住右边沿。margin-left:auto 只给第一个：
- * 两个都写 auto 会把间距摊成两半，悬停时整行标题会横向抖一下。 */
-.gt-discuss--start { margin-left: 0; }
 .gt-sep { white-space: pre; }
 .gt-move {
   flex: none; font-size: 10.5px; padding: 1px 6px; border-radius: 5px;
@@ -2599,6 +2790,28 @@ const CSS = `
 .gt-digest-wait { color: var(--gt-muted); }
 .gt-digest-body > *:first-child { margin-top: 0; }
 .gt-digest-body > *:last-child { margin-bottom: 0; }
+/* 行内 README：不用强调色左边框，它和「解读」是并列的两块内容，
+ * 左边框会让整页变成两根竖线。 */
+.gt-readme {
+  margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+  background: var(--gt-raised); border: 1px solid var(--gt-border);
+}
+.gt-readme-note {
+  margin: 0 0 8px; display: flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--gt-muted);
+}
+.gt-readme-note--error { color: var(--gt-negative); }
+.gt-readme-more { margin-left: auto; color: var(--gt-accent); }
+/* 正文限高：README 可以很长，展开一整份会把下面十几行榜单推到屏幕外。
+ * 2000 字配这个高度刚好露出开头和结构，剩下的滚一下就够。 */
+.gt-readme-body {
+  max-height: 360px; overflow-y: auto;
+  font-size: 12.5px; line-height: 1.65; word-break: break-word;
+}
+.gt-readme-body > *:first-child { margin-top: 0; }
+.gt-readme-body > *:last-child { margin-bottom: 0; }
+/* README 的一级标题和仓库名重复，而且比行标题还大，压到次要位置。 */
+.gt-readme-body .gt-md-h1 { font-size: 14px; }
 
 /* 解读正文里的 Markdown。只覆盖本插件自己的类名，不影响宿主样式。
  * 正文是 13px，标题梯度要拉到能一眼分节——模型最爱写三级标题，只比正文大
@@ -2875,6 +3088,8 @@ export default function activate(ctx) {
     // 「放入输入框」同理：卸载期间落地的 setDraft 不能往一个已经脱离的 store
     // 里写回执（草稿本身是同步写的，拦不住也不必拦——写入那一刻插件还活着）。
     draftSeq += 1;
+    // README 预览也作废：卸载后回来的 http 响应不能往 store 里写正文。
+    readmeSeq += 1;
     cancelSession(activeDigest, ctx);
     try {
       cssDisposer();
@@ -2895,6 +3110,12 @@ export default function activate(ctx) {
       discussWorkspace: "",
       discussWarning: "",
       draftNotice: "",
+      readmeOpen: "",
+    readmeLoading: false,
+    readmeError: "",
+    readmeText: "",
+    readmeTruncated: false,
+    readmeTotal: 0,
     });
   };
 

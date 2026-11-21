@@ -11,6 +11,7 @@
 - **变化对比**：与上一次成功快照相比，标出「新上榜 ↑ 降位 ↓」并列出掉榜
 - **中文解读**：点「生成解读」才调用模型，读完可自己判断要不要看
 - **单项目讨论**：榜单每一行悬停时出现「讨论」，在 AI 工作区里起一个宿主聊天会话，模型先找本地副本、找不到再读远程；会话出现在侧栏，**本页不会自动跳转**（页面会给出回执，点侧栏那一行打开）。第一次开会话时会把 AI 工作目录登记成侧栏工作区（侧栏随之多出一个以目录名命名的分组），否则宿主的会话表不收这个目录的会话，侧栏里看不见
+- **README 预览**：同一行的「README」就地展开前 2000 字（标题、列表、代码块照常渲染），不用跳浏览器；只显示开头，想看全文点「在 GitHub 上查看」。读的是 `api.github.com/repos/<owner>/<name>/readme`，复用同一个域名与 Token（私有仓也能读）
 - **放入输入框**：同一行的另一种轻量用法——把整理好的提问写进当前会话的输入框，不建会话、不花 token，看一眼改两个字自己发（**会替换输入框里已有的草稿**）
 - **导出 Markdown**：工具栏一键把当前榜单复制成 Markdown（标题 + 时间 + 链接条目 + 掉榜清单），可以直接粘进周报、issue 或笔记
 - **不打扰**：侧栏徽标只在有新上榜时显示数字；不会后台自动跑
@@ -28,7 +29,7 @@
 | 权限 | 用途 |
 |---|---|
 | `network:github.com` | 抓 `github.com/trending` 公开页面（不占 API 配额） |
-| `network:api.github.com` | 新星库搜索；可选 Token 只发给这个域名 |
+| `network:api.github.com` | 新星库搜索 + README 读取；可选 Token 只发给这个域名 |
 | `agent` | 「生成解读」时起一个只读的后台轮次；引擎清单来自宿主的 `agent.catalog()` |
 | `assets:directory` | 设置页里用系统文件夹选择器指定 AI 工作区 |
 | `host:session` | 「讨论」通过 `sessions.startRun` 起一个可在侧栏接管的聊天会话 |
@@ -63,7 +64,7 @@
 
 ```bash
 npm run build     # 把 src/lib/*.mjs 内联进 main.js
-npm test          # 纯函数单测（解析 / 搜索归一化 / 对比 / prompt 预算 / 导出 Markdown）
+npm test          # 纯函数单测（解析 / 搜索归一化 / 对比 / prompt 预算 / 导出 Markdown / README 预处理）
 npm run smoke     # 假宿主冒烟：刷新 → 列表 → 解读 → 讨论 → 停止 → 限流 → 卸载
 npm run validate  # manifest、权限 ↔ 调用、禁用写法、产物自检
 npm run check     # 上面四步全跑
@@ -81,6 +82,7 @@ src/lib/rising.mjs    # Search API → 结构化仓库
 src/lib/diff.mjs      # 快照对比：新上榜 / 掉榜 / 排名变化
 src/lib/prompt.mjs    # 解读 prompt 与事实预算
 src/lib/report.mjs    # 榜单 → Markdown 导出
+src/lib/readme.mjs    # README 去 badge/HTML、截断、base64 还原
 src/lib/catalog.mjs   # 宿主引擎清单 → agent.start 参数（readOnly / 工作区）
 scripts/build.mjs     # 内联构建（剥掉 export 前缀）
 scripts/smoke.mjs     # 假宿主冒烟

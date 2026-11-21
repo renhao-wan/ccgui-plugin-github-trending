@@ -251,7 +251,8 @@ const httpCalls = [];
 const agentStarts = [];
 const agentInterrupts = [];
 /** sessions.startRun 的入参；讨论功能的核心断言对象。 */
-const sessionStarts = [];let sessionStartError = null;
+const sessionStarts = [];
+let sessionStartError = null;
 /**
  * 宿主的侧栏工作区表。宿主只扫「已登记工作区」对应的会话目录，所以这张表
  * 是「会话能不能出现在侧栏」的前提。初始放入 pickedWorkspaceDir，模拟
@@ -268,6 +269,29 @@ let sessionRefreshes = 0;
 const drafts = [];
 let composerError = null;
 let composerAvailable = true;
+/**
+ * README 接口的假响应。按仓库名路由，所以能测「展开 A 再展开 B」。
+ * `status` 用来覆盖 404 / 限流 / 网络错误。
+ */
+const readmeRoutes = new Map();
+let readmeDefault = {
+  status: 200,
+  body: [
+    "---",
+    "title: 假的 frontmatter",
+    "---",
+    "[![build](https://img.shields.io/badge/x.svg)](https://ci.example/run)",
+    "# beta/two",
+    "",
+    '<div align="center"><b>一个很长的说明</b><br>第二行</div>',
+    "",
+    "## 用法",
+    "",
+    "```bash",
+    "npm i beta-two",
+    "```",
+  ].join("\n"),
+};
 const cssCalls = [];
 const eventHandlers = new Set();
 
@@ -519,6 +543,13 @@ const ctx = {
       }
       if (args.url.startsWith("https://api.github.com/search/repositories")) {
         return { status: searchPayload.status, body: searchPayload.body };
+      }
+      // /repos/<owner>/<name>/readme —— 不走 raw.githubusercontent.com，
+      // 是为了复用已有的 network:api.github.com 授权。
+      const readme = /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)\/readme$/.exec(args.url);
+      if (readme) {
+        const hit = readmeRoutes.get(readme[1]) || readmeDefault;
+        return { status: hit.status, body: hit.body };
       }
       throw new Error("unexpected url " + args.url);
     },
@@ -847,6 +878,90 @@ await check("登记侧栏工作区失败时不阻断会话，但要说清可能�
   } finally {
     workspaceAddError = null;
     dispose2();
+  }
+});
+
+await check("README：点行内展开，走 api.github.com 而不是 raw 域名", async () => {
+  readmeRoutes.clear();
+  httpCalls.length = 0;
+  let btn = null;
+  walk(render(), (n) => {
+    if (!btn && n.type === "button" && n.props && n.props["aria-label"] === "展开 beta/two 的 README") btn = n;
+  });
+  assert.ok(btn, "每行都应有 README 展开按钮");
+  assert.equal(btn.props["aria-expanded"], "false");
+  btn.props.onClick();
+
+  assert.ok(await waitFor(() => textOf(render()).includes("用法")), "应渲染出 README 正文");
+  const call = httpCalls.find((c) => c.url.includes("/readme"));
+  assert.ok(call, "应请求 readme 接口");
+  assert.equal(call.url, "https://api.github.com/repos/beta/two/readme");
+  // 走 api 域名是为了复用已有授权；换成 raw.xxx 就要新增网络权限、重装才生效。
+  assert.doesNotMatch(call.url, /raw\.githubusercontent/);
+  assert.match(String(call.headers.Accept), /vnd\.github\.raw/);
+
+  // 预处理生效：badge、frontmatter、HTML 标签都不该出现在正文里
+  const bodyText = textOf(render());
+  assert.doesNotMatch(bodyText, /shields\.io/);
+  assert.doesNotMatch(bodyText, /title: 假的 frontmatter/);
+  assert.doesNotMatch(bodyText, /<b>|<div/);
+  assert.match(bodyText, /一个很长的说明/);
+  assert.match(bodyText, /npm i beta-two/, "代码块内容应保留");
+});
+
+await check("README：再点一次收起，正文消失", async () => {
+  let btn = null;
+  walk(render(), (n) => {
+    if (!btn && n.type === "button" && n.props && n.props["aria-label"] === "收起 beta/two 的 README") btn = n;
+  });
+  assert.ok(btn, "展开后按钮应变成收起");
+  assert.equal(btn.props["aria-expanded"], "true");
+  btn.props.onClick();
+  assert.ok(await waitFor(() => !textOf(render()).includes("一个很长的说明")), "收起后正文应消失");
+});
+
+await check("README：同一时刻只展开一个，换行展开会顶掉上一行", async () => {
+  readmeRoutes.set("alpha/one", { status: 200, body: "# alpha/one\n\n这是 alpha 的 README" });
+  let open = null;
+  walk(render(), (n) => {
+    if (!open && n.type === "button" && n.props && n.props["aria-label"] === "展开 alpha/one 的 README") open = n;
+  });
+  open.props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("这是 alpha 的 README")));
+  let openB = null;
+  walk(render(), (n) => {
+    if (!openB && n.type === "button" && n.props && n.props["aria-label"] === "展开 beta/two 的 README") openB = n;
+  });
+  openB.props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("一个很长的说明")));
+  assert.doesNotMatch(textOf(render()), /这是 alpha 的 README/, "打开第二个时第一个应收起");
+});
+
+await check("README：没有 README 时给出原因，不是空白框", async () => {
+  readmeRoutes.set("beta/two", { status: 404, body: JSON.stringify({ message: "Not Found" }) });
+  try {
+    // 先收起当前展开的
+    let close = null;
+    walk(render(), (n) => {
+      if (!close && n.type === "button" && n.props && n.props["aria-label"] === "收起 beta/two 的 README") close = n;
+    });
+    close.props.onClick();
+    assert.ok(await waitFor(() => !textOf(render()).includes("一个很长的说明")));
+    let btn = null;
+    walk(render(), (n) => {
+      if (!btn && n.type === "button" && n.props && n.props["aria-label"] === "展开 beta/two 的 README") btn = n;
+    });
+    btn.props.onClick();
+    assert.ok(await waitFor(() => textOf(render()).includes("没有 README")), "404 要说清是没有 README");
+  } finally {
+    readmeRoutes.clear();
+    // 收回到干净状态，别把展开态留给后面的用例
+    let close = null;
+    walk(render(), (n) => {
+      if (!close && n.type === "button" && n.props && n.props["aria-label"] === "收起 beta/two 的 README") close = n;
+    });
+    if (close) close.props.onClick();
+    await waitFor(() => !textOf(render()).includes("没有 README"));
   }
 });
 
