@@ -95,23 +95,33 @@ function fillCapsule(x0, y0, x1, y1, r, color) {
 const pad = CW * 0.045;
 fillRoundRect(pad, pad, CW - pad, CH - pad, CW * 0.235, PLATE);
 
-// 2) 向上的箭头。三条约束同时满足：
+// 2) 三根递增的圆头柱。选柱状图而不是箭头：箭头单看是「向上」，柱状图才
+//    一眼是「榜 / 排名 / 谁在涨」——这是这个插件真正在讲的事，也更容易和
+//    别的图标区分开（整个生态里还没人用柱状图）。
 //
-//    - 笔画粗细对齐斜杠面板的那一笔（实测它白色笔画水平宽度约占画布 11.7%，
-//      这里 10.2%，视觉上刚好一样重）；
-//    - **白色包围盒占画布的比例也对齐**（斜杠约 32%×62%，这里约 33%×58%）——
-//      符号画得太大，缩到 18px 就会显得「填满了」，看着比别人的图标重；
-//    - 头部两臂张开到约 45°：角度太陡时三根胶囊会在顶端挤成一个实心三角。
-//
-//    两侧那两枚浅色点缀已经去掉了：底板 + 箭头本来就只有两层，再加两枚
-//    碎点，视觉上是四个孤立元素，在 18px 下只会让人觉得画面散。
-const cx = CW * 0.5;
-const strokeR = CW * 0.058;
-const tipY = CH * 0.335;
-const wingY = CH * 0.478;
-fillCapsule(cx, CH * 0.775, cx, tipY, strokeR, INK);
-fillCapsule(cx, tipY, CW * 0.398, wingY, strokeR, INK);
-fillCapsule(cx, tipY, CW * 0.602, wingY, strokeR, INK);
+//    三条约束：
+//    - 三根柱**同色**。带一根高亮的那版看着像两个图标拼在一起，18px 下
+//      高亮那根只会变成一个偏色的点；
+//    - **间距必须大于柱宽**。等宽或更窄时，缩到 16px 下三根柱会糊成一块，
+//      看不出是柱状图（实测过：柱宽 8%、间距 4.8% 就是这样糊掉的）；
+//    - **白色包围盒占画布的比例对齐斜杠面板**（它约 32%×62%）——
+//      符号画得比别人的大，缩到 18px 就会显得「填满了」，看着比别人的重。
+const BAR_W = CW * 0.055;
+const BAR_GAP = CW * 0.085;
+const BAR_BOTTOM = CH * 0.80;
+/** 递增的三档高度（占画布比例）。最短那根也要在 16px 下站得住。 */
+const BAR_HEIGHTS = [0.3, 0.46, 0.62];
+const BAR_R = BAR_W / 2;
+const BAR_TOTAL = BAR_W * 3 + BAR_GAP * 2;
+const BAR_LEFT = (CW - BAR_TOTAL) / 2;
+
+BAR_HEIGHTS.forEach((h, i) => {
+  const x = BAR_LEFT + i * (BAR_W + BAR_GAP) + BAR_W / 2;
+  // 圆头胶囊：两端各留一个半径，视觉高度才是 h * CH
+  const y0 = BAR_BOTTOM - h * CH + BAR_R;
+  const y1 = BAR_BOTTOM - BAR_R;
+  fillCapsule(x, y0, x, y1, BAR_R, INK);
+});
 
 // 下采样（预乘 alpha）
 const rgba = Buffer.alloc(W * H * 4);
