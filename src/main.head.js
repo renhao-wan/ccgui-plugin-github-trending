@@ -1244,7 +1244,7 @@ function supportsDiscuss(ctx) {
 let discussSeq = 0;
 
 /**
- * 已经为哪些仓库开过会话：`仓库全名 -> sessionId`。
+ * 已经为哪些仓库开过会话：`仓库全名 -> { id, engine }`。
  *
  * 记成**跨榜单**的表而不是榜单内的：`resumeMode` 为 `always` 时用户明确要求
  * 「只要拿得到就接着聊」，那就不能因为换了一份榜单就把 id 扔掉。`session`
@@ -1255,12 +1255,17 @@ let discussSeq = 0;
  * 仓库的会话。会话 ID 是宿主给的字符串，不含任何隐私内容，存进 settings 里
  * （`discussSessionIds`）比让它随着一次重装载入丢失更划算。
  *
+ * **必须记 engine**。会话 id 只在它所属的引擎下有意义；拿 claude 的 id 去
+ * `selectSession("codex", ...)`，宿主要么拒绝、要么打开一条根本不是这次引擎的
+ * 会话。更糟的是拒绝之后我们把它当「失效」删掉——切回 claude 再点，本该接着
+ * 上次聊，结果又新开一条。引擎对不上时**跳过复用但保留记录**，不删。
+ *
  * sessionId 可能拿不到：`startRun` 文档写明引擎稍后才 announce，此时返回 null。
  * 那条路径**不记录**（不是记空串），再点时仍然新开——复用是加分项，拿不到 id
  * 时不能因此让按钮失败，也不该占着一个额度。
  *
- * 插入顺序即「最近用过」的顺序：`rememberDiscussSession` 每次都把该仓库挪到
- * 队尾，超限时从队首淘汰。上限见 DISCUSS_SESSION_LIMIT。
+ * 插入顺序即「最近用过」的顺序：`rememberDiscussSession` / `touchDiscussSession`
+ * 每次都把该仓库挪到队尾，超限时从队首淘汰。上限见 DISCUSS_SESSION_LIMIT。
  */
 let discussSessions = new Map();
 /**
@@ -1278,14 +1283,31 @@ let discussSessionsStale = false;
 /** 本次激活内是否真的用讨论开过/打开过会话；没开过时 stale 语义没有意义。 */
 let discussTouched = false;
 
-/** 落盘上限：一个仓库一个 id，40 条足够覆盖最近几周的扫榜。 */
-const DISCUSS_SESSION_LIMIT = 40;
+/** 落盘上限：一个仓库一条记录。60 条 ≈ 每天讨论 5-10 个也能覆盖一周多。 */
+const DISCUSS_SESSION_LIMIT = 60;
 
 /**
- * 按上限裁剪一张「仓库 → id」表。
+ * 把落盘的一条值归一化成 `{ id, engine }`；不是有效记录时返回 null。
+ *
+ * 兼容旧格式：`8ffb092`..`25faa4c` 之间落盘的是裸字符串（没有 engine）。
+ * 这些记录照常能用——命中时只要求「没换过引擎」才复用，见 discussRepo。
+ */
+function normaliseDiscussRow(value) {
+  if (typeof value === "string") {
+    const id = value.trim();
+    return id ? { id, engine: "" } : null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = typeof value.id === "string" ? value.id.trim() : "";
+  if (!id) return null;
+  return { id, engine: typeof value.engine === "string" ? value.engine.trim() : "" };
+}
+
+/**
+ * 按上限裁剪一张「仓库 → 记录」表。
  *
  * `Map` / 普通对象都保持插入顺序，这里两边都**按这个顺序**裁：淘汰的是最久
- * 没碰过的仓库。早先按 key 排序再 `slice(-N)`，留下的是字母序末尾的 40 个，
+ * 没碰过的仓库。早先按 key 排序再 `slice(-N)`，留下的是字母序末尾的若干条，
  * 那是 bug——常点的 `rust-lang/rust` 会被裁掉，而某个从没再点过的 `zzz/zzz`
  * 会一直留着。
  */
@@ -1301,25 +1323,25 @@ function normaliseDiscussSessions(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const valid = {};
   for (const k of Object.keys(raw)) {
-    // 只认合法的 owner/name。空串也丢：它表示「开过但没拿到 id」，而这跟
+    // 只认合法的 owner/name。空值也丢：它表示「开过但没拿到 id」，这跟
     // 「没有记录」在复用判断上完全等价（都要新开），占额度没有意义。
     if (!readmeRepoKey(k)) continue;
-    const v = raw[k];
-    if (typeof v === "string" && v !== "") valid[k] = v;
+    const row = normaliseDiscussRow(raw[k]);
+    if (row) valid[k] = row;
   }
   return trimDiscussRows(valid);
 }
 
 /**
- * 记一条会话 id。
+ * 记一条会话 id（连同它属于哪个引擎）。
  *
  * 先 `delete` 再 `set`：`Map.set` 对已存在的 key 不会挪动位置，不这么做的话
  * 「最近用过」的仓库会一直停在队首，超限时被淘汰的反而是它。
  */
-function rememberDiscussSession(repo, sessionId) {
+function rememberDiscussSession(repo, sessionId, engine) {
   if (!sessionId) return;
   discussSessions.delete(repo);
-  discussSessions.set(repo, sessionId);
+  discussSessions.set(repo, { id: sessionId, engine: String(engine || "") });
   while (discussSessions.size > DISCUSS_SESSION_LIMIT) {
     const oldest = discussSessions.keys().next().value;
     discussSessions.delete(oldest);
@@ -1339,9 +1361,9 @@ function touchDiscussSession(repo) {
   if (!discussSessions.has(repo)) return false;
   // 已经在队尾就没有可挪的，省一次写盘。
   if (Array.from(discussSessions.keys()).pop() === repo) return false;
-  const id = discussSessions.get(repo);
+  const row = discussSessions.get(repo);
   discussSessions.delete(repo);
-  discussSessions.set(repo, id);
+  discussSessions.set(repo, row);
   return true;
 }
 
@@ -1349,7 +1371,7 @@ function touchDiscussSession(repo) {
 function persistDiscussSessions(ctx) {
   const rows = {};
   // 内存表已经裁过；这里再走一次是为了防手改/旧版本写进来的超大表。
-  for (const [repo, id] of discussSessions) if (id) rows[repo] = id;
+  for (const [repo, row] of discussSessions) if (row && row.id) rows[repo] = row;
   setSettings({ discussSessionIds: trimDiscussRows(rows) });
   return Promise.resolve(ctx.storage.set("settings", store.snap.settings)).catch(() => {});
 }
@@ -1443,11 +1465,15 @@ async function discussRepo(ctx, row) {
     // 已经有这个仓库的会话：直接切过去，不跑模型。
     // 策略交给 shouldResume：never 时明确要求新开，其余情况优先复用。
     const known = discussSessions.get(row.repo);
-    const resumable = typeof known === "string" && known !== "";
+    // 引擎对不上就**不复用**，但也**不删记录**：会话 id 只在所属引擎下有意义。
+    // 删掉的话，切回原引擎再点这条仓库本该接着上次聊，却变成新开一条。
+    // 旧格式落盘的记录没有 engine 字段（空串），当作「不知道」照常复用。
+    const engineMatches = !known || !known.engine || known.engine === entry.engine;
+    const resumable = Boolean(known && known.id) && engineMatches;
     if (shouldResume(settings.resumeMode, discussSessionsStale, resumable) && typeof ctx.sessions.selectSession === "function") {
       try {
         await withTimeout(
-          ctx.sessions.selectSession(entry.engine, known, workspace),
+          ctx.sessions.selectSession(entry.engine, known.id, workspace),
           DISCUSS_TIMEOUT_MS,
           "会话打开",
         );
@@ -1492,11 +1518,12 @@ async function discussRepo(ctx, row) {
 
     // 走到这里只有两种可能：没有可复用的会话，或者宿主不支持 selectSession。
     // 后者退回复用式 startRun（会真的再跑一轮），只为兼容旧宿主。
+    // 引擎对不上时也走这里——按新引擎新开一条，旧引擎那条留着。
     const fallbackResume =
       typeof ctx.sessions.selectSession === "function"
         ? ""
-        : shouldResume(settings.resumeMode, discussSessionsStale, resumable)
-          ? known
+        : resumable
+          ? known.id
           : "";
 
     // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。
@@ -1513,10 +1540,10 @@ async function discussRepo(ctx, row) {
       "会话启动",
     );
 
-    // 记住这一行的 sessionId，供下次点击时直接打开它。
+    // 记住这一行的 sessionId 和它所属引擎，供下次点击时直接打开它。
     // `started.sessionId` 可能为 null——那就不记，下次照常新开。
     const sessionId = started && typeof started.sessionId === "string" && started.sessionId ? started.sessionId : "";
-    rememberDiscussSession(row.repo, sessionId);
+    rememberDiscussSession(row.repo, sessionId, entry.engine);
     // 落盘：内存表熬不过重装/重新激活/宿主重启，而用户的观感是「每点一次
     // 就多一条会话」。写盘失败不影响这次点击，所以不 await 它的错误。
     void persistDiscussSessions(ctx);

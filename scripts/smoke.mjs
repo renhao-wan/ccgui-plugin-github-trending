@@ -2351,15 +2351,56 @@ await check("讨论续接：换一行仍然新开，只有同一仓库才复用"
   }
 });
 
+await check("讨论续接：换了引擎就不复用，但原引擎那条记录要留着", async () => {
+  // 会话 id 只在所属引擎下有意义。拿 claude 的 id 去 selectSession("codex")
+  // 宿主要么拒绝、要么打开错的会话；更糟的是被拒之后我们当「失效」删掉，
+  // 切回 claude 再点本该接着上次聊，却变成新开一条。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  const seeded = { "beta/two": { id: "sess-claude", engine: "claude" } };
+  let lastSaved = null;
+  const inst = await freshTabInstance(() => ({ discussSessionIds: seeded, engine: "codex" }), (k, v) => {
+    if (k === "settings") lastSaved = v;
+  });
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1), "换引擎应新开一条");
+    assert.equal(sessionSelects.length, 0, "不该拿别的引擎的 id 去打开");
+    assert.ok(!sessionStarts[0].sessionId, "新会话不该带别人的 id");
+    assert.equal(sessionStarts[0].engine, "codex");
+    // 记录被新引擎覆盖（同一个仓库在 codex 下也有一条了）。
+    assert.ok(await waitFor(() => lastSaved && lastSaved.discussSessionIds["beta/two"]), "应记下新引擎的会话");
+    assert.equal(lastSaved.discussSessionIds["beta/two"].engine, "codex");
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：旧格式落盘的裸字符串仍能读回来", async () => {
+  // 8ffb092..25faa4c 之间落盘的是 { repo: "id" }，没有 engine。升级后不能把这些
+  // 记录当成坏数据丢掉——那样用户重装一次就退回「每点一次新开一条」。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  const inst = await freshTabInstance(() => ({ discussSessionIds: { "beta/two": "sess-legacy" } }));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionSelects.length === 1), "旧记录应照常复用");
+    assert.equal(sessionSelects[0].sessionId, "sess-legacy");
+    assert.equal(sessionStarts.length, 0, "不该新开");
+  } finally {
+    inst.dispose();
+  }
+});
+
 await check("讨论续接：命中也算「刚用过」，下一份新会话不会把它挤掉", async () => {
   // LRU 的关键不在于「新建时挪到队尾」，而在于**读取时也挪**。常点的仓库走
   // 「直接打开」那条路，从不经过新建分支——不记读取的话它永远停在队首，
   // 下一次新开会话就把它淘汰了，用户再点又变成新开一条。
   sessionStarts.length = 0;
   sessionSelects.length = 0;
-  const seeded = { "alpha/one": "sess-alpha" };
-  // 先塞 39 条凑到 40：alpha/one 在最前（最久没用）。
-  for (let i = 0; i < 39; i += 1) seeded["seed/seed-" + i] = "seed-" + i;
+  const seeded = { "alpha/one": { id: "sess-alpha", engine: "claude" } };
+  // 先塞 59 条凑到 60：alpha/one 在最前（最久没用）。
+  for (let i = 0; i < 59; i += 1) seeded["seed/seed-" + i] = { id: "seed-" + i, engine: "claude" };
   let lastSaved = null;
   const inst = await freshTabInstance(() => ({ discussSessionIds: seeded }), (k, v) => {
     if (k === "settings") lastSaved = v;
@@ -2375,9 +2416,9 @@ await check("讨论续接：命中也算「刚用过」，下一份新会话不�
     assert.ok(await waitFor(() => sessionStarts.length === 1));
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
     const rows = lastSaved.discussSessionIds;
-    assert.ok(rows["alpha/one"] === "sess-alpha", "刚点开过的 alpha/one 不能被淘汰");
+    assert.ok(rows["alpha/one"] && rows["alpha/one"].id === "sess-alpha", "刚点开过的 alpha/one 不能被淘汰");
     assert.ok(!rows["seed/seed-0"], "该淘汰的是最久没用过的那条");
-    assert.equal(Object.keys(rows).length, 40, "仍是 40 条");
+    assert.equal(Object.keys(rows).length, 60, "仍是 60 条");
   } finally {
     inst.dispose();
   }
@@ -2396,7 +2437,10 @@ await check("讨论续接：会话表落盘，重新激活后仍能直接打开"
     inst.click("beta/two");
     assert.ok(await waitFor(() => sessionStarts.length === 1));
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
-    assert.ok(await waitFor(() => saved.discussSessionIds && saved.discussSessionIds["beta/two"] === "sess-1"), "会话 id 应写进设置");
+    assert.ok(
+      await waitFor(() => saved.discussSessionIds && saved.discussSessionIds["beta/two"] && saved.discussSessionIds["beta/two"].id === "sess-1"),
+      "会话 id 应写进设置",
+    );
   } finally {
     inst.dispose();
   }
@@ -2418,7 +2462,7 @@ await check("讨论续接：打开旧会话失败时退回新开，并清掉失�
   // 「一点就报错」的死路，也不能把那个 id 一直留着。
   sessionStarts.length = 0;
   sessionSelects.length = 0;
-  const saved = { discussSessionIds: { "beta/two": "sess-gone" } };
+  const saved = { discussSessionIds: { "beta/two": { id: "sess-gone", engine: "claude" } } };
   sessionSelectError = new Error("session not found");
   let lastSaved = null;
   const inst = await freshTabInstance(() => saved, (k, v) => {
@@ -2430,7 +2474,7 @@ await check("讨论续接：打开旧会话失败时退回新开，并清掉失�
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
     // 失效 id 必须被换掉；新开成功后会写成新拿到的那个。
     assert.ok(
-      await waitFor(() => lastSaved && lastSaved.discussSessionIds["beta/two"] === "sess-1"),
+      await waitFor(() => lastSaved && lastSaved.discussSessionIds["beta/two"] && lastSaved.discussSessionIds["beta/two"].id === "sess-1"),
       "失效 id 应被换成新会话",
     );
   } finally {
@@ -2440,15 +2484,15 @@ await check("讨论续接：打开旧会话失败时退回新开，并清掉失�
 });
 
 await check("讨论续接：超过上限时淘汰最久没用过的，且写入时就裁", async () => {
-  // 上限 40。之前在内存里根本不裁、写盘也不裁，这条路径等于没有上限；
+  // 上限 60。之前在内存里根本不裁、写盘也不裁，这条路径等于没有上限；
   // 读盘裁剪还按字典序，会先淘汰掉常点的仓库。
   sessionStarts.length = 0;
   sessionSelects.length = 0;
   const seeded = {};
-  // 塞满 40 条，`zzz/zzz` 排在最前——它是最久没用过的那条。
-  for (let i = 0; i < 40; i += 1) {
+  // 塞满 60 条，`zzz/zzz` 排在最前——它是最久没用过的那条。
+  for (let i = 0; i < 60; i += 1) {
     const repo = i === 0 ? "zzz/zzz" : "seed/seed-" + i;
-    seeded[repo] = "seed-" + i;
+    seeded[repo] = { id: "seed-" + i, engine: "claude" };
   }
   let lastSaved = null;
   const inst = await freshTabInstance(() => ({ discussSessionIds: seeded }), (k, v) => {
@@ -2460,8 +2504,9 @@ await check("讨论续接：超过上限时淘汰最久没用过的，且写入�
     assert.ok(await waitFor(() => !inst.text().includes("打开中")));
     assert.ok(await waitFor(() => lastSaved && lastSaved.discussSessionIds), "应写回设置");
     const rows = lastSaved.discussSessionIds;
-    assert.equal(Object.keys(rows).length, 40, "落盘最多 40 条");
-    assert.ok(rows["beta/two"] === "sess-1", "新会话要在表里");
+    assert.equal(Object.keys(rows).length, 60, "落盘最多 60 条");
+    assert.ok(rows["beta/two"] && rows["beta/two"].id === "sess-1", "新会话要在表里");
+    assert.equal(rows["beta/two"].engine, "claude", "要记下它属于哪个引擎");
     assert.ok(!rows["zzz/zzz"], "超限时淘汰最久没用的那条，而不是按字母序");
   } finally {
     inst.dispose();
