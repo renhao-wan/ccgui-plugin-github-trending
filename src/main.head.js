@@ -222,18 +222,38 @@ const THIN_ICON = {
 };
 
 /**
- * 应用内图标：三根递增柱，与 docs/icon.png 同一套符号。
- * 侧栏/页签里只有 16px，线条一律 1.5px、不画刻度与指针——细节到这个尺寸只会糊。
+ * 应用内图标：向上的箭头，与 docs/icon.png **同一套符号、同一套几何比例**。
+ *
+ * 两处必须是同一个东西：市场页/侧栏缩略图是 docs/icon.png，侧栏与页签标签
+ * 用的是这个组件。早先 PNG 画箭头、这里画「三根柱 + 基线」，同一个插件在
+ * 两个位置显示两种图形，用户根本认不出是同一个插件。改几何时两边必须一起改。
+ *
+ * 下面这些坐标就是 make-icon.mjs 里那几行比例换算到 16×16 的结果
+ * （箭杆 77.5%→33.5%、翼端 47.8%、翼展 39.8%~60.2%）：
+ *   箭杆 M8 12.4 V5.36 / 翼 (8,5.36) → (±6.37, 7.65)
+ *
+ * 换算过来的包围盒占画布约 31%×55%，与斜杠面板那 32%×62% 基本一致——
+ * 符号画得比别人的大，缩到 18px 就会显得填满了。
+ *
+ * 16px 下只用一笔描边，不画点缀、不做双层配色——细节到这个尺寸只会糊。
+ * `strokeWidth` 也按 PNG 换算：那里笔画约占画布 11.6%，16 单位下即 1.85，
+ * 与 `THIN_ICON` 的 1.5 不同，所以用它覆盖掉。
  */
+const ICON_GEOM = {
+  shaft: "M8 12.4V5.36",
+  wingL: "M8 5.36 6.37 7.65",
+  wingR: "M8 5.36 9.63 7.65",
+  strokeWidth: 1.85,
+};
+
 function Icon(props) {
   const h = appCtx.react.createElement;
   return h(
     "svg",
-    Object.assign({}, THIN_ICON, props && props.className ? { className: props.className } : {}),
-    h("path", { d: "M3.2 12.6V9.4" }),
-    h("path", { d: "M8 12.6V6.6" }),
-    h("path", { d: "M12.8 12.6V3.4" }),
-    h("path", { d: "M2.2 12.6h11.6", "stroke-width": 1.2 }),
+    Object.assign({}, THIN_ICON, { "stroke-width": ICON_GEOM.strokeWidth }, props && props.className ? { className: props.className } : {}),
+    h("path", { d: ICON_GEOM.shaft }),
+    h("path", { d: ICON_GEOM.wingL }),
+    h("path", { d: ICON_GEOM.wingR }),
   );
 }
 

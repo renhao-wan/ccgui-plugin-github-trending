@@ -31,8 +31,6 @@ const CH = H * S;
  */
 const PLATE = [222, 78, 22, 255];
 const INK = [255, 255, 255, 255];
-/** 点缀色 = 底板混白，和斜杠面板的浅蓝点是同一种做法。 */
-const DOT = [250, 196, 178, 255];
 
 const canvas = new Float32Array(CW * CH * 4);
 
@@ -92,36 +90,28 @@ function fillCapsule(x0, y0, x1, y1, r, color) {
   }
 }
 
-function fillCircle(cx, cy, r, color) {
-  for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
-    for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
-      const dx = x - cx;
-      const dy = y - cy;
-      if (dx * dx + dy * dy <= r * r) blend(x, y, color);
-    }
-  }
-}
-
 // 1) 圆角方形底板：纯色、无渐变、无描边。留白与圆角比例抄斜杠面板，
 //    这样两枚图标并排时轮廓完全一致。
 const pad = CW * 0.045;
 fillRoundRect(pad, pad, CW - pad, CH - pad, CW * 0.235, PLATE);
 
-// 2) 向上的箭头。笔画粗细对齐斜杠面板的那一笔（约画布 10%），否则箭头
-//    天然比单根斜杠重，并排时一个像加粗、一个像细体。头部两臂张开到约
-//    45°：角度太陡时三根胶囊会在顶端挤成一个实心三角，放大看很沉。
+// 2) 向上的箭头。三条约束同时满足：
+//
+//    - 笔画粗细对齐斜杠面板的那一笔（实测它白色笔画水平宽度约占画布 11.7%，
+//      这里 10.2%，视觉上刚好一样重）；
+//    - **白色包围盒占画布的比例也对齐**（斜杠约 32%×62%，这里约 33%×58%）——
+//      符号画得太大，缩到 18px 就会显得「填满了」，看着比别人的图标重；
+//    - 头部两臂张开到约 45°：角度太陡时三根胶囊会在顶端挤成一个实心三角。
+//
+//    两侧那两枚浅色点缀已经去掉了：底板 + 箭头本来就只有两层，再加两枚
+//    碎点，视觉上是四个孤立元素，在 18px 下只会让人觉得画面散。
 const cx = CW * 0.5;
-const strokeR = CW * 0.052;
-const tipY = CH * 0.305;
-const wingY = CH * 0.455;
-fillCapsule(cx, CH * 0.755, cx, CH * 0.355, strokeR, INK);
-fillCapsule(cx, tipY, CW * 0.328, wingY, strokeR, INK);
-fillCapsule(cx, tipY, CW * 0.672, wingY, strokeR, INK);
-
-// 3) 两侧点缀：一高一低（与斜杠面板同为错落的两点），不抢主符号。
-const dotR = CW * 0.042;
-fillCircle(CW * 0.268, CH * 0.655, dotR, DOT);
-fillCircle(CW * 0.732, CH * 0.565, dotR, DOT);
+const strokeR = CW * 0.058;
+const tipY = CH * 0.335;
+const wingY = CH * 0.478;
+fillCapsule(cx, CH * 0.775, cx, tipY, strokeR, INK);
+fillCapsule(cx, tipY, CW * 0.398, wingY, strokeR, INK);
+fillCapsule(cx, tipY, CW * 0.602, wingY, strokeR, INK);
 
 // 下采样（预乘 alpha）
 const rgba = Buffer.alloc(W * H * 4);
