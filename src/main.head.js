@@ -94,6 +94,8 @@ const DEFAULT_STATE = {
   discussWorkspace: "",
   /** 会话建起来了、但没挂进侧栏工作区时的说明。不阻塞会话，只解释为什么可能看不见。 */
   discussWarning: "",
+  /** 把讨论 prompt 放进输入框（而不是开会话）后的回执；与 discussNotice 互斥。 */
+  draftNotice: "",
   catalog: [],
   catalogLoaded: false,
   modelsLoading: false,
@@ -204,6 +206,25 @@ function fmtTime(ts) {
 /** 只允许 https 链接进 DOM；其它一律当纯文本。 */
 function safeHref(url) {
   return typeof url === "string" && /^https:\/\/[a-z0-9.-]+(\/|$)/i.test(url) ? url : null;
+}
+
+/**
+ * 写剪贴板。宿主是 Electron，正常都有 `navigator.clipboard`；缺失时直接 reject，
+ * 由调用方把「复制失败」显示出来——静默失败比不支持更糟，用户会以为已经复制了。
+ *
+ * 返回值是「这次复制自己的」Promise，不是布尔：连点两次导出时，两个 Promise
+ * 各自 resolve，调用方不必靠一个共享的 timestamp 去猜哪次结果该留下了。
+ */
+function copyText(text) {
+  try {
+    const clip = typeof navigator !== "undefined" ? navigator.clipboard : null;
+    if (clip && typeof clip.writeText === "function") {
+      return Promise.resolve(clip.writeText(String(text)));
+    }
+  } catch {
+    /* 落到下面统一 reject */
+  }
+  return Promise.reject(new Error("clipboard unavailable"));
 }
 
 function withTimeout(promise, ms, label) {
@@ -460,6 +481,7 @@ async function refresh(ctx, options) {
     discussNotice: "",
     discussWorkspace: "",
     discussWarning: "",
+    draftNotice: "",
   });
 
   let result;
@@ -853,7 +875,7 @@ async function discussRepo(ctx, row) {
   const seq = ++discussSeq;
   // 新的一轮先把上一条「已开会话」提示收掉：否则连续点两行，页面会同时说
   // 两个仓库都开了会话，而实际只留了最后那条。
-  set({ discussing: row.repo, discussError: "", discussNotice: "", discussWorkspace: "", discussWarning: "" });
+  set({ discussing: row.repo, discussError: "", discussNotice: "", discussWorkspace: "", discussWarning: "", draftNotice: "" });
   const settings = snap.settings;
   const bailed = (message) => {
     if (seq === discussSeq) set({ discussing: "", discussError: message });
@@ -924,6 +946,64 @@ async function discussRepo(ctx, row) {
         ? "宿主没有及时建起会话（30 秒），可以直接再点一次"
         : messageOf(error);
     bailed("开会话失败：" + hint);
+  }
+}
+
+/**
+ * 把讨论 prompt 放进**当前会话的输入框**，而不是立刻开一个新会话。
+ *
+ * 与 `discussRepo` 互补，不是替代：开会话花的是真 token，而且会话挂在插件
+ * 数据目录下；很多时候用户只是想把「这个库跟我们现在用的 X 比怎么样」这句话
+ * 带到自己正在写的会话里，改两个字再发。`composer.setDraft`（0.3.2+）正好是
+ * 这个动作——只写草稿，不发送，发送永远是用户的事。
+ *
+ * **会覆盖已有草稿**，这是 API 语义（写入即替换），而且宿主没有「读草稿」的
+ * 接口，所以插件无法判断当前有没有草稿、更没法事后还原。这条警告只能写在
+ * 按钮 title 上（`draftWarningText()`），点之前就看得到；不弹确认框——这是
+ * 一次能用 Ctrl+Z 撤回的写入，不值得为它打断一次扫榜。
+ *
+ * 不需要引擎可用、不需要登记工作区、不需要权限审批之外的东西——这是它比
+ * 「讨论」便宜的地方，也是它应该有一个独立按钮的原因。
+ */
+let draftSeq = 0;
+
+async function draftRepo(ctx, row) {
+  const snap = store.snap;
+  if (!row || !row.repo) return;
+  const api = ctx && ctx.composer;
+  if (!api || typeof api.setDraft !== "function") {
+    set({ discussError: "当前 CC GUI 版本不支持写入输入框，请升级宿主，或用「讨论」直接开会话" });
+    return;
+  }
+
+  const prompt = buildDiscussPrompt({
+    row,
+    view: snap.view,
+    period: snap.view === "rising" ? RISING_PERIOD.key : snap.settings.period,
+    language: snap.view === "rising" ? "" : snap.settings.language,
+  });
+  const seq = ++draftSeq;
+  set({ draftNotice: "", discussError: "" });
+  try {
+    // 不 await 任何超时保护：setDraft 是同步写一个受控输入框的值，没有 IPC 往返，
+    // 用 withTimeout 包一层只会引入一个永远清不掉的定时器。
+    await ctx.composer.setDraft(prompt);
+    if (seq !== draftSeq) return;
+    set({
+      draftNotice: row.repo,
+      // 上一次讨论留下的回执不能和新回执并存，否则页面同时说两件事。
+      discussing: "",
+      discussNotice: "",
+      discussWorkspace: "",
+      discussWarning: "",
+    });
+  } catch (error) {
+    if (seq !== draftSeq) return;
+    const raw = error && error.message ? String(error.message) : String(error || "");
+    const hint = /composer:draft|permission|not declared/i.test(raw)
+      ? "缺少写入输入框的权限，请重新安装插件（manifest 已声明 composer:draft）"
+      : messageOf(error);
+    set({ discussError: "放入输入框失败：" + hint });
   }
 }
 
@@ -1131,6 +1211,11 @@ function RepoRow({ row, ctx, discussing }) {
   const busy = Boolean(discussing) && discussing === row.repo;
   // 一次只能开一个：别的行在开的时候按钮禁用，避免连点开出好几个真会话。
   const blocked = Boolean(discussing) && !busy;
+  // 「放入输入框」不做 loading 态：setDraft 不花 token、不建会话，也不涉及
+  // 进程启动，连点的后果只是把同一段草稿再写一遍。给它一个「已放入」的中间
+  // 态反而会让人以为在等什么，等它复位又是一次没必要的闪动。
+  // 唯一要挡的是 opening 期间：那一刻用户按发送，草稿可能刚被另一行覆盖。
+  const draftBlocked = Boolean(discussing);
 
   return h(
     "li",
@@ -1155,11 +1240,25 @@ function RepoRow({ row, ctx, discussing }) {
           ? h("span", { className: "gt-move" + movementClass(row) }, movement)
           : null,
         // 放在标题行末尾：跟仓库名同一视觉层级，用户扫榜时顺手就能点。
+        // 「放入输入框」排在「讨论」前面：前者不花 token、不建会话，是更轻的那个。
+        // 同一条 CSS（.gt-discuss）管淡入，两者一起浮现，不会一高一低。
         h(
           "button",
           {
             type: "button",
-            className: "gt-btn gt-discuss" + (busy ? " gt-discuss--busy" : ""),
+            className: "gt-btn gt-discuss",
+            onClick: () => void draftRepo(ctx, row),
+            disabled: draftBlocked,
+            title: "把整理好的提问放进输入框，自己看一眼再发（" + draftWarningText() + "）",
+            "aria-label": "把 " + row.repo + " 的提问放进输入框",
+          },
+          "放入输入框",
+        ),
+        h(
+          "button",
+          {
+            type: "button",
+            className: "gt-btn gt-discuss gt-discuss--start" + (busy ? " gt-discuss--busy" : ""),
             onClick: () => void discussRepo(ctx, row),
             disabled: blocked || busy,
             title: "在 AI 工作区里开一个会话，分析这个项目",
@@ -1189,6 +1288,40 @@ function RepoRow({ row, ctx, discussing }) {
 
 function Toolbar({ snap, ctx }) {
   const h = appCtx.react.createElement;
+  const R = appCtx.react;
+  // 导出状态放在这一层而不是 status store：它只描述「刚才那次复制」，跟榜单
+  // 数据无关，放进全局反而要在每个刷新点清一遍。
+  const exportState = R.useState("");
+  const exportStatus = exportState[0];
+  const setExportStatus = exportState[1];
+  const exportTimer = R.useRef(null);
+  R.useEffect(() => () => {
+    if (exportTimer.current) clearTimeout(exportTimer.current);
+  }, []);
+  const flashExport = (text) => {
+    setExportStatus(text);
+    if (exportTimer.current) clearTimeout(exportTimer.current);
+    exportTimer.current = setTimeout(() => setExportStatus(""), 2000);
+  };
+  const exportMarkdown = () => {
+    const markdown = buildBoardMarkdown({
+      view: snap.view,
+      period: snap.settings.period,
+      language: snap.view === "trending" ? snap.settings.language : "",
+      rows: snap.repos,
+      dropped: snap.dropped,
+      capturedAt: fmtTime(snap.loadedAt),
+    });
+    // 空榜单不该给出一个「已复制」，那等于让用户粘出一张空白表。
+    if (!markdown) {
+      flashExport("没有可导出的内容");
+      return;
+    }
+    copyText(markdown).then(
+      () => flashExport("已复制"),
+      () => flashExport("复制失败"),
+    );
+  };
   // 切视图/时间档会让榜单换掉，正在生成的解读说的是旧榜单，必须一并停掉，
   // 否则旧轮次的 delta 会继续写进新视图，而且宿主那侧还在烧 token。
   const onView = (view) => {
@@ -1206,6 +1339,7 @@ function Toolbar({ snap, ctx }) {
       discussNotice: "",
       discussWorkspace: "",
       discussWarning: "",
+      draftNotice: "",
     });
     void refresh(ctx, { force: true });
   };
@@ -1224,6 +1358,7 @@ function Toolbar({ snap, ctx }) {
       discussNotice: "",
       discussWorkspace: "",
       discussWarning: "",
+      draftNotice: "",
     });
     void refresh(ctx, { force: true });
   };
@@ -1250,6 +1385,18 @@ function Toolbar({ snap, ctx }) {
       "div",
       { className: "gt-group gt-group--end" },
       snap.loadedAt ? h("span", { className: "gt-stamp" }, "更新于 " + fmtTime(snap.loadedAt)) : null,
+      // 定宽：文案在「导出 Markdown / 已复制 / 复制失败」之间切，右侧按钮不能跟着挪。
+      h(
+        "button",
+        {
+          type: "button",
+          className: "gt-btn gt-btn--export",
+          onClick: exportMarkdown,
+          disabled: snap.loading || snap.repos.length === 0,
+          title: "把当前榜单复制成 Markdown（可直接粘进周报或 issue）",
+        },
+        exportStatus || "导出 Markdown",
+      ),
       h(
         "button",
         {
@@ -1297,7 +1444,8 @@ function StatusLine({ snap }) {
   // 讨论的两条回执讲的是「你刚才那一按的结果」，比榜单状态更该优先显示：
   // 先判回执，再判 httpError / loaded。否则上一次生成超时的红字会原样留着，
   // 把「开会话失败了，因为…」整个吞掉——用户看到的还是几分钟前的错误。
-  if (snap.discussError || snap.discussNotice) {
+  // 「放入输入框」的回执也走这条通道：它同样是对一次点击的答复。
+  if (snap.discussError || snap.discussNotice || snap.draftNotice) {
     const base = snap.loaded
       ? h(
           "p",
@@ -1314,7 +1462,16 @@ function StatusLine({ snap }) {
       base,
       snap.discussError
         ? h("p", { className: "gt-notice gt-notice--error", role: "status" }, snap.discussError)
-        : h(
+        : snap.draftNotice
+          ? h(
+              "p",
+              { className: "gt-notice gt-notice--ok", role: "status" },
+              h("span", null, "已把 " + snap.draftNotice + " 的提问放进输入框"),
+              // 这条提示是「没切过去」之外的第二个提醒：用户可能正在别处看，
+              // 回来时输入框突然多了一大段，不知道是谁塞的会以为是自己误触。
+              h("span", { className: "gt-notice-hint" }, "看一眼再发，发送仍然由你决定"),
+            )
+          : h(
             "p",
             { className: "gt-notice gt-notice--ok", role: "status" },
             h("span", null, "已在侧栏为 " + snap.discussNotice + " 开了会话"),
@@ -2283,6 +2440,8 @@ const CSS = `
 /* 「刷新 / 刷新中…」来回切时宽度不跳，右边的按钮不会跟着挪。
  * 转圈 12px + 间距 6px + 「刷新中…」实测 63px，加内边距 20 刚好 86px。 */
 .gt-btn--refresh { min-width: 86px; }
+/* 「导出 Markdown / 已复制 / 复制失败」来回切时宽度不跳。 */
+.gt-btn--export { min-width: 104px; }
 .gt-chip:hover, .gt-btn:hover { background: var(--gt-raised); }
 .gt-chip--on {
   background: var(--gt-raised);
@@ -2390,6 +2549,9 @@ const CSS = `
 .gt-row:hover .gt-discuss, .gt-row:focus-within .gt-discuss { opacity: 1; }
 .gt-discuss:focus-visible { opacity: 1; }
 .gt-discuss--busy { opacity: 1; }
+/* 两个按钮一起淡入时，「讨论」要压住右边沿。margin-left:auto 只给第一个：
+ * 两个都写 auto 会把间距摊成两半，悬停时整行标题会横向抖一下。 */
+.gt-discuss--start { margin-left: 0; }
 .gt-sep { white-space: pre; }
 .gt-move {
   flex: none; font-size: 10.5px; padding: 1px 6px; border-radius: 5px;
@@ -2710,6 +2872,9 @@ export default function activate(ctx) {
     digestSeq += 1;
     // 讨论也一起作废：卸载期间在飞的 startRun 回来后不能往 store 里写回执。
     discussSeq += 1;
+    // 「放入输入框」同理：卸载期间落地的 setDraft 不能往一个已经脱离的 store
+    // 里写回执（草稿本身是同步写的，拦不住也不必拦——写入那一刻插件还活着）。
+    draftSeq += 1;
     cancelSession(activeDigest, ctx);
     try {
       cssDisposer();
@@ -2729,6 +2894,7 @@ export default function activate(ctx) {
       discussNotice: "",
       discussWorkspace: "",
       discussWarning: "",
+      draftNotice: "",
     });
   };
 

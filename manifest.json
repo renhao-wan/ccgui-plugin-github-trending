@@ -20,6 +20,7 @@
     "plugin.storage",
     "theme",
     "events",
+    "composer:draft",
     "agent",
     "host:session",
     "host:workspace",

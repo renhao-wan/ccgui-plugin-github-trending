@@ -11,6 +11,8 @@
 - **变化对比**：与上一次成功快照相比，标出「新上榜 ↑ 降位 ↓」并列出掉榜
 - **中文解读**：点「生成解读」才调用模型，读完可自己判断要不要看
 - **单项目讨论**：榜单每一行悬停时出现「讨论」，在 AI 工作区里起一个宿主聊天会话，模型先找本地副本、找不到再读远程；会话出现在侧栏，**本页不会自动跳转**（页面会给出回执，点侧栏那一行打开）。第一次开会话时会把 AI 工作目录登记成侧栏工作区（侧栏随之多出一个以目录名命名的分组），否则宿主的会话表不收这个目录的会话，侧栏里看不见
+- **放入输入框**：同一行的另一种轻量用法——把整理好的提问写进当前会话的输入框，不建会话、不花 token，看一眼改两个字自己发（**会替换输入框里已有的草稿**）
+- **导出 Markdown**：工具栏一键把当前榜单复制成 Markdown（标题 + 时间 + 链接条目 + 掉榜清单），可以直接粘进周报、issue 或笔记
 - **不打扰**：侧栏徽标只在有新上榜时显示数字；不会后台自动跑
 
 ## 安装
@@ -31,6 +33,7 @@
 | `assets:directory` | 设置页里用系统文件夹选择器指定 AI 工作区 |
 | `host:session` | 「讨论」通过 `sessions.startRun` 起一个可在侧栏接管的聊天会话 |
 | `host:workspace` | 开会话前把 AI 工作目录登记成侧栏工作区（宿主只收已登记工作区下的会话） |
+| `composer:draft` | 「放入输入框」把提问写进当前会话的草稿（不发送） |
 | `ui:center-tab` / `ui:sidebar-entry` / `ui:settings-section` / `ui:command` | 界面入口 |
 | `storage` / `plugin.storage` | 设置与历史快照 |
 | `theme` / `events` | 注入样式、接收 agent 事件流 |
@@ -52,14 +55,15 @@
 - 首次抓取没有历史可对比，所以不会标「新上榜」；第二次刷新开始才有排名变化。
 - 新星库受 GitHub 搜索限流约束（未认证 10 次/分钟）。遇到限流会提示，并保留上一次的结果。
 - 解读有超时保护（默认 120 秒，开会话 30 秒）。超时会告诉用户原因，并**同时打断宿主侧进程**，不会在插件放手后继续消耗 token。
-- 「讨论」用到 `host:session` 与 `host:workspace`：从旧版本升级后需要重新「从本地目录安装」一次，权限只在安装时生效。
+- 「讨论」用到 `host:session` 与 `host:workspace`，「放入输入框」用到 `composer:draft`：从旧版本升级后需要重新「从本地目录安装」一次，权限只在安装时生效。
+- 「放入输入框」会**整体替换**当前输入框的草稿，宿主没有读取草稿的接口，所以插件无法提醒你「原本写了什么」。
 - 解读质量取决于所选引擎与模型；插件只负责把榜单事实整理成清单，不替模型编造细节。
 
 ## 开发
 
 ```bash
 npm run build     # 把 src/lib/*.mjs 内联进 main.js
-npm test          # 纯函数单测（解析 / 搜索归一化 / 对比 / prompt 预算）
+npm test          # 纯函数单测（解析 / 搜索归一化 / 对比 / prompt 预算 / 导出 Markdown）
 npm run smoke     # 假宿主冒烟：刷新 → 列表 → 解读 → 讨论 → 停止 → 限流 → 卸载
 npm run validate  # manifest、权限 ↔ 调用、禁用写法、产物自检
 npm run check     # 上面四步全跑
@@ -76,6 +80,7 @@ src/lib/parse.mjs     # Trending HTML → 结构化仓库
 src/lib/rising.mjs    # Search API → 结构化仓库
 src/lib/diff.mjs      # 快照对比：新上榜 / 掉榜 / 排名变化
 src/lib/prompt.mjs    # 解读 prompt 与事实预算
+src/lib/report.mjs    # 榜单 → Markdown 导出
 src/lib/catalog.mjs   # 宿主引擎清单 → agent.start 参数（readOnly / 工作区）
 scripts/build.mjs     # 内联构建（剥掉 export 前缀）
 scripts/smoke.mjs     # 假宿主冒烟

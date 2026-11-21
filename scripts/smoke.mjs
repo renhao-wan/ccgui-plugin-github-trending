@@ -251,8 +251,7 @@ const httpCalls = [];
 const agentStarts = [];
 const agentInterrupts = [];
 /** sessions.startRun 的入参；讨论功能的核心断言对象。 */
-const sessionStarts = [];
-let sessionStartError = null;
+const sessionStarts = [];let sessionStartError = null;
 /**
  * 宿主的侧栏工作区表。宿主只扫「已登记工作区」对应的会话目录，所以这张表
  * 是「会话能不能出现在侧栏」的前提。初始放入 pickedWorkspaceDir，模拟
@@ -265,6 +264,10 @@ const sessionStartsAtAdd = [];
 let workspaceAddError = null;
 /** 登记新工作区后插件应请宿主补扫会话目录（把之前看不见的旧会话找回来）。 */
 let sessionRefreshes = 0;
+/** composer.setDraft 写入的内容；「放入输入框」不能走会议话那条路。 */
+const drafts = [];
+let composerError = null;
+let composerAvailable = true;
 const cssCalls = [];
 const eventHandlers = new Set();
 
@@ -394,8 +397,17 @@ const ctx = {
   assets: {
     grantDirectory: async () => ({ grantId: "g-1", path: pickedWorkspaceDir }),
   },
-  // 会话：讨论功能走这个，不是 agent.start。
-  // 形态照 SDK 0.3.18 的 startRun 契约：新会话不带 sessionId，resolve runId + sessionId。
+  // 输入框写入：只写草稿，不发送。假宿主记下每次写入的内容。
+  // 故意做成 async：宿主契约是同步 void，但插件 await 了它，用例必须覆盖
+  // 「被 await 的同步实现」这条路径，否则真机上 await 一个 undefined 才会炸。
+  composer: {
+    setDraft: async (text) => {
+      if (!composerAvailable) throw new Error("ctx.composer is undefined");
+      if (composerError) throw composerError;
+      drafts.push(text);
+    },
+  },
+  // 会话：讨论功能走这个，不是 agent.start。  // 形态照 SDK 0.3.18 的 startRun 契约：新会话不带 sessionId，resolve runId + sessionId。
   sessions: {
     startRun: async (def) => {
       sessionStarts.push(def);
@@ -714,6 +726,17 @@ function discussButtonFor(tree, repo) {
   return hit;
 }
 
+/** 「放入输入框」按钮，同样按 aria-label 精确定位。 */
+function draftButtonFor(tree, repo) {
+  let hit = null;
+  const label = "把 " + repo + " 的提问放进输入框";
+  walk(tree, (n) => {
+    if (hit || n.type !== "button") return;
+    if (n.props && n.props["aria-label"] === label) hit = n;
+  });
+  return hit;
+}
+
 await check("每行都有讨论入口，点后向 sessions.startRun 开会话而不是 agent.start", async () => {
   const before = agentStarts.length;
   const btn = discussButtonFor(render(), "beta/two");
@@ -824,6 +847,113 @@ await check("登记侧栏工作区失败时不阻断会话，但要说清可能�
   } finally {
     workspaceAddError = null;
     dispose2();
+  }
+});
+
+await check("放入输入框：写草稿、不建会话、不进 agent", async () => {
+  drafts.length = 0;
+  const sessionsBefore = sessionStarts.length;
+  const agentsBefore = agentStarts.length;
+  const btn = draftButtonFor(render(), "beta/two");
+  assert.ok(btn, "每行都应有「放入输入框」");
+  assert.equal(btn.props.disabled, false, "空闲时应可点");
+  btn.props.onClick();
+  assert.ok(await waitFor(() => drafts.length === 1), "应调用 composer.setDraft");
+  // 这是「轻」的那条路：不花 token、不建会话。
+  assert.equal(sessionStarts.length, sessionsBefore, "放入输入框不应开会话");
+  assert.equal(agentStarts.length, agentsBefore, "放入输入框不应起 agent");
+  // 草稿内容与「讨论」用的是同一份 prompt：用户改两个字就能发，不必重写。
+  assert.match(drafts[0], /beta\/two/);
+  assert.match(drafts[0], /https:\/\/github\.com\/beta\/two/);
+  assert.match(drafts[0], /本地副本/);
+  assert.ok(await waitFor(() => textOf(render()).includes("的提问放进输入框")), "应给出回执");
+});
+
+await check("放入输入框失败时说明原因，并提示可以改用讨论", async () => {
+  drafts.length = 0;
+  composerError = new Error("missing permission composer:draft");
+  try {
+    draftButtonFor(render(), "alpha/one").props.onClick();
+    assert.ok(
+      await waitFor(() => textOf(render()).includes("composer:draft")),
+      "权限问题应直接点名权限，而不是笼统的网络错误",
+    );
+    assert.equal(drafts.length, 0, "失败时不应写进草稿");
+  } finally {
+    composerError = null;
+    // 把错误状态清掉，别污染后面用例的界面
+    draftButtonFor(render(), "alpha/one").props.onClick();
+    await waitFor(() => textOf(render()).includes("的提问放进输入框"));
+  }
+});
+
+await check("开会话期间「放入输入框」禁用，避免草稿被另一行覆盖", async () => {
+  drafts.length = 0;
+  const gated = [];
+  const original = ctx.sessions.startRun;
+  ctx.sessions.startRun = async (def) => {
+    sessionStarts.push(def);
+    await new Promise((r) => gated.push(r));
+    return { runId: "srun-y", sessionId: null };
+  };
+  try {
+    discussButtonFor(render(), "beta/two").props.onClick();
+    assert.ok(await waitFor(() => textOf(render()).includes("打开中")), "应进入打开中");
+    const target = draftButtonFor(render(), "alpha/one");
+    assert.equal(target.props.disabled, true, "开会话期间不应还能往别的行写入草稿");
+  } finally {
+    for (const r of gated) r();
+    ctx.sessions.startRun = original;
+    assert.ok(await waitFor(() => !textOf(render()).includes("打开中")));
+  }
+  assert.equal(drafts.length, 0, "整个过程中不应写草稿");
+});
+
+await check("导出 Markdown：复制的是当前榜单，不是渲染后的文本", async () => {
+  const prev = globalThis.navigator;
+  let copied = "";
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { writeText: async (t) => { copied = t; } } },
+  });
+  try {
+    let btn = null;
+    walk(render(), (n) => {
+      if (!btn && n.type === "button" && textOf(n) === "导出 Markdown") btn = n;
+    });
+    assert.ok(btn, "工具栏应有导出按钮");
+    btn.props.onClick();
+    assert.ok(await waitFor(() => copied.length > 0), "应写入剪贴板");
+    assert.match(copied, /^# 每日热点/);
+    assert.match(copied, /\*\*\[alpha\/one\]\(https:\/\/github\.com\/alpha\/one\)\*\*/);
+    // Markdown 源码而不是屏幕上的纯文本：粘出去还得是列表和链接。
+    assert.doesNotMatch(copied, /★ 1\.2k ·/);
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: prev });
+  }
+});
+
+await check("导出 Markdown：剪贴板不可用时报失败，不静默", async () => {
+  const prev = globalThis.navigator;
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
+  try {
+    // 先拿按钮（renderFresh 重置内部 state，文案回到「导出 Markdown」），
+    // 之后必须每帧重新渲染再读：回执是异步写进 useState 的，拿一次快照
+    // 只会在 Promise 落地前读到空字符串。
+    let btn = null;
+    walk(render(), (n) => {
+      if (!btn && n.type === "button" && textOf(n) === "导出 Markdown") btn = n;
+    });
+    assert.ok(btn);
+    btn.props.onClick();
+    assert.ok(
+      await waitFor(() => textOf(renderKeep(tab(), {})).includes("复制失败")),
+      "复制失败必须显示出来",
+    );
+  } finally {
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: prev });
+    // 复位导出状态，别把「复制失败」留给下一条用例。
+    renderFresh(tab(), {});
   }
 });
 
