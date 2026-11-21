@@ -427,10 +427,13 @@ async function fetchRising(settings) {
 }
 
 /** 「换一批」：伪随机档位 + 随机页，见 src/lib/discover.mjs 的说明。 */
+// 上一批的档位/页：撞上了就重抽，避免点了「换一批」列表一模一样。
+let lastDiscoverPick = null;
 async function fetchDiscover(settings) {
-  const spec = buildDiscoverQuery();
+  const spec = buildDiscoverQuery(Math.random, lastDiscoverPick);
   const result = await fetchSearch(spec, settings, { emptyMessage: "这一批没抽到仓库，再换一批" });
   if (result.ok) {
+    lastDiscoverPick = { band: spec.band, page: spec.page };
     // 把星档带回去，状态行要说出「这批是从哪个档位抽的」。
     result.band = spec.band;
     result.repos = shapeDiscoverRows(result.repos);
@@ -475,9 +478,11 @@ async function fetchReadme(repo, settings) {
   const res = await httpGet(url, headers);
   if (res.status === 404) return { ok: false, message: "这个仓库没有 README" };
   if (res.status === 403 || res.status === 429) {
+    // README 走的是核心 REST API，配额与 Search API 不同：未认证 60 次/小时，
+    // 认证后 5000 次/小时。别照抄 Search 的「10 次/分钟」。
     return {
       ok: false,
-      message: token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（10 次/分钟），可在设置里填 Token",
+      message: token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（60 次/小时），可在设置里填 Token 提高额度",
     };
   }
   if (res.status < 200 || res.status >= 300) return { ok: false, message: "GitHub 返回 HTTP " + res.status };
@@ -671,6 +676,8 @@ async function refresh(ctx, options) {
 
   // 讨论的回执只服务于那一次点击：刷新是用户明确表示的「再来一次」，
   // 回执要让位给榜单本身的状态说明，失败的那条同理。
+  // README 预览也随之作废：列表要换了，在飞的响应回来后不能往新列表里写旧正文。
+  readmeSeq += 1;
   set({
     loading: true,
     httpError: "",
@@ -1531,7 +1538,9 @@ function RepoRow({ row, ctx, discussing, readme }) {
               "+" + fmtNumber(row.gain) + " " + gainLabel(row.gainPeriod),
             )
           : null,
-        Number.isFinite(row.ageDays) ? h("span", { className: "gt-stat" }, row.ageDays + " 天前创建") : null,
+        Number.isFinite(row.ageDays) && !(readme && readme.view === "browse")
+          ? h("span", { className: "gt-stat" }, row.ageDays + " 天前创建")
+          : null,
       ),
       readmeOpen ? h(ReadmePanel, { readme, href }) : null,
     ),
@@ -1597,8 +1606,9 @@ function DiscoverBar({ snap, ctx }) {
   const text = textState[0];
   const setText = textState[1];
   // 搜索生效时输入框要显示那个词：否则清空后看不出「现在这批是搜出来的」。
+  // 空串也必须同步——「换一批」后留着旧关键词，页面就在说谎。
   R.useEffect(() => {
-    if (snap.discoverTerm) setText(snap.discoverTerm);
+    setText(snap.discoverTerm || "");
   }, [snap.discoverTerm]);
 
   const busy = snap.loading;
@@ -1635,6 +1645,7 @@ function DiscoverBar({ snap, ctx }) {
         value: text,
         placeholder: "搜仓库名，回车去 GitHub 查",
         "aria-label": "搜索仓库名",
+        maxLength: SEARCH_TERM_LIMIT,
         disabled: busy,
         onChange: (event) => setText(event && event.target ? String(event.target.value || "") : ""),
         // Esc 清空：输入框里最常见的「算了」，比逼用户逐个删字强。
@@ -2578,18 +2589,25 @@ function SettingsSection() {
   /* ---- 讨论提示词 ---- */
 
   // 归一化是幂等的，且必须每次都过：磁盘上可能是手改过的数据。
+  // 有名字但正文空的那份会保留在列表里——用户正在重写，不能当场消失。
   const prompts = normalisePrompts(form.prompts);
-  const defaultId = prompts.some((p) => p.id === form.defaultPromptId)
+  // 「默认」标记必须落在真正会生效的那份上，否则界面说 A、实际用 B。
+  // 空正文的条目会被 pickPrompt 跳过，这里也跟着跳过。
+  const usable = prompts.filter((p) => p.text.trim() !== "");
+  const defaultId = usable.some((p) => p.id === form.defaultPromptId)
     ? form.defaultPromptId
-    : prompts.length > 0
-      ? prompts[0].id
+    : usable.length > 0
+      ? usable[0].id
       : "";
 
   /** 写回列表。顺手修正默认值——默认指向一份刚被删掉的提示词时不能悬空。 */
   const writePrompts = (next, nextDefault) => {
+    // 有名字的空正文条目必须留住：用户全选删除正文是想重写，不是想删掉这一份。
     const list = normalisePrompts(next);
     const wanted = nextDefault === undefined ? form.defaultPromptId : nextDefault;
-    const fixed = list.some((p) => p.id === wanted) ? wanted : list.length > 0 ? list[0].id : "";
+    // 空正文的不会生效（pickPrompt 跳过），默认值也不该指向它们。
+    const usable = list.filter((p) => p.text.trim() !== "");
+    const fixed = usable.some((p) => p.id === wanted) ? wanted : usable.length > 0 ? usable[0].id : "";
     setForm((prev) => Object.assign({}, prev || snap.settings, { prompts: list, defaultPromptId: fixed }));
   };
 
@@ -3598,8 +3616,10 @@ export default function activate(ctx) {
         // 提示词来自磁盘：可能是旧版本的空值、也可能是手改过的坏形状。
         // 归一化在这里做一次，后面所有读取点都不用再防。
         merged.prompts = normalisePrompts(merged.prompts);
-        if (!merged.prompts.some((p) => p.id === merged.defaultPromptId)) {
-          merged.defaultPromptId = merged.prompts.length > 0 ? merged.prompts[0].id : "";
+        // 默认值只落在真正会生效的那份上（空正文会被 pickPrompt 跳过）。
+        const usable = merged.prompts.filter((p) => p.text.trim() !== "");
+        if (!usable.some((p) => p.id === merged.defaultPromptId)) {
+          merged.defaultPromptId = usable.length > 0 ? usable[0].id : "";
         }
         set({ settings: merged });
       }
@@ -3646,11 +3666,11 @@ export default function activate(ctx) {
       discussResumed: false,
       discussPromptName: "",
       readmeOpen: "",
-    readmeLoading: false,
-    readmeError: "",
-    readmeText: "",
-    readmeTruncated: false,
-    readmeTotal: 0,
+      readmeLoading: false,
+      readmeError: "",
+      readmeText: "",
+      readmeTruncated: false,
+      readmeTotal: 0,
     });
   };
 

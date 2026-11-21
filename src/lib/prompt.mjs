@@ -162,16 +162,29 @@ export const DEFAULT_DISCUSS_TEMPLATE = [
 ].join("\n");
 
 /** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
-export const PROMPT_TEXT_LIMIT = 20000;/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
+export const PROMPT_TEXT_LIMIT = 20000;
+/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
 export const PROMPT_COUNT_LIMIT = 8;
 /** 名字上限：侧栏/下拉里只放得下一行。 */
 export const PROMPT_NAME_LIMIT = 40;
+
+/** 生成一个不与 seen 冲突的 id。确定性而非随机：每次渲染 id 跳变会让「设为默认」点不中。 */
+function freshId(seen, start) {
+  let n = start;
+  while (seen.has("p" + n)) n += 1;
+  return "p" + n;
+}
 
 /**
  * 把存下来的提示词列表归一化。
  *
  * 设置是从磁盘读的，可能被手改、可能来自旧版本（那时候只有一个字符串）。
  * 这里必须是**不会抛错**的：一份坏数据不能让整个设置页白屏。
+ *
+ * 只丢「完全空的壳」（没有名字也没有正文）。**有名字但正文空**的必须保留：
+ * 用户全选删除正文准备重写时，这一份不能当场消失——读盘与编辑走同一个
+ * 函数，只有一套行为，才不会出现「编辑时还在、重开就没了」。
+ * 空正文不会真的喂给模型：pickPrompt 会跳过它们。
  *
  * @param {unknown} raw
  * @returns {Array<{ id: string, name: string, text: string }>}
@@ -183,13 +196,14 @@ export function normalisePrompts(raw) {
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
     const text = String(item.text === undefined || item.text === null ? "" : item.text);
-    if (!text.trim()) continue; // 空正文的条目没有任何用处，直接丢
+    const name = String(item.name === undefined || item.name === null ? "" : item.name).trim();
+    if (!text.trim() && !name) continue; // 连名字都没有：旧版/手改留下的空壳
     let id = String(item.id || "").trim();
-    if (!id || seen.has(id)) id = "p" + (out.length + 1) + Math.random().toString(36).slice(2, 6);
+    if (!id || seen.has(id)) id = freshId(seen, out.length + 1);
     seen.add(id);
     out.push({
       id,
-      name: String(item.name || "").trim().slice(0, PROMPT_NAME_LIMIT) || "未命名",
+      name: name.slice(0, PROMPT_NAME_LIMIT) || "未命名",
       text: text.slice(0, PROMPT_TEXT_LIMIT),
     });
     if (out.length >= PROMPT_COUNT_LIMIT) break;
@@ -201,15 +215,18 @@ export function normalisePrompts(raw) {
  * 选出这次讨论实际用哪份提示词。
  *
  * 三级回落：设置里的默认 → 列表第一份 → 内置模板。**永远返回一份可用模板**，
- * 因为「没有提示词」不该表现为按钮点了没反应。
+ * 因为「没有提示词」不该表现为按钮点了没反应。空正文的条目（正在编辑/被清空）
+ * 不能当选：选它等于给模型一个空 prompt。
  *
  * @param {Array<{ id: string, name: string, text: string }>} prompts
  * @param {string} defaultId
  * @returns {{ id: string, name: string, text: string }}
  */
 export function pickPrompt(prompts, defaultId) {
-  const list = Array.isArray(prompts) ? prompts : [];
-  const hit = list.find((p) => p && p.id === defaultId);
+  const list = (Array.isArray(prompts) ? prompts : []).filter(
+    (p) => p && typeof p === "object" && String(p.text || "").trim() !== "",
+  );
+  const hit = list.find((p) => p.id === defaultId);
   if (hit) return hit;
   if (list.length > 0) return list[0];
   return { id: "", name: "默认", text: DEFAULT_DISCUSS_TEMPLATE };
@@ -253,7 +270,8 @@ export function buildDiscussPrompt(input) {
   if (Number.isFinite(row.stars)) facts.push("- 总 star：" + row.stars);
   if (Number.isFinite(row.gain)) facts.push("- 近期增长：+" + row.gain + "/" + (row.gainPeriod || "recent"));
   if (Number.isFinite(row.rank)) facts.push("- 当前名次：" + row.rank + "（" + scope + "）");
-  if (Number.isFinite(row.ageDays)) facts.push("- 仓库创建于 " + row.ageDays + " 天前");
+  // 「随便看看」没有名次也没有涨跌，「X 天前创建」对随机批次只是噪音。
+  if (Number.isFinite(row.ageDays) && input.view !== "browse") facts.push("- 仓库创建于 " + row.ageDays + " 天前");
   if (row.isNew) facts.push("- 本次新上榜");
   else if (Number.isFinite(row.rankDelta) && row.rankDelta !== 0) {
     facts.push("- 较上次" + (row.rankDelta > 0 ? "上升 " : "下降 ") + Math.abs(row.rankDelta) + " 位");

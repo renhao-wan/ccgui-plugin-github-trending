@@ -4,6 +4,7 @@ import {
   STAR_BANDS,
   DISCOVER_PAGE_SIZE,
   DISCOVER_MAX_PAGE,
+  SEARCH_TERM_LIMIT,
   buildDiscoverQuery,
   discoverUrl,
   buildSearchQuery,
@@ -91,6 +92,36 @@ test("搜索：只匹配仓库名，且排除 fork/归档", () => {
   assert.match(buildSearchQuery("  vite  "), /^vite in:name/);
   // 用户输入里的换行不能进查询语法
   assert.equal(buildSearchQuery("a\nb"), "a b in:name fork:false archived:false");
+});
+
+test("搜索：限定符语法被拆成字面量，不能借搜索框注入 stars:/language:", () => {
+  // `in:name` 只作用在紧邻前一个词上，原样拼入会让 stars: 变成真正的过滤条件
+  assert.equal(buildSearchQuery("stars:>100000"), "stars >100000 in:name fork:false archived:false");
+  assert.equal(buildSearchQuery("language:rust"), "language rust in:name fork:false archived:false");
+  // 布尔运算符不能穿透
+  assert.equal(buildSearchQuery("language:rust OR repo:foo"), "language rust repo foo in:name fork:false archived:false");
+  // 引号/反斜杠是转义语法，一并去掉
+  assert.equal(buildSearchQuery('"a b"'), "a b in:name fork:false archived:false");
+});
+
+test("搜索：超长输入被限长，不会拼出会让网关 414 的 URL", () => {
+  const q = buildSearchQuery("x".repeat(3000));
+  assert.ok(q.length <= SEARCH_TERM_LIMIT + 40, "query 长度应受 SEARCH_TERM_LIMIT 约束");
+  // 只剩标点在转义后应当视作空输入
+  assert.equal(buildSearchQuery(":::\\\\"), null);
+});
+
+test("换一批：与上一批撞上组合时重抽一次", () => {
+  const fixed = () => 0; // 恒定第一档第一页
+  const first = buildDiscoverQuery(fixed);
+  const again = buildDiscoverQuery(fixed, { band: first.band, page: first.page });
+  // 随机源输出恒定，无法真的换一批；但不能抛错，且仍落在合法范围
+  assert.ok(again.page >= 1 && again.page <= DISCOVER_MAX_PAGE);
+  // 序列推进后能换到别的组合
+  const seq = seeded([0, 0, 0.99, 0.99]);
+  const a = buildDiscoverQuery(seq);
+  const b = buildDiscoverQuery(seq, { band: a.band, page: a.page });
+  assert.notEqual(b.band + ":" + b.page, a.band + ":" + a.page, "撞上时应重抽");
 });
 
 test("搜索：空输入返回 null，让调用方回到换一批", () => {

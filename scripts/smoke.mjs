@@ -1388,6 +1388,27 @@ await check("随便看看：按仓库名搜索走 in:name，并标出精确命�
   assert.match(textOf(tree), /不是排行榜/);
 });
 
+await check("随便看看：搜索生效时输入框显示关键词，换一批后自动清空", async () => {
+  submitSearch("random/pick");
+  assert.ok(await waitFor(() => textOf(render()).includes("fuzzy hit")));
+  // effect 里的 setText 在本次渲染之后才生效：像 React 一样再渲染一帧再读。
+  browseKeep();
+  assert.equal(searchInputOf(browseKeep()).props.value, "random/pick", "搜索生效时输入框应显示关键词");
+
+  // 列表回到随机批次，输入框却还写着关键词的话，页面三处互相矛盾。
+  findByText(render(), "换一批").props.onClick();
+  assert.ok(await waitFor(() => textOf(render()).includes("a random pick")));
+  browseKeep();
+  assert.equal(searchInputOf(browseKeep()).props.value, "", "换一批后输入框必须清空");
+});
+
+await check("随便看看：搜索框限长，不把超长输入拼进 URL", async () => {
+  submitSearch("random/pick");
+  assert.ok(await waitFor(() => textOf(render()).includes("fuzzy hit")));
+  const input = searchInputOf(browseKeep());
+  assert.ok(Number.isFinite(input.props.maxLength), "输入框应有 maxLength，否则粘贴超长文本会拼出 414 的 URL");
+});
+
 await check("随便看看：搜不到时说清楚没搜到，而不是「榜单为空」", async () => {
   nameSearchPayload = { status: 200, body: JSON.stringify({ total_count: 0, items: [] }) };
   submitSearch("根本没有这个仓库");

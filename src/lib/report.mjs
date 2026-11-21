@@ -40,7 +40,7 @@ function boardUrl(row) {
 }
 
 /** 一行榜单的 Markdown 条目；返回数组，每条是 Markdown 的一行（不含换行符）。 */
-function boardItem(row) {
+function boardItem(row, showAge = true) {
   if (!row || typeof row !== "object") return [];
   const repo = String(row.repo || "").trim();
   if (!repo) return [];
@@ -60,7 +60,8 @@ function boardItem(row) {
   else if (Number.isFinite(row.rankDelta) && row.rankDelta !== 0) {
     meta.push((row.rankDelta > 0 ? "↑" : "↓") + Math.abs(row.rankDelta) + " 位");
   }
-  if (Number.isFinite(row.ageDays)) meta.push(row.ageDays + " 天前创建");
+  // 「随便看看」是随机批次/搜索结果，「X 天前创建」在这里只是噪音。
+  if (showAge && Number.isFinite(row.ageDays)) meta.push(row.ageDays + " 天前创建");
 
   // 续行缩进两个空格：无序列表的续行在 CommonMark 里就是这个宽度。
   return meta.length > 0 ? [first, "  " + meta.join(" · ")] : [first];
@@ -80,7 +81,7 @@ function boardItem(row) {
 export function buildBoardMarkdown(input) {
   const rows = Array.isArray(input && input.rows) ? input.rows : [];
   const dropped = Array.isArray(input && input.dropped) ? input.dropped : [];
-  const items = rows.map(boardItem).filter((lines) => lines.length > 0);
+  const items = rows.map((row) => boardItem(row, input.view !== "browse")).filter((lines) => lines.length > 0);
   if (items.length === 0) return "";
 
   const scope =

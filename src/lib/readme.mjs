@@ -11,6 +11,9 @@
 /** 预览长度上限。够看清「这是什么项目」，又不至于把整页撑成一份文档。 */
 const README_PREVIEW_LIMIT = 2000;
 
+/** 代码围栏行（``` 或 ~~~）。行内的反引号不在此列：只认行首。 */
+const FENCE_LINE = /^\s*(```+|~~~+)/;
+
 /**
  * 去掉 YAML frontmatter（Jekyll / Hugo 等静态站项目的 README 常见）。
  *
@@ -46,15 +49,40 @@ function stripBadgesAndImages(text) {
 
 /**
  * 去 HTML 标签。只保留内部文字（`<b>粗</b>` → `粗`），
- * `<br>`、`<hr>` 这类无内容的换成换行，避免两段被粘成一行。
+ * `<br>`、`<hr>` 这类无内容的换成换行，块级结束标签也换成换行，
+ * 避免 `<summary>a</summary>b` 被粘成 `ab`。
  */
 function stripHtmlTags(text) {
   return String(text || "")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<hr\s*\/?>/gi, "\n\n")
+    .replace(/<\/(p|div|li|ul|ol|summary|details|h[1-6]|tr|td|th|blockquote|section|article|table)\s*>/gi, "\n")
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<\/?[a-zA-Z][^>]*>/g, "");
     // 只删「看起来是标签」的：`a < b` 里的 `<` 后面不是字母，不会被误删。
+}
+
+/**
+ * 只对**行内代码之外**的文字跑 fn。
+ *
+ * `Use \`<T>\` generics.` 里的尖括号是代码，去标签会把内容整段删掉。
+ * 做法：先把行内代码换成占位符，跑完 fn 再原样换回来。
+ *
+ * @param {string} text
+ * @param {(chunk: string) => string} fn
+ * @returns {string}
+ */
+function mapInlineCode(text, fn) {
+  const parts = [];
+  const masked = String(text || "").replace(/`[^`\n]*`/g, (whole) => {
+    parts.push(whole);
+    return "\u0000" + (parts.length - 1) + "\u0000";
+  });
+  const out = String(fn(masked));
+  return out.replace(/\u0000(\d+)\u0000/g, (whole, i) => {
+    const hit = parts[Number(i)];
+    return hit === undefined ? whole : hit;
+  });
 }
 
 /** 折叠连续空行与行尾空白。 */
@@ -68,13 +96,83 @@ function tidyWhitespace(text) {
 }
 
 /**
+ * 只对**代码围栏之外**的行跑 fn，围栏内的内容逐字保留。
+ *
+ * 为什么必须分段：`Array<string>`、`Vec<T>`、代码块里的 `![alt](url)` 都是
+ * 合法代码，却被去标签/去图片的正则当成 HTML 与图片删掉——Rust / C++ / TS
+ * 项目的 README 开头恰好全是这类代码。README 预览的价值就在这些代码上。
+ *
+ * @param {string} text
+ * @param {(chunk: string) => string} fn
+ * @returns {string}
+ */
+function mapOutsideFences(text, fn) {
+  const lines = String(text || "").split("\n");
+  const out = [];
+  let plain = [];
+  let fence = ""; // 当前开启围栏的标记（``` / ~~~），空串 = 围栏外
+  const flush = () => {
+    if (plain.length === 0) return;
+    out.push(...String(fn(plain.join("\n"))).split("\n"));
+    plain = [];
+  };
+  for (const line of lines) {
+    const hit = FENCE_LINE.exec(line);
+    if (hit) {
+      const mark = hit[1];
+      if (!fence) {
+        flush();
+        fence = mark;
+      } else if (mark[0] === fence[0] && mark.length >= fence.length) {
+        // 关闭围栏：同字符且不短于开启标记（CommonMark 的规则）
+        fence = "";
+      }
+      out.push(line);
+      continue;
+    }
+    if (fence) out.push(line);
+    else plain.push(line);
+  }
+  flush();
+  return out.join("\n");
+}
+
+/**
  * README 原文 → 可渲染的预览文本。
  * @param {string} text
  * @returns {string}
  */
 export function prepareReadme(text) {
   if (!text) return "";
-  return tidyWhitespace(stripHtmlTags(stripBadgesAndImages(stripFrontmatter(String(text)))));
+  const body = mapOutsideFences(stripFrontmatter(String(text)), (chunk) =>
+    // 行内代码里的 `<T>`、`![x](y)` 也属于代码，一并保护。
+    mapInlineCode(chunk, (masked) => stripHtmlTags(stripBadgesAndImages(masked))),
+  );
+  return tidyWhitespace(body);
+}
+
+/**
+ * 找出代码围栏区间，偏移量以字符计。末尾未闭合的那一处 `end = Infinity`。
+ * 用于两件事：断点别落在代码块里、硬切之后补闭合。
+ */
+function fenceSpans(text) {
+  const spans = [];
+  let offset = 0;
+  let open = null;
+  for (const line of String(text || "").split("\n")) {
+    const hit = FENCE_LINE.exec(line);
+    if (hit) {
+      const mark = hit[1];
+      if (!open) open = { start: offset, mark };
+      else if (mark[0] === open.mark[0] && mark.length >= open.mark.length) {
+        spans.push({ start: open.start, end: offset + line.length, mark: open.mark });
+        open = null;
+      }
+    }
+    offset += line.length + 1;
+  }
+  if (open) spans.push({ start: open.start, end: Infinity, mark: open.mark });
+  return spans;
 }
 
 /**
@@ -82,6 +180,9 @@ export function prepareReadme(text) {
  *
  * 在句子中间硬切会让「前 2000 字」读起来像断线；优先在最近的换行处收口，
  * 没有换行再退到句子边界，都没有才硬切。
+ *
+ * 代码块要特殊对待：切在 ``` 中间会让渲染器把后文全当成代码，所以断点只认
+ * 围栏之外的位置；实在找不到就停在围栏开头；最后再兜一次未闭合围栏。
  * @param {string} text
  * @param {number} [limit]
  * @returns {{ text: string, truncated: boolean, total: number }}
@@ -94,15 +195,31 @@ export function truncateReadme(text, limit = README_PREVIEW_LIMIT) {
   // 只在前 80%~100% 区间找断点：太靠前会白白丢掉一大段。
   const floor = Math.floor(max * 0.8);
   const window = src.slice(floor, max);
+  const spans = fenceSpans(src);
+  const inFence = (at) => spans.some((s) => at > s.start && at < s.end);
+
   const candidates = ["\n\n", "\n", "。", ". ", "；", "; "];
+  let cut = -1;
   for (const sep of candidates) {
-    const at = window.lastIndexOf(sep);
+    let at = window.lastIndexOf(sep);
+    // 落进代码块的断点不能用，接着往前找。
+    while (at >= 0 && inFence(floor + at + sep.length)) at = at > 0 ? window.lastIndexOf(sep, at - 1) : -1;
     if (at >= 0) {
-      const cut = floor + at + sep.length;
-      return { text: src.slice(0, cut).trimEnd(), truncated: true, total: src.length };
+      cut = floor + at + sep.length;
+      break;
     }
   }
-  return { text: src.slice(0, max).trimEnd(), truncated: true, total: src.length };
+  if (cut < 0) {
+    // 候选断点全在代码块里：停在围栏开头，至少不产出半截代码。
+    const nextFence = spans.find((s) => s.start > floor && s.start < max);
+    cut = nextFence ? nextFence.start : max;
+  }
+
+  let out = src.slice(0, cut).trimEnd();
+  // 兜底：硬切落在代码块中间时补一个闭合围栏，否则后文会被吞进代码块。
+  const dangling = fenceSpans(out).find((s) => !Number.isFinite(s.end));
+  if (dangling) out = out + "\n" + dangling.mark;
+  return { text: out, truncated: true, total: src.length };
 }
 
 /**

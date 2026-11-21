@@ -113,3 +113,12 @@ test("随便看看：scopeText 写进导出标题，不冒充 Trending 榜", () 
   assert.match(md, /^# 每日热点 · GitHub 上按仓库名搜索「react」的结果/m);
   assert.doesNotMatch(md, /GitHub Trending/);
 });
+
+test("随便看看：不写「X 天前创建」（随机批次里是噪音）", () => {
+  const row = { repo: "a/b", stars: 100, ageDays: 900 };
+  const browse = buildBoardMarkdown({ view: "browse", scopeText: "随机抽的一批", rows: [row], dropped: [] });
+  assert.doesNotMatch(browse, /天前创建/);
+  // 榜单视图仍然保留：它确实在说明「新上榜的仓库有多新」
+  const daily = buildBoardMarkdown({ view: "trending", period: "daily", rows: [row], dropped: [] });
+  assert.match(daily, /900 天前创建/);
+});

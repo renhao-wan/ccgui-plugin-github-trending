@@ -66,6 +66,36 @@ test("截断：完全找不到边界才硬切，且不超上限", () => {
   assert.equal(r.total, 5000);
 });
 
+test("README 预处理：围栏内的代码逐字保留（Vec<T>、图片语法都不动）", () => {
+  const src = "```ts\nconst a: Array<string> = [];\n![img](https://x/y.png)\n```";
+  assert.equal(prepareReadme(src), src);
+  // 围栏外的 badge 仍然要删
+  assert.equal(prepareReadme("[![b](https://i/b.svg)](https://ci)\n```ts\nx<T>\n```"), "```ts\nx<T>\n```");
+});
+
+test("README 预处理：行内代码里的尖括号不被当 HTML 删掉", () => {
+  assert.equal(prepareReadme("Use `<T>` generics."), "Use `<T>` generics.");
+  // 行内代码之外的小于号本来也不会被删
+  assert.match(prepareReadme("Use `<T>` 当 a < b 时"), /当 a < b 时/);
+});
+
+test("README 预处理：块级标签换成换行，不把两段粘成一行", () => {
+  assert.equal(prepareReadme("<details><summary>more</summary>body</details>"), "more\nbody");
+});
+
+test("截断：切在代码块中间时补闭合围栏", () => {
+  const r = truncateReadme("```js\n" + "x".repeat(3000) + "\n```", 2000);
+  assert.equal(r.truncated, true);
+  assert.equal((r.text.match(/```/g) || []).length % 2, 0, "围栏必须成对，否则后文会被吞进代码块");
+});
+
+test("截断：断点优先落在围栏之外", () => {
+  // 1800 字正文 + 代码块 + 收尾文字：不应当在围栏中间断
+  const src = "a".repeat(1700) + "\n```py\n" + "b".repeat(400) + "\n```\n收尾";
+  const r = truncateReadme(src, 2000);
+  assert.equal((r.text.match(/```/g) || []).length % 2, 0);
+});
+
 test("响应还原：raw 正文原样返回", () => {
   assert.equal(readmeTextFromBody("# 标题"), "# 标题");
   // 看起来像 JSON 但解析失败，退回原文

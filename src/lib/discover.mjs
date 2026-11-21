@@ -45,22 +45,36 @@ function clampInt(value, min, max) {
  * 生成一批抽样的请求参数。
  *
  * @param {() => number} [rand] 注入随机源，便于单测得到确定结果
+ * @param {{ band: object, page: number }|null} [avoid] 上一批的组合；撞上就重抽，
+ *   否则「换一批」偶尔抽回同一批而界面毫无变化，用户会以为按钮坏了。
  * @returns {{ q: string, sort: string, order: string, perPage: number, page: number, band: object }}
  */
-export function buildDiscoverQuery(rand = Math.random) {
+export function buildDiscoverQuery(rand = Math.random, avoid = null) {
   const r = typeof rand === "function" ? rand : Math.random;
-  const idx = clampInt(Math.floor(r() * STAR_BANDS.length), 0, STAR_BANDS.length - 1);
-  const band = STAR_BANDS[idx];
-  const page = clampInt(Math.floor(r() * DISCOVER_MAX_PAGE) + 1, 1, DISCOVER_MAX_PAGE);
-  const stars = band.max > 0 ? "stars:" + band.min + ".." + band.max : "stars:>" + band.min;
+  const draw = () => {
+    const idx = clampInt(Math.floor(r() * STAR_BANDS.length), 0, STAR_BANDS.length - 1);
+    return {
+      band: STAR_BANDS[idx],
+      page: clampInt(Math.floor(r() * DISCOVER_MAX_PAGE) + 1, 1, DISCOVER_MAX_PAGE),
+    };
+  };
+  const last = avoid && typeof avoid === "object" ? avoid : null;
+  let pick = draw();
+  // 组合只有 档位数 × 页数 种；最多试 8 次，撞不上就认（随机源坏掉时不会死循环）。
+  if (last) {
+    for (let i = 0; i < 8 && pick.band === last.band && pick.page === last.page; i += 1) pick = draw();
+  }
+  const stars = pick.band.max > 0
+    ? "stars:" + pick.band.min + ".." + pick.band.max
+    : "stars:>" + pick.band.min;
   return {
     // 排除 fork 与归档仓：这两类占了热门搜结果的一大半，抽进来只会显得噪音。
     q: stars + " fork:false archived:false",
     sort: "stars",
     order: "desc",
     perPage: DISCOVER_PAGE_SIZE,
-    page,
-    band,
+    page: pick.page,
+    band: pick.band,
   };
 }
 
@@ -83,19 +97,33 @@ export function discoverUrl(spec) {
 }
 
 /**
+ * 搜索词上限：GitHub 的 query 过长会被网关拒掉（414），状态行也放不下。
+ * 仓库名的实际长度远小于它，正常输入不会被截断。
+ */
+export const SEARCH_TERM_LIMIT = 80;
+
+/**
  * 把用户在搜索框里打的字变成 q。
  *
- * 只搜仓库名（用户选的）：`in:name`。**不加引号不做模糊语法**——把用户输入
- * 直接拼进查询语法等于让他能写 `stars:>100000` 之类的表达式，那不是「搜索
- * 仓库名」，而且拼错了会得到一堆看不懂的结果。
+ * 只搜仓库名（用户选的）：`in:name`。输入必须被**当成字面量**：直接把用户
+ * 输入拼进查询语法，等于允许他写 `stars:>100000`、`language:rust` 这类限定符，
+ * 那不是「搜索仓库名」，结果也会让他看不懂。所以先去掉 `:`（限定符语法）、
+ * 引号与反斜杠（转义/短语语法），再折叠空白并限长。
  *
  * @param {string} term
  * @returns {string|null} 空输入返回 null（调用方据此回到「换一批」）
  */
 export function buildSearchQuery(term) {
-  // 换行/制表等控制字符会破坏查询，折叠成空格。
   const cleaned = String(term === undefined || term === null ? "" : term)
+    // 换行/制表等控制字符会破坏查询，先去成空格。
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    // 限定符与转义语法：去掉冒号/引号/反斜杠，`stars:>100` 就只剩字面量。
+    .replace(/[:"\\]/g, " ")
+    // 布尔运算符是查询语法的一部分，不当作仓库名。
+    .replace(/\b(?:OR|AND|NOT)\b/g, " ")
     .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, SEARCH_TERM_LIMIT)
     .trim();
   if (!cleaned) return null;
   // GitHub 的搜索把 `/` 当语法分隔，用户想找 owner/repo 时只取该按名字匹配。

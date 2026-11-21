@@ -240,7 +240,7 @@ test("自定义模板：空串/纯空白时退回内置模板", () => {
   }
 });
 
-test("normalisePrompts：丢掉空正文，补齐缺失 id 与名字", () => {
+test("normalisePrompts：丢掉完全空的壳，补齐缺失 id 与名字", () => {
   const list = normalisePrompts([
     { name: "  ", text: "   " },
     { text: "正文" },
@@ -249,7 +249,7 @@ test("normalisePrompts：丢掉空正文，补齐缺失 id 与名字", () => {
     "不是对象",
     null,
   ]);
-  assert.equal(list.length, 3, "两条空正文和两条非对象都该丢掉");
+  assert.equal(list.length, 3, "一条纯空壳和两条非对象都该丢掉");
   assert.ok(list[0].id, "缺 id 的要补一个");
   assert.equal(list[0].name, "未命名");
   assert.equal(list[1].id, "dup");
@@ -260,6 +260,26 @@ test("normalisePrompts：非数组输入返回空列表，不抛错", () => {
   for (const raw of [null, undefined, "", 0, {}, "x"]) {
     assert.deepEqual(normalisePrompts(raw), []);
   }
+});
+
+test("normalisePrompts：有名字但正文为空的那份要保留（编辑时不能当场消失）", () => {
+  const raw = [{ id: "a", name: "甲", text: "" }, { id: "b", name: "乙", text: "正文" }];
+  const list = normalisePrompts(raw);
+  assert.equal(list.length, 2, "用户删空正文准备重写时，这一份不能消失");
+  assert.equal(list[0].text, "");
+  // 读盘与编辑走同一个函数：同一份输入重开一次结果不变
+  assert.deepEqual(normalisePrompts(list), list);
+});
+
+test("normalisePrompts：对同一份输入幂等（id 不会每次跳变）", () => {
+  const raw = [{ name: "无 id", text: "x" }, { name: "重复", id: "x", text: "a" }, { name: "又重复", id: "x", text: "b" }];
+  const once = normalisePrompts(raw);
+  assert.deepEqual(normalisePrompts(once), once, "归一化过的输入再归一化必须不变，否则「设为默认」会点不中");
+});
+
+test("normalisePrompts：重复 id 补齐是确定性的，不靠随机", () => {
+  const raw = [{ id: "dup", name: "甲", text: "A" }, { id: "dup", name: "乙", text: "B" }];
+  assert.deepEqual(normalisePrompts(raw).map((p) => p.id), normalisePrompts(raw).map((p) => p.id));
 });
 
 test("normalisePrompts：份数与长度都有上限", () => {
@@ -279,6 +299,15 @@ test("pickPrompt：默认命中 → 第一份 → 内置模板，永远有可用
   assert.deepEqual(pickPrompt(prompts, "不存在"), prompts[0], "默认悬空时用第一份");
   assert.equal(pickPrompt([], "x").text, DEFAULT_DISCUSS_TEMPLATE);
   assert.equal(pickPrompt(null, "").text, DEFAULT_DISCUSS_TEMPLATE);
+});
+
+test("pickPrompt：空正文的条目不能当选（否则模型收到空 prompt）", () => {
+  const prompts = [
+    { id: "a", name: "空", text: "   " },
+    { id: "b", name: "有", text: "B" },
+  ];
+  assert.equal(pickPrompt(prompts, "a").id, "b", "默认指向空正文时回落到第一份有内容的");
+  assert.equal(pickPrompt([{ id: "a", name: "空", text: "" }], "a").text, DEFAULT_DISCUSS_TEMPLATE);
 });
 
 test("pickPrompt 的结果能直接喂给 buildDiscussPrompt", () => {

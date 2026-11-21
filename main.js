@@ -419,22 +419,36 @@ function clampInt(value, min, max) {
  * 生成一批抽样的请求参数。
  *
  * @param {() => number} [rand] 注入随机源，便于单测得到确定结果
+ * @param {{ band: object, page: number }|null} [avoid] 上一批的组合；撞上就重抽，
+ *   否则「换一批」偶尔抽回同一批而界面毫无变化，用户会以为按钮坏了。
  * @returns {{ q: string, sort: string, order: string, perPage: number, page: number, band: object }}
  */
-function buildDiscoverQuery(rand = Math.random) {
+function buildDiscoverQuery(rand = Math.random, avoid = null) {
   const r = typeof rand === "function" ? rand : Math.random;
-  const idx = clampInt(Math.floor(r() * STAR_BANDS.length), 0, STAR_BANDS.length - 1);
-  const band = STAR_BANDS[idx];
-  const page = clampInt(Math.floor(r() * DISCOVER_MAX_PAGE) + 1, 1, DISCOVER_MAX_PAGE);
-  const stars = band.max > 0 ? "stars:" + band.min + ".." + band.max : "stars:>" + band.min;
+  const draw = () => {
+    const idx = clampInt(Math.floor(r() * STAR_BANDS.length), 0, STAR_BANDS.length - 1);
+    return {
+      band: STAR_BANDS[idx],
+      page: clampInt(Math.floor(r() * DISCOVER_MAX_PAGE) + 1, 1, DISCOVER_MAX_PAGE),
+    };
+  };
+  const last = avoid && typeof avoid === "object" ? avoid : null;
+  let pick = draw();
+  // 组合只有 档位数 × 页数 种；最多试 8 次，撞不上就认（随机源坏掉时不会死循环）。
+  if (last) {
+    for (let i = 0; i < 8 && pick.band === last.band && pick.page === last.page; i += 1) pick = draw();
+  }
+  const stars = pick.band.max > 0
+    ? "stars:" + pick.band.min + ".." + pick.band.max
+    : "stars:>" + pick.band.min;
   return {
     // 排除 fork 与归档仓：这两类占了热门搜结果的一大半，抽进来只会显得噪音。
     q: stars + " fork:false archived:false",
     sort: "stars",
     order: "desc",
     perPage: DISCOVER_PAGE_SIZE,
-    page,
-    band,
+    page: pick.page,
+    band: pick.band,
   };
 }
 
@@ -457,19 +471,33 @@ function discoverUrl(spec) {
 }
 
 /**
+ * 搜索词上限：GitHub 的 query 过长会被网关拒掉（414），状态行也放不下。
+ * 仓库名的实际长度远小于它，正常输入不会被截断。
+ */
+const SEARCH_TERM_LIMIT = 80;
+
+/**
  * 把用户在搜索框里打的字变成 q。
  *
- * 只搜仓库名（用户选的）：`in:name`。**不加引号不做模糊语法**——把用户输入
- * 直接拼进查询语法等于让他能写 `stars:>100000` 之类的表达式，那不是「搜索
- * 仓库名」，而且拼错了会得到一堆看不懂的结果。
+ * 只搜仓库名（用户选的）：`in:name`。输入必须被**当成字面量**：直接把用户
+ * 输入拼进查询语法，等于允许他写 `stars:>100000`、`language:rust` 这类限定符，
+ * 那不是「搜索仓库名」，结果也会让他看不懂。所以先去掉 `:`（限定符语法）、
+ * 引号与反斜杠（转义/短语语法），再折叠空白并限长。
  *
  * @param {string} term
  * @returns {string|null} 空输入返回 null（调用方据此回到「换一批」）
  */
 function buildSearchQuery(term) {
-  // 换行/制表等控制字符会破坏查询，折叠成空格。
   const cleaned = String(term === undefined || term === null ? "" : term)
+    // 换行/制表等控制字符会破坏查询，先去成空格。
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    // 限定符与转义语法：去掉冒号/引号/反斜杠，`stars:>100` 就只剩字面量。
+    .replace(/[:"\\]/g, " ")
+    // 布尔运算符是查询语法的一部分，不当作仓库名。
+    .replace(/\b(?:OR|AND|NOT)\b/g, " ")
     .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, SEARCH_TERM_LIMIT)
     .trim();
   if (!cleaned) return null;
   // GitHub 的搜索把 `/` 当语法分隔，用户想找 owner/repo 时只取该按名字匹配。
@@ -702,16 +730,29 @@ const DEFAULT_DISCUSS_TEMPLATE = [
 ].join("\n");
 
 /** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
-const PROMPT_TEXT_LIMIT = 20000;/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
+const PROMPT_TEXT_LIMIT = 20000;
+/** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
 const PROMPT_COUNT_LIMIT = 8;
 /** 名字上限：侧栏/下拉里只放得下一行。 */
 const PROMPT_NAME_LIMIT = 40;
+
+/** 生成一个不与 seen 冲突的 id。确定性而非随机：每次渲染 id 跳变会让「设为默认」点不中。 */
+function freshId(seen, start) {
+  let n = start;
+  while (seen.has("p" + n)) n += 1;
+  return "p" + n;
+}
 
 /**
  * 把存下来的提示词列表归一化。
  *
  * 设置是从磁盘读的，可能被手改、可能来自旧版本（那时候只有一个字符串）。
  * 这里必须是**不会抛错**的：一份坏数据不能让整个设置页白屏。
+ *
+ * 只丢「完全空的壳」（没有名字也没有正文）。**有名字但正文空**的必须保留：
+ * 用户全选删除正文准备重写时，这一份不能当场消失——读盘与编辑走同一个
+ * 函数，只有一套行为，才不会出现「编辑时还在、重开就没了」。
+ * 空正文不会真的喂给模型：pickPrompt 会跳过它们。
  *
  * @param {unknown} raw
  * @returns {Array<{ id: string, name: string, text: string }>}
@@ -723,13 +764,14 @@ function normalisePrompts(raw) {
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
     const text = String(item.text === undefined || item.text === null ? "" : item.text);
-    if (!text.trim()) continue; // 空正文的条目没有任何用处，直接丢
+    const name = String(item.name === undefined || item.name === null ? "" : item.name).trim();
+    if (!text.trim() && !name) continue; // 连名字都没有：旧版/手改留下的空壳
     let id = String(item.id || "").trim();
-    if (!id || seen.has(id)) id = "p" + (out.length + 1) + Math.random().toString(36).slice(2, 6);
+    if (!id || seen.has(id)) id = freshId(seen, out.length + 1);
     seen.add(id);
     out.push({
       id,
-      name: String(item.name || "").trim().slice(0, PROMPT_NAME_LIMIT) || "未命名",
+      name: name.slice(0, PROMPT_NAME_LIMIT) || "未命名",
       text: text.slice(0, PROMPT_TEXT_LIMIT),
     });
     if (out.length >= PROMPT_COUNT_LIMIT) break;
@@ -741,15 +783,18 @@ function normalisePrompts(raw) {
  * 选出这次讨论实际用哪份提示词。
  *
  * 三级回落：设置里的默认 → 列表第一份 → 内置模板。**永远返回一份可用模板**，
- * 因为「没有提示词」不该表现为按钮点了没反应。
+ * 因为「没有提示词」不该表现为按钮点了没反应。空正文的条目（正在编辑/被清空）
+ * 不能当选：选它等于给模型一个空 prompt。
  *
  * @param {Array<{ id: string, name: string, text: string }>} prompts
  * @param {string} defaultId
  * @returns {{ id: string, name: string, text: string }}
  */
 function pickPrompt(prompts, defaultId) {
-  const list = Array.isArray(prompts) ? prompts : [];
-  const hit = list.find((p) => p && p.id === defaultId);
+  const list = (Array.isArray(prompts) ? prompts : []).filter(
+    (p) => p && typeof p === "object" && String(p.text || "").trim() !== "",
+  );
+  const hit = list.find((p) => p.id === defaultId);
   if (hit) return hit;
   if (list.length > 0) return list[0];
   return { id: "", name: "默认", text: DEFAULT_DISCUSS_TEMPLATE };
@@ -793,7 +838,8 @@ function buildDiscussPrompt(input) {
   if (Number.isFinite(row.stars)) facts.push("- 总 star：" + row.stars);
   if (Number.isFinite(row.gain)) facts.push("- 近期增长：+" + row.gain + "/" + (row.gainPeriod || "recent"));
   if (Number.isFinite(row.rank)) facts.push("- 当前名次：" + row.rank + "（" + scope + "）");
-  if (Number.isFinite(row.ageDays)) facts.push("- 仓库创建于 " + row.ageDays + " 天前");
+  // 「随便看看」没有名次也没有涨跌，「X 天前创建」对随机批次只是噪音。
+  if (Number.isFinite(row.ageDays) && input.view !== "browse") facts.push("- 仓库创建于 " + row.ageDays + " 天前");
   if (row.isNew) facts.push("- 本次新上榜");
   else if (Number.isFinite(row.rankDelta) && row.rankDelta !== 0) {
     facts.push("- 较上次" + (row.rankDelta > 0 ? "上升 " : "下降 ") + Math.abs(row.rankDelta) + " 位");
@@ -1218,7 +1264,7 @@ function boardUrl(row) {
 }
 
 /** 一行榜单的 Markdown 条目；返回数组，每条是 Markdown 的一行（不含换行符）。 */
-function boardItem(row) {
+function boardItem(row, showAge = true) {
   if (!row || typeof row !== "object") return [];
   const repo = String(row.repo || "").trim();
   if (!repo) return [];
@@ -1238,7 +1284,8 @@ function boardItem(row) {
   else if (Number.isFinite(row.rankDelta) && row.rankDelta !== 0) {
     meta.push((row.rankDelta > 0 ? "↑" : "↓") + Math.abs(row.rankDelta) + " 位");
   }
-  if (Number.isFinite(row.ageDays)) meta.push(row.ageDays + " 天前创建");
+  // 「随便看看」是随机批次/搜索结果，「X 天前创建」在这里只是噪音。
+  if (showAge && Number.isFinite(row.ageDays)) meta.push(row.ageDays + " 天前创建");
 
   // 续行缩进两个空格：无序列表的续行在 CommonMark 里就是这个宽度。
   return meta.length > 0 ? [first, "  " + meta.join(" · ")] : [first];
@@ -1258,7 +1305,7 @@ function boardItem(row) {
 function buildBoardMarkdown(input) {
   const rows = Array.isArray(input && input.rows) ? input.rows : [];
   const dropped = Array.isArray(input && input.dropped) ? input.dropped : [];
-  const items = rows.map(boardItem).filter((lines) => lines.length > 0);
+  const items = rows.map((row) => boardItem(row, input.view !== "browse")).filter((lines) => lines.length > 0);
   if (items.length === 0) return "";
 
   const scope =
@@ -1300,6 +1347,9 @@ function buildBoardMarkdown(input) {
 /** 预览长度上限。够看清「这是什么项目」，又不至于把整页撑成一份文档。 */
 const README_PREVIEW_LIMIT = 2000;
 
+/** 代码围栏行（``` 或 ~~~）。行内的反引号不在此列：只认行首。 */
+const FENCE_LINE = /^\s*(```+|~~~+)/;
+
 /**
  * 去掉 YAML frontmatter（Jekyll / Hugo 等静态站项目的 README 常见）。
  *
@@ -1335,15 +1385,40 @@ function stripBadgesAndImages(text) {
 
 /**
  * 去 HTML 标签。只保留内部文字（`<b>粗</b>` → `粗`），
- * `<br>`、`<hr>` 这类无内容的换成换行，避免两段被粘成一行。
+ * `<br>`、`<hr>` 这类无内容的换成换行，块级结束标签也换成换行，
+ * 避免 `<summary>a</summary>b` 被粘成 `ab`。
  */
 function stripHtmlTags(text) {
   return String(text || "")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<hr\s*\/?>/gi, "\n\n")
+    .replace(/<\/(p|div|li|ul|ol|summary|details|h[1-6]|tr|td|th|blockquote|section|article|table)\s*>/gi, "\n")
     .replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<\/?[a-zA-Z][^>]*>/g, "");
     // 只删「看起来是标签」的：`a < b` 里的 `<` 后面不是字母，不会被误删。
+}
+
+/**
+ * 只对**行内代码之外**的文字跑 fn。
+ *
+ * `Use \`<T>\` generics.` 里的尖括号是代码，去标签会把内容整段删掉。
+ * 做法：先把行内代码换成占位符，跑完 fn 再原样换回来。
+ *
+ * @param {string} text
+ * @param {(chunk: string) => string} fn
+ * @returns {string}
+ */
+function mapInlineCode(text, fn) {
+  const parts = [];
+  const masked = String(text || "").replace(/`[^`\n]*`/g, (whole) => {
+    parts.push(whole);
+    return "\u0000" + (parts.length - 1) + "\u0000";
+  });
+  const out = String(fn(masked));
+  return out.replace(/\u0000(\d+)\u0000/g, (whole, i) => {
+    const hit = parts[Number(i)];
+    return hit === undefined ? whole : hit;
+  });
 }
 
 /** 折叠连续空行与行尾空白。 */
@@ -1357,13 +1432,83 @@ function tidyWhitespace(text) {
 }
 
 /**
+ * 只对**代码围栏之外**的行跑 fn，围栏内的内容逐字保留。
+ *
+ * 为什么必须分段：`Array<string>`、`Vec<T>`、代码块里的 `![alt](url)` 都是
+ * 合法代码，却被去标签/去图片的正则当成 HTML 与图片删掉——Rust / C++ / TS
+ * 项目的 README 开头恰好全是这类代码。README 预览的价值就在这些代码上。
+ *
+ * @param {string} text
+ * @param {(chunk: string) => string} fn
+ * @returns {string}
+ */
+function mapOutsideFences(text, fn) {
+  const lines = String(text || "").split("\n");
+  const out = [];
+  let plain = [];
+  let fence = ""; // 当前开启围栏的标记（``` / ~~~），空串 = 围栏外
+  const flush = () => {
+    if (plain.length === 0) return;
+    out.push(...String(fn(plain.join("\n"))).split("\n"));
+    plain = [];
+  };
+  for (const line of lines) {
+    const hit = FENCE_LINE.exec(line);
+    if (hit) {
+      const mark = hit[1];
+      if (!fence) {
+        flush();
+        fence = mark;
+      } else if (mark[0] === fence[0] && mark.length >= fence.length) {
+        // 关闭围栏：同字符且不短于开启标记（CommonMark 的规则）
+        fence = "";
+      }
+      out.push(line);
+      continue;
+    }
+    if (fence) out.push(line);
+    else plain.push(line);
+  }
+  flush();
+  return out.join("\n");
+}
+
+/**
  * README 原文 → 可渲染的预览文本。
  * @param {string} text
  * @returns {string}
  */
 function prepareReadme(text) {
   if (!text) return "";
-  return tidyWhitespace(stripHtmlTags(stripBadgesAndImages(stripFrontmatter(String(text)))));
+  const body = mapOutsideFences(stripFrontmatter(String(text)), (chunk) =>
+    // 行内代码里的 `<T>`、`![x](y)` 也属于代码，一并保护。
+    mapInlineCode(chunk, (masked) => stripHtmlTags(stripBadgesAndImages(masked))),
+  );
+  return tidyWhitespace(body);
+}
+
+/**
+ * 找出代码围栏区间，偏移量以字符计。末尾未闭合的那一处 `end = Infinity`。
+ * 用于两件事：断点别落在代码块里、硬切之后补闭合。
+ */
+function fenceSpans(text) {
+  const spans = [];
+  let offset = 0;
+  let open = null;
+  for (const line of String(text || "").split("\n")) {
+    const hit = FENCE_LINE.exec(line);
+    if (hit) {
+      const mark = hit[1];
+      if (!open) open = { start: offset, mark };
+      else if (mark[0] === open.mark[0] && mark.length >= open.mark.length) {
+        spans.push({ start: open.start, end: offset + line.length, mark: open.mark });
+        open = null;
+      }
+    }
+    offset += line.length + 1;
+  }
+  if (open) spans.push({ start: open.start, end: Infinity, mark: open.mark });
+  return spans;
 }
 
 /**
@@ -1371,6 +1516,9 @@ function prepareReadme(text) {
  *
  * 在句子中间硬切会让「前 2000 字」读起来像断线；优先在最近的换行处收口，
  * 没有换行再退到句子边界，都没有才硬切。
+ *
+ * 代码块要特殊对待：切在 ``` 中间会让渲染器把后文全当成代码，所以断点只认
+ * 围栏之外的位置；实在找不到就停在围栏开头；最后再兜一次未闭合围栏。
  * @param {string} text
  * @param {number} [limit]
  * @returns {{ text: string, truncated: boolean, total: number }}
@@ -1383,15 +1531,31 @@ function truncateReadme(text, limit = README_PREVIEW_LIMIT) {
   // 只在前 80%~100% 区间找断点：太靠前会白白丢掉一大段。
   const floor = Math.floor(max * 0.8);
   const window = src.slice(floor, max);
+  const spans = fenceSpans(src);
+  const inFence = (at) => spans.some((s) => at > s.start && at < s.end);
+
   const candidates = ["\n\n", "\n", "。", ". ", "；", "; "];
+  let cut = -1;
   for (const sep of candidates) {
-    const at = window.lastIndexOf(sep);
+    let at = window.lastIndexOf(sep);
+    // 落进代码块的断点不能用，接着往前找。
+    while (at >= 0 && inFence(floor + at + sep.length)) at = at > 0 ? window.lastIndexOf(sep, at - 1) : -1;
     if (at >= 0) {
-      const cut = floor + at + sep.length;
-      return { text: src.slice(0, cut).trimEnd(), truncated: true, total: src.length };
+      cut = floor + at + sep.length;
+      break;
     }
   }
-  return { text: src.slice(0, max).trimEnd(), truncated: true, total: src.length };
+  if (cut < 0) {
+    // 候选断点全在代码块里：停在围栏开头，至少不产出半截代码。
+    const nextFence = spans.find((s) => s.start > floor && s.start < max);
+    cut = nextFence ? nextFence.start : max;
+  }
+
+  let out = src.slice(0, cut).trimEnd();
+  // 兜底：硬切落在代码块中间时补一个闭合围栏，否则后文会被吞进代码块。
+  const dangling = fenceSpans(out).find((s) => !Number.isFinite(s.end));
+  if (dangling) out = out + "\n" + dangling.mark;
+  return { text: out, truncated: true, total: src.length };
 }
 
 /**
@@ -1839,10 +2003,13 @@ async function fetchRising(settings) {
 }
 
 /** 「换一批」：伪随机档位 + 随机页，见 src/lib/discover.mjs 的说明。 */
+// 上一批的档位/页：撞上了就重抽，避免点了「换一批」列表一模一样。
+let lastDiscoverPick = null;
 async function fetchDiscover(settings) {
-  const spec = buildDiscoverQuery();
+  const spec = buildDiscoverQuery(Math.random, lastDiscoverPick);
   const result = await fetchSearch(spec, settings, { emptyMessage: "这一批没抽到仓库，再换一批" });
   if (result.ok) {
+    lastDiscoverPick = { band: spec.band, page: spec.page };
     // 把星档带回去，状态行要说出「这批是从哪个档位抽的」。
     result.band = spec.band;
     result.repos = shapeDiscoverRows(result.repos);
@@ -1887,9 +2054,11 @@ async function fetchReadme(repo, settings) {
   const res = await httpGet(url, headers);
   if (res.status === 404) return { ok: false, message: "这个仓库没有 README" };
   if (res.status === 403 || res.status === 429) {
+    // README 走的是核心 REST API，配额与 Search API 不同：未认证 60 次/小时，
+    // 认证后 5000 次/小时。别照抄 Search 的「10 次/分钟」。
     return {
       ok: false,
-      message: token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（10 次/分钟），可在设置里填 Token",
+      message: token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（60 次/小时），可在设置里填 Token 提高额度",
     };
   }
   if (res.status < 200 || res.status >= 300) return { ok: false, message: "GitHub 返回 HTTP " + res.status };
@@ -2083,6 +2252,8 @@ async function refresh(ctx, options) {
 
   // 讨论的回执只服务于那一次点击：刷新是用户明确表示的「再来一次」，
   // 回执要让位给榜单本身的状态说明，失败的那条同理。
+  // README 预览也随之作废：列表要换了，在飞的响应回来后不能往新列表里写旧正文。
+  readmeSeq += 1;
   set({
     loading: true,
     httpError: "",
@@ -2943,7 +3114,9 @@ function RepoRow({ row, ctx, discussing, readme }) {
               "+" + fmtNumber(row.gain) + " " + gainLabel(row.gainPeriod),
             )
           : null,
-        Number.isFinite(row.ageDays) ? h("span", { className: "gt-stat" }, row.ageDays + " 天前创建") : null,
+        Number.isFinite(row.ageDays) && !(readme && readme.view === "browse")
+          ? h("span", { className: "gt-stat" }, row.ageDays + " 天前创建")
+          : null,
       ),
       readmeOpen ? h(ReadmePanel, { readme, href }) : null,
     ),
@@ -3009,8 +3182,9 @@ function DiscoverBar({ snap, ctx }) {
   const text = textState[0];
   const setText = textState[1];
   // 搜索生效时输入框要显示那个词：否则清空后看不出「现在这批是搜出来的」。
+  // 空串也必须同步——「换一批」后留着旧关键词，页面就在说谎。
   R.useEffect(() => {
-    if (snap.discoverTerm) setText(snap.discoverTerm);
+    setText(snap.discoverTerm || "");
   }, [snap.discoverTerm]);
 
   const busy = snap.loading;
@@ -3047,6 +3221,7 @@ function DiscoverBar({ snap, ctx }) {
         value: text,
         placeholder: "搜仓库名，回车去 GitHub 查",
         "aria-label": "搜索仓库名",
+        maxLength: SEARCH_TERM_LIMIT,
         disabled: busy,
         onChange: (event) => setText(event && event.target ? String(event.target.value || "") : ""),
         // Esc 清空：输入框里最常见的「算了」，比逼用户逐个删字强。
@@ -3990,18 +4165,25 @@ function SettingsSection() {
   /* ---- 讨论提示词 ---- */
 
   // 归一化是幂等的，且必须每次都过：磁盘上可能是手改过的数据。
+  // 有名字但正文空的那份会保留在列表里——用户正在重写，不能当场消失。
   const prompts = normalisePrompts(form.prompts);
-  const defaultId = prompts.some((p) => p.id === form.defaultPromptId)
+  // 「默认」标记必须落在真正会生效的那份上，否则界面说 A、实际用 B。
+  // 空正文的条目会被 pickPrompt 跳过，这里也跟着跳过。
+  const usable = prompts.filter((p) => p.text.trim() !== "");
+  const defaultId = usable.some((p) => p.id === form.defaultPromptId)
     ? form.defaultPromptId
-    : prompts.length > 0
-      ? prompts[0].id
+    : usable.length > 0
+      ? usable[0].id
       : "";
 
   /** 写回列表。顺手修正默认值——默认指向一份刚被删掉的提示词时不能悬空。 */
   const writePrompts = (next, nextDefault) => {
+    // 有名字的空正文条目必须留住：用户全选删除正文是想重写，不是想删掉这一份。
     const list = normalisePrompts(next);
     const wanted = nextDefault === undefined ? form.defaultPromptId : nextDefault;
-    const fixed = list.some((p) => p.id === wanted) ? wanted : list.length > 0 ? list[0].id : "";
+    // 空正文的不会生效（pickPrompt 跳过），默认值也不该指向它们。
+    const usable = list.filter((p) => p.text.trim() !== "");
+    const fixed = usable.some((p) => p.id === wanted) ? wanted : usable.length > 0 ? usable[0].id : "";
     setForm((prev) => Object.assign({}, prev || snap.settings, { prompts: list, defaultPromptId: fixed }));
   };
 
@@ -5010,8 +5192,10 @@ export default function activate(ctx) {
         // 提示词来自磁盘：可能是旧版本的空值、也可能是手改过的坏形状。
         // 归一化在这里做一次，后面所有读取点都不用再防。
         merged.prompts = normalisePrompts(merged.prompts);
-        if (!merged.prompts.some((p) => p.id === merged.defaultPromptId)) {
-          merged.defaultPromptId = merged.prompts.length > 0 ? merged.prompts[0].id : "";
+        // 默认值只落在真正会生效的那份上（空正文会被 pickPrompt 跳过）。
+        const usable = merged.prompts.filter((p) => p.text.trim() !== "");
+        if (!usable.some((p) => p.id === merged.defaultPromptId)) {
+          merged.defaultPromptId = usable.length > 0 ? usable[0].id : "";
         }
         set({ settings: merged });
       }
@@ -5058,11 +5242,11 @@ export default function activate(ctx) {
       discussResumed: false,
       discussPromptName: "",
       readmeOpen: "",
-    readmeLoading: false,
-    readmeError: "",
-    readmeText: "",
-    readmeTruncated: false,
-    readmeTotal: 0,
+      readmeLoading: false,
+      readmeError: "",
+      readmeText: "",
+      readmeTruncated: false,
+      readmeTotal: 0,
     });
   };
 
