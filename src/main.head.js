@@ -1255,10 +1255,16 @@ let discussSeq = 0;
  * 仓库的会话。会话 ID 是宿主给的字符串，不含任何隐私内容，存进 settings 里
  * （`discussSessionIds`）比让它随着一次重装载入丢失更划算。
  *
- * **必须记 engine**。会话 id 只在它所属的引擎下有意义；拿 claude 的 id 去
+ * **必须按引擎分开记**。会话 id 只在它所属的引擎下有意义；拿 claude 的 id 去
  * `selectSession("codex", ...)`，宿主要么拒绝、要么打开一条根本不是这次引擎的
- * 会话。更糟的是拒绝之后我们把它当「失效」删掉——切回 claude 再点，本该接着
- * 上次聊，结果又新开一条。引擎对不上时**跳过复用但保留记录**，不删。
+ * 会话。所以一条记录的形状是
+ *
+ *   `{ id, engine, byEngine: { claude: "id-a", codex: "id-b" } }`
+ *
+ * `id` / `engine` 是「最近一次用的那条」，留作旧格式兼容与展示；真正查表走
+ * `byEngine`。**同一个仓库在不同引擎下各有各的会话，互不覆盖**——早先只留一个
+ * `{ id, engine }`，换引擎新开一轮就把另一个引擎的记录冲掉了，切回去又开新的。
+ * 一个仓库下最多留 4 个引擎（现实中也就两三个），超出按插入序丢最旧的。
  *
  * sessionId 可能拿不到：`startRun` 文档写明引擎稍后才 announce，此时返回 null。
  * 那条路径**不记录**（不是记空串），再点时仍然新开——复用是加分项，拿不到 id
@@ -1286,21 +1292,74 @@ let discussTouched = false;
 /** 落盘上限：一个仓库一条记录。60 条 ≈ 每天讨论 5-10 个也能覆盖一周多。 */
 const DISCUSS_SESSION_LIMIT = 60;
 
+/** 一个仓库最多记几个引擎的会话。现实里宿主也就 claude / codex 两三个。 */
+const DISCUSS_ENGINE_LIMIT = 4;
+
 /**
- * 把落盘的一条值归一化成 `{ id, engine }`；不是有效记录时返回 null。
+ * 把落盘的一条值归一化成 `{ id, engine, byEngine }`；不是有效记录时返回 null。
  *
- * 兼容旧格式：`8ffb092`..`25faa4c` 之间落盘的是裸字符串（没有 engine）。
- * 这些记录照常能用——命中时只要求「没换过引擎」才复用，见 discussRepo。
+ * 兼容两代旧格式：
+ * - `8ffb092`..`25faa4c`：裸字符串（没有 engine）；
+ * - `25faa4c`.. 现在：`{ id, engine }`（一个仓库只留一个引擎的记录）。
+ *
+ * 两代都给不出 `byEngine`，就用 `id` / `engine` 补一条。`engine` 为空串表示
+ * 「不知道属于哪个引擎」，这类记录**不再参与复用**——不知道该拿它去开哪个引擎
+ * 的会话，拿去试反而可能打开错的会话。留着只是为了不让它被判成坏数据丢掉。
  */
 function normaliseDiscussRow(value) {
+  let id = "";
+  let engine = "";
+  const byEngine = {};
   if (typeof value === "string") {
-    const id = value.trim();
-    return id ? { id, engine: "" } : null;
+    id = value.trim();
+  } else if (value && typeof value === "object" && !Array.isArray(value)) {
+    const raw = value.byEngine && typeof value.byEngine === "object" && !Array.isArray(value.byEngine)
+      ? value.byEngine
+      : {};
+    for (const k of Object.keys(raw)) {
+      const key = String(k).trim();
+      const v = typeof raw[k] === "string" ? raw[k].trim() : "";
+      if (key && v) byEngine[key] = v;
+    }
+    id = typeof value.id === "string" ? value.id.trim() : "";
+    engine = typeof value.engine === "string" ? value.engine.trim() : "";
+  } else {
+    return null;
   }
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const id = typeof value.id === "string" ? value.id.trim() : "";
-  if (!id) return null;
-  return { id, engine: typeof value.engine === "string" ? value.engine.trim() : "" };
+  // 旧格式兜底：有 id 但没分槽时，engine 知道就归到那一槽。
+  if (!id && engine) id = byEngine[engine] || "";
+  if (id && engine && !byEngine[engine]) byEngine[engine] = id;
+  if (!id && Object.keys(byEngine).length === 0) return null;
+  return trimEngineSlots({ id, engine, byEngine });
+}
+
+/** 一个仓库的引擎分槽最多留 DISCUSS_ENGINE_LIMIT 个，按插入序丢最旧的。 */
+function trimEngineSlots(row) {
+  if (!row) return row;
+  const keys = Object.keys(row.byEngine || {});
+  if (keys.length <= DISCUSS_ENGINE_LIMIT) return row;
+  const byEngine = {};
+  for (const k of keys.slice(-DISCUSS_ENGINE_LIMIT)) byEngine[k] = row.byEngine[k];
+  return { ...row, byEngine };
+}
+
+/**
+ * 取某个仓库在某个引擎下的会话 id；没有就返回空串。
+ *
+ * 这是唯一的查表入口：别处一律走它，免得哪天有人漏改一处又退化成
+ * 「拿别的引擎的 id 去开」。
+ *
+ * 例外：分槽全空的旧记录（`8ffb092` 起的裸字符串格式）不知道属于哪个引擎，
+ * 但那多半就是用户一直在用的那个。照旧给它复用，成功打开时会被
+ * `rememberDiscussSession` 顺手补上 engine，下次就进槽了。
+ */
+function sessionIdFor(row, engine) {
+  if (!row || !engine) return "";
+  const slots = row.byEngine || {};
+  const hit = typeof slots[engine] === "string" ? slots[engine] : "";
+  if (hit) return hit;
+  const legacy = Object.keys(slots).length === 0 && !row.engine;
+  return legacy && typeof row.id === "string" ? row.id : "";
 }
 
 /**
@@ -1335,13 +1394,25 @@ function normaliseDiscussSessions(raw) {
 /**
  * 记一条会话 id（连同它属于哪个引擎）。
  *
+ * **只写自己那一槽**，不碰别的引擎的记录：同一个仓库在 claude 与 codex 下各有
+ * 一条会话，换引擎聊完再切回去，原来那条还得认得。
+ *
  * 先 `delete` 再 `set`：`Map.set` 对已存在的 key 不会挪动位置，不这么做的话
  * 「最近用过」的仓库会一直停在队首，超限时被淘汰的反而是它。
  */
 function rememberDiscussSession(repo, sessionId, engine) {
   if (!sessionId) return;
+  const key = String(engine || "");
+  const prev = discussSessions.get(repo) || { byEngine: {} };
+  const byEngine = { ...(prev.byEngine || {}) };
+  // 不知道该属于哪个引擎时不猜测：宁可只保留一个「最近一次」，也不随便塞槽。
+  const merged = key ? { ...byEngine, [key]: sessionId } : byEngine;
   discussSessions.delete(repo);
-  discussSessions.set(repo, { id: sessionId, engine: String(engine || "") });
+  discussSessions.set(repo, {
+    id: sessionId,
+    engine: key,
+    byEngine: trimEngineSlots({ byEngine: merged }).byEngine,
+  });
   while (discussSessions.size > DISCUSS_SESSION_LIMIT) {
     const oldest = discussSessions.keys().next().value;
     discussSessions.delete(oldest);
@@ -1367,11 +1438,40 @@ function touchDiscussSession(repo) {
   return true;
 }
 
+/**
+ * 忘掉某个仓库在某个引擎下的会话 id（那条会话被删除/归档时）。
+ *
+ * 只删这一槽；全空了才删整条记录——否则下次 `normaliseDiscussRow` 会把它归一化
+ * 成空壳，白白占一个额度。
+ */
+function forgetDiscussSession(repo, engine) {
+  const row = discussSessions.get(repo);
+  if (!row) return;
+  const key = String(engine || "");
+  const byEngine = { ...(row.byEngine || {}) };
+  if (key) delete byEngine[key];
+  const legacyStale = !key || row.engine === key;
+  const keepLegacy = row.id && !legacyStale && Object.keys(byEngine).length === 0;
+  if (Object.keys(byEngine).length === 0 && !keepLegacy) {
+    discussSessions.delete(repo);
+    return;
+  }
+  discussSessions.set(repo, {
+    id: keepLegacy ? row.id : "",
+    engine: keepLegacy ? row.engine : "",
+    byEngine,
+  });
+}
+
 /** 把当前表写回设置。失败不报错：这只是省一次重复开会话，不影响主流程。 */
 function persistDiscussSessions(ctx) {
   const rows = {};
   // 内存表已经裁过；这里再走一次是为了防手改/旧版本写进来的超大表。
-  for (const [repo, row] of discussSessions) if (row && row.id) rows[repo] = row;
+  for (const [repo, row] of discussSessions) {
+    if (!row) continue;
+    const trimmed = trimEngineSlots(row);
+    if (trimmed.id || Object.keys(trimmed.byEngine || {}).length > 0) rows[repo] = trimmed;
+  }
   setSettings({ discussSessionIds: trimDiscussRows(rows) });
   return Promise.resolve(ctx.storage.set("settings", store.snap.settings)).catch(() => {});
 }
@@ -1462,18 +1562,17 @@ async function discussRepo(ctx, row) {
     const models = (entry.models || []).filter((m) => m && typeof m.id === "string" && m.id.trim());
     const model = String(settings.model || "").trim() || (models[0] ? models[0].id : undefined);
 
-    // 已经有这个仓库的会话：直接切过去，不跑模型。
+    // 已经有这个仓库在本引擎下的会话：直接切过去，不跑模型。
     // 策略交给 shouldResume：never 时明确要求新开，其余情况优先复用。
     const known = discussSessions.get(row.repo);
-    // 引擎对不上就**不复用**，但也**不删记录**：会话 id 只在所属引擎下有意义。
-    // 删掉的话，切回原引擎再点这条仓库本该接着上次聊，却变成新开一条。
-    // 旧格式落盘的记录没有 engine 字段（空串），当作「不知道」照常复用。
-    const engineMatches = !known || !known.engine || known.engine === entry.engine;
-    const resumable = Boolean(known && known.id) && engineMatches;
+    // 只认**本引擎**那一槽。别的引擎的 id 拿去 selectSession 要么被拒、要么
+    // 打开一条根本不是这个引擎的会话；那条记录现在也不会被覆盖，切回去还在。
+    const resumeId = sessionIdFor(known, entry.engine);
+    const resumable = Boolean(resumeId);
     if (shouldResume(settings.resumeMode, discussSessionsStale, resumable) && typeof ctx.sessions.selectSession === "function") {
       try {
         await withTimeout(
-          ctx.sessions.selectSession(entry.engine, known.id, workspace),
+          ctx.sessions.selectSession(entry.engine, resumeId, workspace),
           DISCUSS_TIMEOUT_MS,
           "会话打开",
         );
@@ -1497,8 +1596,9 @@ async function discussRepo(ctx, row) {
         return;
       } catch (error) {
         // 打开失败（会话被归档/删除、宿主版本变了）不能把按钮卡死：
-        // 落到下面新建一条，并把这个失效的 id 清掉。
-        discussSessions.delete(row.repo);
+        // 落到下面新建一条，并把这个失效的 id 清掉。**只清本引擎那一槽**——
+        // 别的引擎的会话还在，删整条记录会让切回去时又开新的。
+        forgetDiscussSession(row.repo, entry.engine);
         void persistDiscussSessions(ctx);
       }
     }
@@ -1516,14 +1616,14 @@ async function discussRepo(ctx, row) {
       template: chosen.text,
     });
 
-    // 走到这里只有两种可能：没有可复用的会话，或者宿主不支持 selectSession。
-    // 后者退回复用式 startRun（会真的再跑一轮），只为兼容旧宿主。
-    // 引擎对不上时也走这里——按新引擎新开一条，旧引擎那条留着。
+    // 走到这里只有两种可能：没有本引擎可复用的会话，或者宿主不支持
+    // selectSession。后者退回复用式 startRun（会真的再跑一轮），只为兼容旧宿主。
+    // 别的引擎有记录也走这里——按当前引擎新开一条，那条记录原样留着。
     const fallbackResume =
       typeof ctx.sessions.selectSession === "function"
         ? ""
         : resumable
-          ? known.id
+          ? resumeId
           : "";
 
     // 新会话不带 sessionId：宿主会建一个，侧栏立即可见。

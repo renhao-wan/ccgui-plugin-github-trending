@@ -2351,16 +2351,16 @@ await check("讨论续接：换一行仍然新开，只有同一仓库才复用"
   }
 });
 
-await check("讨论续接：换了引擎就不复用，但原引擎那条记录要留着", async () => {
+await check("讨论续接：换引擎不复用、也不覆盖另一引擎的记录，切回去照样打开", async () => {
   // 会话 id 只在所属引擎下有意义。拿 claude 的 id 去 selectSession("codex")
-  // 宿主要么拒绝、要么打开错的会话；更糟的是被拒之后我们当「失效」删掉，
-  // 切回 claude 再点本该接着上次聊，却变成新开一条。
+  // 宿主要么拒绝、要么打开错的会话。所以换引擎要新开一条——但**不能把 claude
+  // 那条覆盖掉**，否则切回 claude 再点又变成新开。
   sessionStarts.length = 0;
   sessionSelects.length = 0;
-  const seeded = { "beta/two": { id: "sess-claude", engine: "claude" } };
-  let lastSaved = null;
-  const inst = await freshTabInstance(() => ({ discussSessionIds: seeded, engine: "codex" }), (k, v) => {
-    if (k === "settings") lastSaved = v;
+  const seeded = { "beta/two": { id: "sess-claude", engine: "claude", byEngine: { claude: "sess-claude" } } };
+  let saved = {};
+  let inst = await freshTabInstance(() => ({ discussSessionIds: seeded, engine: "codex" }), (k, v) => {
+    if (k === "settings") saved = v;
   });
   try {
     inst.click("beta/two");
@@ -2368,10 +2368,53 @@ await check("讨论续接：换了引擎就不复用，但原引擎那条记录�
     assert.equal(sessionSelects.length, 0, "不该拿别的引擎的 id 去打开");
     assert.ok(!sessionStarts[0].sessionId, "新会话不该带别人的 id");
     assert.equal(sessionStarts[0].engine, "codex");
-    // 记录被新引擎覆盖（同一个仓库在 codex 下也有一条了）。
-    assert.ok(await waitFor(() => lastSaved && lastSaved.discussSessionIds["beta/two"]), "应记下新引擎的会话");
-    assert.equal(lastSaved.discussSessionIds["beta/two"].engine, "codex");
+    assert.ok(await waitFor(() => saved.discussSessionIds && saved.discussSessionIds["beta/two"]), "应记下新引擎的会话");
+    const rows = saved.discussSessionIds["beta/two"];
+    assert.equal(rows.byEngine.codex, "sess-1", "codex 那一槽要有新会话");
+    assert.equal(rows.byEngine.claude, "sess-claude", "claude 那条不能被覆盖");
   } finally {
+    inst.dispose();
+  }
+
+  // 切回 claude：应直接打开当初那条，而不是又开一条。
+  // 注意 saved 里 settings.engine 还是 codex——要显式切回来，否则下一次激活
+  // 仍按 codex 走，查到的自然是 codex 那槽。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  inst = await freshTabInstance(() => ({ ...saved, engine: "claude" }));
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionSelects.length === 1), "切回原引擎应复用");
+    assert.equal(sessionSelects[0].sessionId, "sess-claude");
+    assert.equal(sessionSelects[0].engine, "claude");
+    assert.equal(sessionStarts.length, 0, "不该再新开");
+  } finally {
+    inst.dispose();
+  }
+});
+
+await check("讨论续接：某引擎的会话被删时只清那一槽，另一个引擎的记录还在", async () => {
+  // 打开失败的清理不能 `discussSessions.delete(repo)` —— 那会把另一个引擎
+  // 好端端的记录一起删掉，切回去又开新的。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  const seeded = {
+    "beta/two": { id: "sess-gone", engine: "claude", byEngine: { claude: "sess-gone", codex: "sess-codex" } },
+  };
+  sessionSelectError = new Error("session not found");
+  let saved = null;
+  const inst = await freshTabInstance(() => ({ discussSessionIds: seeded }), (k, v) => {
+    if (k === "settings") saved = v;
+  });
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1), "打开失败应退回新开");
+    assert.ok(await waitFor(() => saved && saved.discussSessionIds["beta/two"]));
+    const rows = saved.discussSessionIds["beta/two"];
+    assert.equal(rows.byEngine.claude, "sess-1", "失效的那槽要换成新会话");
+    assert.equal(rows.byEngine.codex, "sess-codex", "别的引擎的记录不能跟着被删");
+  } finally {
+    sessionSelectError = null;
     inst.dispose();
   }
 });
