@@ -1256,8 +1256,11 @@ let discussSeq = 0;
  * （`discussSessionIds`）比让它随着一次重装载入丢失更划算。
  *
  * sessionId 可能拿不到：`startRun` 文档写明引擎稍后才 announce，此时返回 null。
- * 那条路径存空串（表示「开过但没有 id」），再点时仍然新开——续接是加分项，
- * 拿不到 id 时不能因此让按钮失败。
+ * 那条路径**不记录**（不是记空串），再点时仍然新开——复用是加分项，拿不到 id
+ * 时不能因此让按钮失败，也不该占着一个额度。
+ *
+ * 插入顺序即「最近用过」的顺序：`rememberDiscussSession` 每次都把该仓库挪到
+ * 队尾，超限时从队首淘汰。上限见 DISCUSS_SESSION_LIMIT。
  */
 let discussSessions = new Map();
 /**
@@ -1278,24 +1281,57 @@ let discussTouched = false;
 /** 落盘上限：一个仓库一个 id，40 条足够覆盖最近几周的扫榜。 */
 const DISCUSS_SESSION_LIMIT = 40;
 
-function normaliseDiscussSessions(raw) {
+/**
+ * 按上限裁剪一张「仓库 → id」表。
+ *
+ * `Map` / 普通对象都保持插入顺序，这里两边都**按这个顺序**裁：淘汰的是最久
+ * 没碰过的仓库。早先按 key 排序再 `slice(-N)`，留下的是字母序末尾的 40 个，
+ * 那是 bug——常点的 `rust-lang/rust` 会被裁掉，而某个从没再点过的 `zzz/zzz`
+ * 会一直留着。
+ */
+function trimDiscussRows(rows) {
+  const keys = Object.keys(rows);
+  if (keys.length <= DISCUSS_SESSION_LIMIT) return rows;
   const out = {};
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
-  const keys = Object.keys(raw).filter((k) => readmeRepoKey(k));
-  // 只留最近写入的若干条；对象本身没有顺序保证，这里按 key 排序只为结果稳定。
-  for (const k of keys.sort().slice(-DISCUSS_SESSION_LIMIT)) {
-    const v = raw[k];
-    // 空串是有意义的：表示「开过但这个引擎没给 id」，下次仍新开。
-    if (typeof v === "string") out[k] = v;
-  }
+  for (const k of keys.slice(-DISCUSS_SESSION_LIMIT)) out[k] = rows[k];
   return out;
+}
+
+function normaliseDiscussSessions(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const valid = {};
+  for (const k of Object.keys(raw)) {
+    // 只认合法的 owner/name。空串也丢：它表示「开过但没拿到 id」，而这跟
+    // 「没有记录」在复用判断上完全等价（都要新开），占额度没有意义。
+    if (!readmeRepoKey(k)) continue;
+    const v = raw[k];
+    if (typeof v === "string" && v !== "") valid[k] = v;
+  }
+  return trimDiscussRows(valid);
+}
+
+/**
+ * 记一条会话 id。
+ *
+ * 先 `delete` 再 `set`：`Map.set` 对已存在的 key 不会挪动位置，不这么做的话
+ * 「最近用过」的仓库会一直停在队首，超限时被淘汰的反而是它。
+ */
+function rememberDiscussSession(repo, sessionId) {
+  if (!sessionId) return;
+  discussSessions.delete(repo);
+  discussSessions.set(repo, sessionId);
+  while (discussSessions.size > DISCUSS_SESSION_LIMIT) {
+    const oldest = discussSessions.keys().next().value;
+    discussSessions.delete(oldest);
+  }
 }
 
 /** 把当前表写回设置。失败不报错：这只是省一次重复开会话，不影响主流程。 */
 function persistDiscussSessions(ctx) {
   const rows = {};
-  for (const [repo, id] of discussSessions) rows[repo] = id;
-  setSettings({ discussSessionIds: rows });
+  // 内存表已经裁过；这里再走一次是为了防手改/旧版本写进来的超大表。
+  for (const [repo, id] of discussSessions) if (id) rows[repo] = id;
+  setSettings({ discussSessionIds: trimDiscussRows(rows) });
   return Promise.resolve(ctx.storage.set("settings", store.snap.settings)).catch(() => {});
 }
 
@@ -1455,10 +1491,10 @@ async function discussRepo(ctx, row) {
       "会话启动",
     );
 
-    // 记住这一行的 sessionId，供下次点击时续接。
-    // `started.sessionId` 可能为 null——那就存空串，下次照常新开。
+    // 记住这一行的 sessionId，供下次点击时直接打开它。
+    // `started.sessionId` 可能为 null——那就不记，下次照常新开。
     const sessionId = started && typeof started.sessionId === "string" && started.sessionId ? started.sessionId : "";
-    discussSessions.set(row.repo, sessionId);
+    rememberDiscussSession(row.repo, sessionId);
     // 落盘：内存表熬不过重装/重新激活/宿主重启，而用户的观感是「每点一次
     // 就多一条会话」。写盘失败不影响这次点击，所以不 await 它的错误。
     void persistDiscussSessions(ctx);

@@ -2368,6 +2368,35 @@ await check("讨论续接：打开旧会话失败时退回新开，并清掉失�
   }
 });
 
+await check("讨论续接：超过上限时淘汰最久没用过的，且写入时就裁", async () => {
+  // 上限 40。之前在内存里根本不裁、写盘也不裁，这条路径等于没有上限；
+  // 读盘裁剪还按字典序，会先淘汰掉常点的仓库。
+  sessionStarts.length = 0;
+  sessionSelects.length = 0;
+  const seeded = {};
+  // 塞满 40 条，`zzz/zzz` 排在最前——它是最久没用过的那条。
+  for (let i = 0; i < 40; i += 1) {
+    const repo = i === 0 ? "zzz/zzz" : "seed/seed-" + i;
+    seeded[repo] = "seed-" + i;
+  }
+  let lastSaved = null;
+  const inst = await freshTabInstance(() => ({ discussSessionIds: seeded }), (k, v) => {
+    if (k === "settings") lastSaved = v;
+  });
+  try {
+    inst.click("beta/two");
+    assert.ok(await waitFor(() => sessionStarts.length === 1));
+    assert.ok(await waitFor(() => !inst.text().includes("打开中")));
+    assert.ok(await waitFor(() => lastSaved && lastSaved.discussSessionIds), "应写回设置");
+    const rows = lastSaved.discussSessionIds;
+    assert.equal(Object.keys(rows).length, 40, "落盘最多 40 条");
+    assert.ok(rows["beta/two"] === "sess-1", "新会话要在表里");
+    assert.ok(!rows["zzz/zzz"], "超限时淘汰最久没用的那条，而不是按字母序");
+  } finally {
+    inst.dispose();
+  }
+});
+
 await check("讨论续接：拿不到 sessionId 时退回新开，不把按钮做成一次性", async () => {
   const original = ctx.sessions.startRun;
   // 引擎稍后才 announce 时 resolve 的 sessionId 是 null（文档明写），
