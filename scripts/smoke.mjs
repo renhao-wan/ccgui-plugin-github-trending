@@ -784,7 +784,7 @@ await check("榜单内筛选：导出的是筛出来的行，并在标题里写�
   });
   try {
     typeFilter("rust");
-    findByText(render(), "导出 Markdown").props.onClick();
+    findByText(render(), "复制 Markdown").props.onClick();
     assert.ok(await waitFor(() => copied.length > 0), "应写入剪贴板");
     assert.match(copied, /已筛选「rust」/, "标题要说明这是筛选后的子集");
     assert.match(copied, /beta\/two/);
@@ -1102,6 +1102,58 @@ await check("README：点行内展开，走 api.github.com 而不是 raw 域名"
   assert.match(bodyText, /npm i beta-two/, "代码块内容应保留");
 });
 
+await check("README：403 只在正文说明限流时才按配额解释", async () => {
+  const openReadme = (repo) => {
+    let btn = null;
+    walk(render(), (n) => {
+      if (!btn && n.type === "button" && n.props && n.props["aria-label"] === "展开 " + repo + " 的 README") btn = n;
+    });
+    return btn;
+  };
+  const closeIfOpen = () => {
+    let close = null;
+    walk(render(), (n) => {
+      if (!close && n.type === "button" && n.props && typeof n.props["aria-label"] === "string"
+        && /^收起 .+ 的 README$/.test(n.props["aria-label"])) close = n;
+    });
+    if (close) close.props.onClick();
+  };
+  try {
+    // 1) 403 + 限流正文 → 配额文案（要告诉用户能做什么）
+    closeIfOpen();
+    await waitFor(() => !/README 全文|只显示前/.test(textOf(render())));
+    readmeRoutes.set("alpha/one", { status: 403, body: JSON.stringify({ message: "API rate limit exceeded" }) });
+    openReadme("alpha/one").props.onClick();
+    assert.ok(await waitFor(() => /限流/.test(textOf(render()))), "限流 403 应提示配额");
+
+    // 2) 403 + 普通正文（私有仓/被限制）→ 不能说成「等一会儿再试」
+    closeIfOpen();
+    await waitFor(() => !/限流/.test(textOf(render())));
+    readmeRoutes.set("alpha/one", { status: 403, body: JSON.stringify({ message: "Repository access blocked" }) });
+    openReadme("alpha/one").props.onClick();
+    assert.ok(await waitFor(() => /拒绝访问/.test(textOf(render()))), "非限流 403 应说清是被拒绝");
+    assert.doesNotMatch(textOf(render()), /限流/, "不该冒充限流");
+
+    // 3) 429 一定是限流，不用看正文
+    closeIfOpen();
+    await waitFor(() => !/拒绝访问/.test(textOf(render())));
+    readmeRoutes.set("alpha/one", { status: 429, body: "" });
+    openReadme("alpha/one").props.onClick();
+    assert.ok(await waitFor(() => /限流/.test(textOf(render()))), "429 应提示配额");
+  } finally {
+    readmeRoutes.clear();
+    closeIfOpen();
+    await waitFor(() => !/限流|拒绝访问/.test(textOf(render())));
+    // 恢复进入本用例前的状态：beta/two 是展开的，下一条用例要接着测「收起」。
+    let open = null;
+    walk(render(), (n) => {
+      if (!open && n.type === "button" && n.props && n.props["aria-label"] === "展开 beta/two 的 README") open = n;
+    });
+    if (open) open.props.onClick();
+    await waitFor(() => textOf(render()).includes("一个很长的说明"));
+  }
+});
+
 await check("README：再点一次收起，正文消失", async () => {
   let btn = null;
   walk(render(), (n) => {
@@ -1210,7 +1262,7 @@ await check("README：失败结果不缓存，看着恢复了就能重新读到"
   }
 });
 
-await check("导出 Markdown：复制的是当前榜单，不是渲染后的文本", async () => {
+await check("复制 Markdown：复制的是当前榜单，不是渲染后的文本", async () => {
   const prev = globalThis.navigator;
   let copied = "";
   Object.defineProperty(globalThis, "navigator", {
@@ -1220,7 +1272,7 @@ await check("导出 Markdown：复制的是当前榜单，不是渲染后的文�
   try {
     let btn = null;
     walk(render(), (n) => {
-      if (!btn && n.type === "button" && textOf(n) === "导出 Markdown") btn = n;
+      if (!btn && n.type === "button" && textOf(n) === "复制 Markdown") btn = n;
     });
     assert.ok(btn, "工具栏应有导出按钮");
     btn.props.onClick();
@@ -1234,16 +1286,16 @@ await check("导出 Markdown：复制的是当前榜单，不是渲染后的文�
   }
 });
 
-await check("导出 Markdown：剪贴板不可用时报失败，不静默", async () => {
+await check("复制 Markdown：剪贴板不可用时报失败，不静默", async () => {
   const prev = globalThis.navigator;
   Object.defineProperty(globalThis, "navigator", { configurable: true, value: {} });
   try {
-    // 先拿按钮（renderFresh 重置内部 state，文案回到「导出 Markdown」），
+    // 先拿按钮（renderFresh 重置内部 state，文案回到「复制 Markdown」），
     // 之后必须每帧重新渲染再读：回执是异步写进 useState 的，拿一次快照
     // 只会在 Promise 落地前读到空字符串。
     let btn = null;
     walk(render(), (n) => {
-      if (!btn && n.type === "button" && textOf(n) === "导出 Markdown") btn = n;
+      if (!btn && n.type === "button" && textOf(n) === "复制 Markdown") btn = n;
     });
     assert.ok(btn);
     btn.props.onClick();
@@ -1467,6 +1519,48 @@ await check("限流时保留已有列表并给出可读提示", async () => {
   assert.match(textOf(render()), /上次缓存|当前显示/, "应说明显示的是旧数据");
 });
 
+await check("连接层偶发失败会重试一次，不再把 reqwest 原文丢给用户", async () => {
+  // 宿主桥把 `error sending request` 原样抛出。第一次抛、第二次成功：
+  // 插件应自己重放，页面上不该出现任何错误。
+  trendingPayload = { status: 200, body: trendingHtml(day1) };
+  let hits = 0;
+  const original = ctx.bridge.invoke;
+  ctx.bridge.invoke = async (cmd, args) => {
+    if (String(args.url).startsWith("https://github.com/trending")) {
+      hits += 1;
+      if (hits === 1) throw new Error("error sending request");
+    }
+    return original(cmd, args);
+  };
+  try {
+    findByText(render(), "Trending").props.onClick();
+    assert.ok(await waitFor(() => textOf(render()).includes("alpha /")), "重试后应拿到榜单");
+    assert.equal(hits, 2, "应重放一次");
+    assert.doesNotMatch(textOf(render()), /error sending request/, "不该把底层错误原样显示");
+  } finally {
+    ctx.bridge.invoke = original;
+  }
+});
+
+await check("连接层持续失败时给出人能看懂的提示", async () => {
+  const original = ctx.bridge.invoke;
+  ctx.bridge.invoke = async (cmd, args) => {
+    if (String(args.url).startsWith("https://github.com/trending")) throw new Error("error sending request");
+    return original(cmd, args);
+  };
+  try {
+    findByText(render(), "刷新").props.onClick();
+    assert.ok(await waitFor(() => /连不上 GitHub|网络|代理/.test(textOf(render()))), "应说清是网络问题");
+    assert.doesNotMatch(textOf(render()), /error sending request/, "不要露出底层错误字符串");
+  } finally {
+    ctx.bridge.invoke = original;
+    // 这两条用例停在 Trending 视图；下一条「页面结构变化」靠点 Trending 触发刷新，
+    // 同一视图点一下是早退。先切回新星库，把视图状态还原成原顺序里的样子。
+    findByText(render(), "新星库（7 天）").props.onClick();
+    await waitFor(() => textOf(render()).includes("fresh repo") || !textOf(render()).includes("正在刷新"));
+  }
+});
+
 await check("页面结构变化时给出明确提示而不是空榜单", async () => {
   trendingPayload = { status: 200, body: "<html><body>redesigned</body></html>" };
   findByText(render(), "Trending").props.onClick();
@@ -1621,7 +1715,7 @@ await check("随便看看：导出标题写明来源，不冒充榜单", async (
   try {
     submitSearch("random/pick");
     assert.ok(await waitFor(() => textOf(render()).includes("fuzzy hit")), "先有搜索结果");
-    findByText(render(), "导出 Markdown").props.onClick();
+    findByText(render(), "复制 Markdown").props.onClick();
     assert.ok(await waitFor(() => copied !== null), "应调用剪贴板");
     assert.match(copied, /^# 每日热点 · GitHub 上按仓库名搜索「random\/pick」的结果/);
     assert.doesNotMatch(copied, /Trending ·/, "不能冒充 Trending 榜");
@@ -2236,15 +2330,17 @@ await check("设置页：提示词可以新增、设为默认、删除，并写�
     assert.ok(await waitFor(() => !!freshSettings, 2000), "应注册设置节");
     renderFresh(freshSettings.component, {}, { effects: true });
     await waitFor(() => textOf(renderFresh(freshSettings.component)).includes("讨论提示词"));
-    assert.match(textOf(renderKeep(freshSettings.component, {})), /还没有自定义提示词/, "初始应说明会用内置模板");
+    const initialText = textOf(renderKeep(freshSettings.component, {}));
+    assert.match(initialText, /还没有自定义提示词/, "初始应说明会用内置模板");
+    // 内置模板一开始就在列表里，且是默认那份
+    assert.match(initialText, /内置模板/);
+    assert.match(initialText, /系统/, "内置那份要能一眼看出不是用户建的");
 
     // 表单值是组件局部 state：必须用 renderKeep，renderFresh 会把它重置回
     // snap.settings，「新增」的结果还没写盘就丢了。
     const keep = () => renderKeep(freshSettings.component, {});
     findByText(keep(), "新增提示词").props.onClick();
     await waitFor(() => textOf(keep()).includes("提示词 1"));
-    // 第一份自动成为默认：加完还要再点一次「设为默认」很别扭
-    assert.match(textOf(keep()), /默认/);
 
     // 保存是防抖的，轮询渲染推进 effect
     for (let i = 0; i < 60 && !(saved.prompts || []).length; i += 1) {
@@ -2252,7 +2348,8 @@ await check("设置页：提示词可以新增、设为默认、删除，并写�
       await sleep(30);
     }
     assert.equal((saved.prompts || []).length, 1, "应写入设置");
-    assert.equal(saved.defaultPromptId, saved.prompts[0].id, "第一份应成为默认");
+    // 新增不抢默认：内置模板一开始就是默认，换不换由用户决定
+    assert.equal(saved.defaultPromptId, "", "新增的那份不该自动变成默认");
     assert.equal(saved.prompts[0].name, "提示词 1");
 
     // 正文默认收起：新增完就展开一整块 14 行文本框会把设置页拉很长。
@@ -2273,6 +2370,15 @@ await check("设置页：提示词可以新增、设为默认、删除，并写�
     }
     assert.equal(saved.prompts[0].name, "评估可投入性");
 
+    // 设为默认：两处「设为默认」里选用户那份（内置已经是默认，没有按钮）
+    findByText(keep(), "设为默认").props.onClick();
+    for (let i = 0; i < 60 && saved.defaultPromptId !== saved.prompts[0]?.id; i += 1) {
+      keep();
+      await sleep(30);
+    }
+    assert.equal(saved.defaultPromptId, saved.prompts[0].id, "点「设为默认」应切过去");
+
+    // 删除用户那份：删完默认回落内置模板（""），不是回落到别的自定义
     findByText(keep(), "删除").props.onClick();
     await waitFor(() => !textOf(keep()).includes("评估可投入性"));
     for (let i = 0; i < 60 && (saved.prompts || []).length !== 0; i += 1) {
@@ -2280,7 +2386,15 @@ await check("设置页：提示词可以新增、设为默认、删除，并写�
       await sleep(30);
     }
     assert.equal(saved.prompts.length, 0, "删除后应写回空列表");
-    assert.equal(saved.defaultPromptId, "", "默认值不能指向已删除的那份");
+    assert.equal(saved.defaultPromptId, "", "默认值应回落到内置模板，不悬空");
+
+    // 内置那份根本没有删除按钮：不是禁用，而是不存在
+    const deleteButtons = [];
+    walk(keep(), (n) => {
+      if (n.type === "button" && textOf(n) === "删除") deleteButtons.push(n);
+    });
+    assert.equal(deleteButtons.length, 0, "内置模板不可删除");
+    assert.match(textOf(keep()), /内置模板/, "删完之后内置那份还在");
   } finally {
     dispose3();
   }
@@ -2331,6 +2445,21 @@ await check("讨论用的是设置里选中的那份提示词", async () => {
   } finally {
     dispose4();
   }
+});
+
+await check("讨论回执：用内置模板时不写提示词名，自定义时才写", async () => {
+  // 内置模板是「没有选择的选择」，回执里再报一遍名字只是噪音；
+  // 但用户建的那份必须报，否则分不清刚才用的是哪套要求。
+  sessionStarts.length = 0;
+  // 讨论入口只挂在榜单行上：先切回 Trending 拿到 alpha/beta/gamma 这三行。
+  const trendingChip = findByText(render(), "Trending");
+  if (trendingChip) trendingChip.props.onClick();
+  assert.ok(await waitFor(() => !!discussButtonFor(render(), "beta/two"), 2000), "应找到讨论按钮");
+  discussButtonFor(render(), "beta/two").props.onClick();
+  assert.ok(await waitFor(() => sessionStarts.length === 1));
+  // 主实例的设置里没有 prompts → 走内置模板
+  assert.doesNotMatch(textOf(render()), /提示词「内置模板」/, "内置时不必报名字");
+  assert.match(sessionStarts[0].prompt, /本地副本/, "内置模板的正文应真的被用上");
 });
 
 await check("start 期间切视图，同样不会留下孤儿进程", async () => {

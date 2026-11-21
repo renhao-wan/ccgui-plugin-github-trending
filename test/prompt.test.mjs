@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   buildDigestPrompt,
   buildDiscussPrompt,
+  BUILTIN_PROMPT,
   DEFAULT_DISCUSS_TEMPLATE,
   normalisePrompts,
   pickPrompt,
@@ -290,15 +291,29 @@ test("normalisePrompts：份数与长度都有上限", () => {
   assert.ok(long.name.length <= 40);
 });
 
-test("pickPrompt：默认命中 → 第一份 → 内置模板，永远有可用结果", () => {
+test("pickPrompt：默认命中 → 内置模板，永远有可用结果", () => {
   const prompts = [
     { id: "a", name: "甲", text: "A" },
     { id: "b", name: "乙", text: "B" },
   ];
   assert.deepEqual(pickPrompt(prompts, "b"), prompts[1]);
-  assert.deepEqual(pickPrompt(prompts, "不存在"), prompts[0], "默认悬空时用第一份");
+  // 默认悬空时不偷偷换成「第一份」：用户以为在用某份、实际用另一份更难察觉。
+  assert.equal(pickPrompt(prompts, "不存在").id, "", "悬空默认应回落内置模板");
+  assert.equal(pickPrompt(prompts, "不存在").text, DEFAULT_DISCUSS_TEMPLATE);
+  // "" 就是内置模板本身，与磁盘上的旧默认值天然兼容
+  assert.deepEqual(pickPrompt(prompts, ""), BUILTIN_PROMPT);
   assert.equal(pickPrompt([], "x").text, DEFAULT_DISCUSS_TEMPLATE);
   assert.equal(pickPrompt(null, "").text, DEFAULT_DISCUSS_TEMPLATE);
+});
+
+test("pickPrompt：内置模板永远可选，且 id 为空串（不占用户数据）", () => {
+  assert.equal(BUILTIN_PROMPT.id, "");
+  assert.equal(BUILTIN_PROMPT.name, "内置模板");
+  assert.equal(BUILTIN_PROMPT.text, DEFAULT_DISCUSS_TEMPLATE);
+  // 用户列表里就算混进了内置那条，也不该被当作用户条目重复选中
+  const list = [{ id: "", name: "伪内置", text: "假的" }, { id: "a", name: "甲", text: "A" }];
+  assert.equal(pickPrompt(list, "a").id, "a");
+  assert.equal(pickPrompt(list, "").text, DEFAULT_DISCUSS_TEMPLATE, "空 id 一律走内置，不认列表里的冒牌货");
 });
 
 test("pickPrompt：空正文的条目不能当选（否则模型收到空 prompt）", () => {
@@ -306,7 +321,7 @@ test("pickPrompt：空正文的条目不能当选（否则模型收到空 prompt
     { id: "a", name: "空", text: "   " },
     { id: "b", name: "有", text: "B" },
   ];
-  assert.equal(pickPrompt(prompts, "a").id, "b", "默认指向空正文时回落到第一份有内容的");
+  assert.equal(pickPrompt(prompts, "a").id, "", "默认指向空正文时回落内置模板");
   assert.equal(pickPrompt([{ id: "a", name: "空", text: "" }], "a").text, DEFAULT_DISCUSS_TEMPLATE);
 });
 
@@ -314,6 +329,14 @@ test("pickPrompt 的结果能直接喂给 buildDiscussPrompt", () => {
   const chosen = pickPrompt(normalisePrompts([{ id: "a", name: "甲", text: "只看 {{repo}} 的 README 结构" }]), "a");
   const p = buildDiscussPrompt({ row: discussRow(), view: "trending", template: chosen.text });
   assert.match(p, /只看 obra\/superpowers 的 README 结构/);
+});
+
+test("内置模板始终是「有内容的那一份」，可反复当底稿", () => {
+  // 新增提示词时以它为底稿：底稿本身必须非空，否则新的一开始就是废的
+  assert.ok(BUILTIN_PROMPT.text.trim().length > 100);
+  const p = buildDiscussPrompt({ row: discussRow(), view: "trending", template: BUILTIN_PROMPT.text });
+  assert.match(p, /本地副本/);
+  assert.match(p, /下一步/);
 });
 
 test("续接策略：normaliseResumeMode 只认已知值，其余退回默认", () => {

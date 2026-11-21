@@ -169,6 +169,17 @@ export const DEFAULT_DISCUSS_TEMPLATE = [
   "- 最后一行给我一个「下一步」建议（比如读哪个文件、跑什么命令验证）。",
 ].join("\n");
 
+/**
+ * 系统内置的那份提示词：始终存在、始终可选、不可删除。
+ *
+ * 它不落盘（不进 settings.prompts），由设置页直接渲染在列表首位。这样做的理由：
+ * 1. 磁盘上永远只有用户自己写的东西，升级/迁移时不用在一个「用户数据」数组里
+ *    猜哪条是系统项；
+ * 2. 「删不掉」是结构性的——它根本不在可删列表里，不靠 disable 一个按钮；
+ * 3. `defaultPromptId === ""` 就是「用内置」，与旧版本磁盘里的默认值天然兼容。
+ */
+export const BUILTIN_PROMPT = { id: "", name: "内置模板", text: DEFAULT_DISCUSS_TEMPLATE };
+
 /** 单份提示词正文上限：两万字符，够写任意详细的分析框架，又不至于让设置页卡住。 */
 export const PROMPT_TEXT_LIMIT = 20000;
 /** 提示词份数上限。设置页要能一眼看完全部，不做分页。 */
@@ -222,9 +233,12 @@ export function normalisePrompts(raw) {
 /**
  * 选出这次讨论实际用哪份提示词。
  *
- * 三级回落：设置里的默认 → 列表第一份 → 内置模板。**永远返回一份可用模板**，
- * 因为「没有提示词」不该表现为按钮点了没反应。空正文的条目（正在编辑/被清空）
- * 不能当选：选它等于给模型一个空 prompt。
+ * 两级：设置里的默认 → 内置模板。**永远返回一份可用模板**，
+ * 因为「没有提示词」不该表现为按钮点了没反应。
+ *
+ * `defaultId === ""` 就是内置模板本身——它不可删除，所以这个回落在结构上
+ * 一定成立；磁盘上有个悬空 id 时也回落它，而不是悄悄换成「第一份」：
+ * 用户以为自己选的是某份，实际用另一份比用系统默认更难察觉。
  *
  * @param {Array<{ id: string, name: string, text: string }>} prompts
  * @param {string} defaultId
@@ -232,12 +246,12 @@ export function normalisePrompts(raw) {
  */
 export function pickPrompt(prompts, defaultId) {
   const list = (Array.isArray(prompts) ? prompts : []).filter(
-    (p) => p && typeof p === "object" && String(p.text || "").trim() !== "",
+    (p) => p && typeof p === "object" && String(p.id || "").trim() !== "" && String(p.text || "").trim() !== "",
   );
-  const hit = list.find((p) => p.id === defaultId);
-  if (hit) return hit;
-  if (list.length > 0) return list[0];
-  return { id: "", name: "默认", text: DEFAULT_DISCUSS_TEMPLATE };
+  const wanted = String(defaultId === undefined || defaultId === null ? "" : defaultId);
+  if (!wanted) return { ...BUILTIN_PROMPT }; // 内置模板：永远可用
+  const hit = list.find((p) => p.id === wanted);
+  return hit ? hit : { ...BUILTIN_PROMPT };
 }
 
 function fillTemplate(template, values) {

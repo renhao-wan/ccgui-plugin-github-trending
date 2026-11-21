@@ -323,16 +323,22 @@ function historyPath(period, language) {
   return HISTORY_DIR + "/" + period + "-" + suffix + ".json";
 }
 
+/** 连接层错误的判据：这类错误重放一次通常就过了，对用户也该换个说法。 */
+const TRANSIENT_NET = /error sending request|econnreset|econnrefused|connection reset|connection closed|socket hang up|dns|tls|certificate|unexpected eof/i;
+
 function messageOf(error) {
   const raw = error && error.message ? String(error.message) : String(error || "");
   if (/network:|no declared network|missing permission|without declaring/i.test(raw)) {
     return "网络授权未生效，请重新安装插件";
   }
   if (/timed?\s*out|timeout/i.test(raw)) return "请求超时，请稍后重试";
+  // 宿主桥把 reqwest 的底层错误原样抛过来。原样显示等于把 `error sending
+  // request` 丢给用户——既不知道是哪里断了，也不知道能做什么。
+  if (TRANSIENT_NET.test(raw)) return "连不上 GitHub：检查本机网络或系统代理后重试";
   return raw || "请求失败";
 }
 
-async function httpGet(url, headers) {
+async function httpGetOnce(url, headers) {
   const res = await withTimeout(
     appCtx.bridge.invoke("plugin_http_request", {
       method: "GET",
@@ -344,6 +350,26 @@ async function httpGet(url, headers) {
     "http",
   );
   return { status: Number(res && res.status) || 0, body: res && typeof res.body === "string" ? res.body : "" };
+}
+
+/**
+ * 一次 GET，连接层失败时重试一次。
+ *
+ * 宿主桥把 reqwest 的错误原样抛出来，本地实测 `error sending request` 是偶发的
+ * （同一 URL 隔几秒就通）。GET 是幂等的，重放一次比让用户自己点「刷新」强。
+ *
+ * 不重试的：超时（再等 20 秒只是把等待翻倍）、授权错误（重放也拿不到权限）、
+ * 以及桥正常返回的 4xx/5xx（那是服务端的答复，重试只会更快撞限流）。
+ */
+async function httpGet(url, headers) {
+  try {
+    return await httpGetOnce(url, headers);
+  } catch (error) {
+    const raw = error && error.message ? String(error.message) : String(error || "");
+    if (!TRANSIENT_NET.test(raw) || /timed?\s*out|timeout|permission|network:/i.test(raw)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return await httpGetOnce(url, headers);
+  }
 }
 
 async function fetchTrending(ctx, period, language) {
@@ -482,14 +508,23 @@ async function fetchReadme(repo, settings) {
 
   const res = await httpGet(url, headers);
   if (res.status === 404) return { ok: false, message: "这个仓库没有 README" };
-  if (res.status === 403 || res.status === 429) {
-    // README 走的是核心 REST API，配额与 Search API 不同：未认证 60 次/小时，
-    // 认证后 5000 次/小时。别照抄 Search 的「10 次/分钟」。
+  // 403 不一定都是限流：仓库被限制访问、命中二次限流也会给 403。只有正文
+  // 明确说了 rate limit 才按配额解释，否则会把「没权限」说成「等一会儿」。
+  // 429 一定是限流，不用看正文。
+  if (res.status === 429 || (res.status === 403 && /rate limit|too many requests/i.test(res.body))) {
+    // 「配额用完」和「请求太密」是两种限流，用户能做的事不一样：前者要等一小时
+    // 或填 Token，后者等十几秒就好。README 走核心 REST API，未认证 60 次/小时。
+    if (/secondary rate limit/i.test(res.body)) {
+      return { ok: false, message: "请求太密被 GitHub 暂时限制，等十几秒再展开" + (token ? "" : "（或在设置里填 Token 提高额度）") };
+    }
     return {
       ok: false,
-      message: token ? "GitHub 限流了，请等一会儿再试" : "GitHub 未认证限流（60 次/小时），可在设置里填 Token 提高额度",
+      message: token
+        ? "GitHub 限流了，请等一会儿再试"
+        : "GitHub 未认证限流（60 次/小时），可在设置里填 Token 提高额度",
     };
   }
+  if (res.status === 403) return { ok: false, message: "GitHub 拒绝访问这个仓库（HTTP 403）" };
   if (res.status < 200 || res.status >= 300) return { ok: false, message: "GitHub 返回 HTTP " + res.status };
 
   const prepared = prepareReadme(readmeTextFromBody(res.body));
@@ -1893,7 +1928,7 @@ function Toolbar({ snap, ctx }) {
       "div",
       { className: "gt-group gt-group--end" },
       snap.loadedAt ? h("span", { className: "gt-stamp" }, "更新于 " + fmtTime(snap.loadedAt)) : null,
-      // 定宽：文案在「导出 Markdown / 已复制 / 复制失败」之间切，右侧按钮不能跟着挪。
+      // 定宽：文案在「复制 Markdown / 已复制 / 复制失败」之间切，右侧按钮不能跟着挪。
       h(
         "button",
         {
@@ -1901,9 +1936,9 @@ function Toolbar({ snap, ctx }) {
           className: "gt-btn gt-btn--export",
           onClick: exportMarkdown,
           disabled: snap.loading || snap.repos.length === 0,
-          title: "把当前榜单复制成 Markdown（可直接粘进周报或 issue）",
+          title: "把当前榜单复制成 Markdown",
         },
-        exportStatus || "导出 Markdown",
+        exportStatus || "复制 Markdown",
       ),
       h(
         "button",
@@ -2712,22 +2747,21 @@ function SettingsSection() {
   // 有名字但正文空的那份会保留在列表里——用户正在重写，不能当场消失。
   const prompts = normalisePrompts(form.prompts);
   // 「默认」标记必须落在真正会生效的那份上，否则界面说 A、实际用 B。
-  // 空正文的条目会被 pickPrompt 跳过，这里也跟着跳过。
+  // 空正文的条目会被 pickPrompt 跳过，这里也跟着跳过。内置模板的 id 是 "",
+  // 所以 `defaultPromptId === ""` 天然表示「用内置」，不额外存一个标记位。
   const usable = prompts.filter((p) => p.text.trim() !== "");
-  const defaultId = usable.some((p) => p.id === form.defaultPromptId)
-    ? form.defaultPromptId
-    : usable.length > 0
-      ? usable[0].id
-      : "";
+  const defaultId = usable.some((p) => p.id === form.defaultPromptId) ? form.defaultPromptId : "";
 
-  /** 写回列表。顺手修正默认值——默认指向一份刚被删掉的提示词时不能悬空。 */
+  /** 写回列表。顺手修正默认值——默认指向一份刚被删掉的提示词时回落内置模板。 */
   const writePrompts = (next, nextDefault) => {
     // 有名字的空正文条目必须留住：用户全选删除正文是想重写，不是想删掉这一份。
     const list = normalisePrompts(next);
     const wanted = nextDefault === undefined ? form.defaultPromptId : nextDefault;
     // 空正文的不会生效（pickPrompt 跳过），默认值也不该指向它们。
     const usable = list.filter((p) => p.text.trim() !== "");
-    const fixed = usable.some((p) => p.id === wanted) ? wanted : usable.length > 0 ? usable[0].id : "";
+    // "" = 内置模板，它永远可选，所以回落目标就是它而不是「第一份」：
+    // 用户删掉正在用的那份时，得到的是可预期的默认，而不是另一份自定义。
+    const fixed = usable.some((p) => p.id === wanted) ? wanted : "";
     setForm((prev) => Object.assign({}, prev || snap.settings, { prompts: list, defaultPromptId: fixed }));
   };
 
@@ -2740,8 +2774,8 @@ function SettingsSection() {
     // 名字用「提示词 N」而不是空串：空名字在列表里无法区分。
     const id = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
     const next = prompts.concat([{ id, name: "提示词 " + (prompts.length + 1), text: DEFAULT_DISCUSS_TEMPLATE }]);
-    // 第一份自动成为默认，否则用户加完还得再点一次「设为默认」。
-    writePrompts(next, prompts.length === 0 ? id : form.defaultPromptId);
+    // 不自动抢默认：内置模板一开始就是默认，新加的那份要用户自己决定用不用。
+    writePrompts(next, form.defaultPromptId);
   };
 
   const removePrompt = (id) => {
@@ -2753,68 +2787,73 @@ function SettingsSection() {
   const openPrompt = openPromptState[0];
   const setOpenPrompt = openPromptState[1];
 
-  const promptRows = prompts.length === 0
-    ? [
+  /**
+   * 一份提示词的一行。
+   *
+   * `builtin` 的那份只读：它不在 settings.prompts 里，改它没有地方存。
+   * 想改就「新增提示词」——那份以内置模板为底稿，是可编辑的。
+   */
+  const promptRow = (item, builtin) => {
+    const isDefault = builtin ? defaultId === "" : item.id === defaultId;
+    const isOpen = openPrompt === (builtin ? "__builtin__" : item.id);
+    const key = builtin ? "__builtin__" : item.id;
+    return h(
+      "div",
+      { className: "gt-prompt" + (builtin ? " gt-prompt--builtin" : ""), key },
+      h(
+        "div",
+        { className: "gt-prompt-head" },
         h(
-          "p",
-          { className: "gt-note-line" },
-          "还没有自定义提示词。点「讨论」会用内置模板（先在本机找同名仓库，找不到再读远程，给出适合谁用的判断）。",
+          "button",
+          {
+            type: "button",
+            className: "gt-prompt-name",
+            onClick: () => setOpenPrompt(isOpen ? "" : key),
+            "aria-expanded": isOpen ? "true" : "false",
+            "aria-label": (isOpen ? "收起 " : "展开 ") + item.name + " 的正文",
+            title: builtin ? "查看内置模板正文（只读）" : "展开编辑正文",
+          },
+          h("span", { className: "gt-prompt-chevron", "aria-hidden": "true" }, isOpen ? "▾" : "▸"),
+          h("span", { className: "gt-prompt-label" }, item.name),
+          builtin ? h("span", { className: "gt-prompt-tag" }, "系统") : null,
         ),
-      ]
-    : prompts.map((item) => {
-        const isDefault = item.id === defaultId;
-        const isOpen = openPrompt === item.id;
-        return h(
-          "div",
-          { className: "gt-prompt", key: item.id },
-          h(
-            "div",
-            { className: "gt-prompt-head" },
-            h(
+        // 默认那份用「已设为默认」的静态标记，而不是一个点下去没反应的按钮：
+        // 几份提示词里哪份在生效，是这一节最重要的一条信息。
+        isDefault
+          ? h("span", { className: "gt-prompt-default" }, "默认")
+          : h(
               "button",
               {
                 type: "button",
-                className: "gt-prompt-name",
-                onClick: () => setOpenPrompt(isOpen ? "" : item.id),
-                "aria-expanded": isOpen ? "true" : "false",
-                "aria-label": (isOpen ? "收起 " : "展开 ") + item.name + " 的正文",
-                title: "展开编辑正文",
+                className: "gt-btn gt-path-pick",
+                onClick: () => writePrompts(prompts, builtin ? "" : item.id),
+                title: "点「讨论」时用这一份",
+                "aria-label": "把 " + item.name + " 设为默认提示词",
               },
-              h("span", { className: "gt-prompt-chevron", "aria-hidden": "true" }, isOpen ? "▾" : "▸"),
-              h("span", { className: "gt-prompt-label" }, item.name),
+              "设为默认",
             ),
-            // 默认那份用「已设为默认」的静态标记，而不是一个点下去没反应的按钮：
-            // 三份提示词里哪份在生效，是这一节最重要的一条信息。
-            isDefault
-              ? h("span", { className: "gt-prompt-default" }, "默认")
-              : h(
-                  "button",
-                  {
-                    type: "button",
-                    className: "gt-btn gt-path-pick",
-                    onClick: () => writePrompts(prompts, item.id),
-                    title: "点「讨论」时用这一份",
-                    "aria-label": "把 " + item.name + " 设为默认提示词",
-                  },
-                  "设为默认",
-                ),
-            h(
+        // 内置那份没有删除按钮：不是禁用，而是根本不渲染——它不在用户数据里。
+        builtin
+          ? null
+          : h(
               "button",
               {
                 type: "button",
                 className: "gt-btn ghost gt-path-pick",
                 onClick: () => removePrompt(item.id),
-                title: "删除这份提示词（不影响内置模板）",
+                title: "删除这份提示词",
                 "aria-label": "删除 " + item.name,
               },
               "删除",
             ),
-          ),
-          isOpen
-            ? h(
-                "div",
-                { className: "gt-prompt-body" },
-                h(
+      ),
+      isOpen
+        ? h(
+            "div",
+            { className: "gt-prompt-body" },
+            builtin
+              ? null
+              : h(
                   "div",
                   { className: "gt-path" },
                   h("input", {
@@ -2826,34 +2865,48 @@ function SettingsSection() {
                     "aria-label": "提示词名字",
                     onChange: (e) => {
                       const name = e.target.value.slice(0, PROMPT_NAME_LIMIT);
-                      writePrompts(
-                        prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { name }) : p)),
-                      );
+                      writePrompts(prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { name }) : p)));
                     },
                   }),
                 ),
-                h("textarea", {
-                  className: "gt-input gt-prompt-text",
-                  value: item.text,
-                  rows: 14,
-                  spellCheck: false,
-                  "aria-label": item.name + " 的提示词正文",
-                  onChange: (e) => {
-                    // 超长只截断不报错：一边打字一边弹红字比截断更烦。
-                    const text = e.target.value.slice(0, PROMPT_TEXT_LIMIT);
-                    writePrompts(prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { text }) : p)));
-                  },
-                }),
-                h(
+            h("textarea", {
+              className: "gt-input gt-prompt-text",
+              value: item.text,
+              rows: 14,
+              spellCheck: false,
+              readOnly: Boolean(builtin),
+              "aria-label": item.name + " 的提示词正文",
+              onChange: (e) => {
+                if (builtin) return;
+                // 超长只截断不报错：一边打字一边弹红字比截断更烦。
+                const text = e.target.value.slice(0, PROMPT_TEXT_LIMIT);
+                writePrompts(prompts.map((p) => (p.id === item.id ? Object.assign({}, p, { text }) : p)));
+              },
+            }),
+            builtin
+              ? h("p", { className: "gt-hint" }, "内置模板不可编辑。要以它为底稿改一份，点下面的「新增提示词」。")
+              : h(
                   "p",
                   { className: "gt-hint" },
                   "可用占位符：{{repo}} {{url}} {{scope}} {{description}} {{language}} {{stars}} {{gain}} {{rank}} {{age}} {{facts}}。"
                     + "它们会被这一行的真实数据替换；没写 {{facts}} 时插件会在末尾补一节事实。",
                 ),
-              )
-            : null,
-        );
-      });
+          )
+        : null,
+    );
+  };
+
+  const promptRows = [
+    promptRow(BUILTIN_PROMPT, true),
+    ...prompts.map((item) => promptRow(item, false)),
+    prompts.length === 0
+      ? h(
+          "p",
+          { className: "gt-note-line" },
+          "还没有自定义提示词。点「讨论」会用上面的内置模板；想换个角度分析，就新增一份。",
+        )
+      : null,
+  ].filter(Boolean);
 
   const promptEditor = h(
     "div",
@@ -3574,6 +3627,14 @@ const CSS = `
 .gt-settings .gt-prompt-label {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 系统内置那份：左边一道与其他行不同的竖线，不用颜色区分，暗色主题也稳。 */
+.gt-settings .gt-prompt--builtin { border-left: 2px solid var(--gt-accent); }
+.gt-settings .gt-prompt--builtin .gt-prompt-head { background: transparent; }
+.gt-settings .gt-prompt-tag {
+  flex: none; padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;
+  letter-spacing: 0.02em; color: var(--gt-muted); background: var(--gt-raised);
+  border: 1px solid var(--gt-control);
+}
 .gt-settings .gt-prompt-default {
   flex: none; padding: 2px 8px; border-radius: 5px; font-size: 11px; font-weight: 600;
   color: var(--gt-accent); background: transparent;
@@ -3744,10 +3805,9 @@ export default function activate(ctx) {
         // 归一化在这里做一次，后面所有读取点都不用再防。
         merged.prompts = normalisePrompts(merged.prompts);
         // 默认值只落在真正会生效的那份上（空正文会被 pickPrompt 跳过）。
+        // 悬空或不存在时回落内置模板（id ""）——它不可删除，所以一定有东西可用。
         const usable = merged.prompts.filter((p) => p.text.trim() !== "");
-        if (!usable.some((p) => p.id === merged.defaultPromptId)) {
-          merged.defaultPromptId = usable.length > 0 ? usable[0].id : "";
-        }
+        if (!usable.some((p) => p.id === merged.defaultPromptId)) merged.defaultPromptId = "";
         set({ settings: merged });
       }
     } catch {
