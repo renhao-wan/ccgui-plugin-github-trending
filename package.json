@@ -1,6 +1,6 @@
 {
   "name": "ccgui-plugin-github-trending",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "每日热点：GitHub Trending 与近 7 天新星库",
