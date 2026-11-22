@@ -3434,8 +3434,16 @@ await check("反馈：额度查询失败时不显示数字，但仍可发送", a
   const tree = await renderFeedbackReady(true);
   const quota = findByType(tree, "span", "gt-feedback-quota");
   assert.ok(quota, "应渲染额度提示");
-  assert.match(textOf(quota), /额度有限/);
+  // 查询失败是「连不上」，不能说成「你发太多了」——后者会把用户引到错方向。
+  assert.match(textOf(quota), /连不上|暂时/);
+  assert.doesNotMatch(textOf(quota), /刷屏/);
   assert.doesNotMatch(textOf(quota), /\d+ 条/);
+  // 额度查不到不能挡住发送。
+  const area = findByType(tree, "textarea", "gt-feedback-text");
+  area.props.onChange({ target: { value: "查不到额度也要能发" } });
+  await sleep(20);
+  const btn = findByText(renderKeep(settingsDef.component, {}), "发送反馈");
+  assert.ok(!btn.props.disabled, "额度未知时仍可发送");
   feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
 });
 
@@ -3532,6 +3540,50 @@ await check("反馈：成功后再打字，旧回执随之撤掉", async () => {
   const after = renderKeep(settingsDef.component, {});
   assert.ok(findByText(after, "发送反馈"), "重新输入后按钮应回到「发送反馈」");
   assert.ok(!findAnyText(after, "反馈已发送"), "旧的成功回执应随之撤掉");
+});
+
+await check("反馈：突发限流提示「稍等」而不是「明天」，且不谎报额度用完", async () => {
+  httpCalls.length = 0;
+  // Worker 突发保护：10 分钟内第 4 条。此时今天还有额度，只是这会儿太快。
+  feedbackSend = {
+    status: 429,
+    body: '{"ok":false,"error":"rate_limited","kind":"burst","remaining":27,"resetAt":1795392000000}',
+  };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "手快了点" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  const msg = await waitFor(
+    () => findAnyText(renderKeep(settingsDef.component, {}), "太快"),
+    3000,
+  );
+  assert.ok(msg, "突发限流应提示发得太快");
+  assert.ok(
+    !findAnyText(renderKeep(settingsDef.component, {}), "明天"),
+    "突发限流不该说「明天」——十分钟后就好",
+  );
+  // 失败不吞正文，用户不用重打一遍。
+  const area = findByType(renderKeep(settingsDef.component, {}), "textarea", "gt-feedback-text");
+  assert.equal(area.props.value, "手快了点", "失败后正文应保留");
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+});
+
+await check("反馈：502 说成服务端发不出，不甩「内容不合要求」", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 502, body: '{"ok":false,"error":"smtp_failed"}' };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "这锅不在我" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  const msg = await waitFor(
+    () => findAnyText(renderKeep(settingsDef.component, {}), "中转暂时"),
+    3000,
+  );
+  assert.ok(msg, "502 应说明是中转发不出邮件");
+  // 责任归属很重要：用户没做错事，别让他去改内容。
+  assert.ok(!findAnyText(renderKeep(settingsDef.component, {}), "内容不合"), "不能把服务端故障说成用户的错");
+  assert.ok(findAnyText(renderKeep(settingsDef.component, {}), "GitHub Issue"), "给出退路");
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
 });
 
 await check("反馈：429 时提示额度用完", async () => {

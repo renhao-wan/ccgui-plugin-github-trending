@@ -449,8 +449,8 @@ async function sendFeedback(ctx, text) {
 }
 
 /**
- * 查今天的剩余额度。失败时返回 null——额度查不到不能挡住发反馈，
- * UI 会退回到「额度有限，请勿刷屏」这句不需要数字的话。
+ * 查今天的剩余额度。失败时返回 `{offline: true}`——额度查不到不能挡住发反馈，
+ * 但要让界面知道「是连不上」而不是「额度紧张」，两句话说给用户听的意思完全不同。
  */
 async function fetchQuota(ctx) {
   try {
@@ -464,11 +464,13 @@ async function fetchQuota(ctx) {
       FEEDBACK_TIMEOUT_MS,
       "quota",
     );
+    const status = Number(res && res.status) || 0;
+    if (!(status >= 200 && status < 300)) return { offline: true };
     const body = res && typeof res.body === "string" ? res.body : "";
     const data = body ? JSON.parse(body) : null;
     return data && Number.isFinite(Number(data.remaining)) ? { remaining: Number(data.remaining), dailyLimit: Number(data.dailyLimit) || 30 } : null;
   } catch {
-    return null;
+    return { offline: true };
   }
 }
 
