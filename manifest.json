@@ -1,7 +1,7 @@
 {
   "id": "github-trending",
   "name": "每日热点",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "sdkVersion": "^0.3",
   "minAppVersion": "1.2.4",
   "author": "renhao-wan",
@@ -27,6 +27,7 @@
     "assets:directory",
     "network:github.com",
     "network:api.github.com",
-    "network:raw.githubusercontent.com"
+    "network:raw.githubusercontent.com",
+    "network:ccgui-feedback.workers.dev"
   ]
 }

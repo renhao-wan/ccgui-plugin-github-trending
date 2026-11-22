@@ -248,6 +248,9 @@ const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), "gt-smoke-"));
 const pickedWorkspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "gt-picked-"));
 const kv = new Map();
 const httpCalls = [];
+/** 反馈中转的假响应。用例逐个改写，跑完不必复原（每个用例自己设）。 */
+let feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+let feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
 const agentStarts = [];
 const agentInterrupts = [];
 /** sessions.startRun 的入参；讨论功能的核心断言对象。 */
@@ -616,7 +619,16 @@ const ctx = {
   bridge: {
     invoke: async (cmd, args) => {
       if (cmd !== "plugin_http_request") throw new Error("unexpected bridge command " + cmd);
-      httpCalls.push({ url: args.url, headers: args.headers || {} });
+      httpCalls.push({ url: args.url, headers: args.headers || {}, method: args.method, body: args.body });
+      // 反馈中转：用例按 feedbackMode 决定这条路回什么。
+      if (args.url.startsWith("https://ccgui-feedback.workers.dev/")) {
+        if (args.url.endsWith("/quota")) {
+          return { status: feedbackQuota.status, body: JSON.stringify(feedbackQuota.value) };
+        }
+        if (args.url.endsWith("/feedback")) {
+          return { status: feedbackSend.status, body: feedbackSend.body };
+        }
+      }
       if (args.url.startsWith("https://github.com/trending")) {
         return { status: trendingPayload.status, body: trendingPayload.body };
       }
@@ -3167,10 +3179,15 @@ await check("设置页：提示词可以新增、设为默认、删除，并写�
     findByText(keep(), "内置模板").props.onClick();
     await waitFor(() => textOf(keep()).includes("先在本机找同名仓库") || textOf(keep()).includes("本地副本"));
     const builtinInputs = [];
+    // 只在提示词行的子树里统计。设置页底部还有反馈正文的 textarea，
+    // 按整页统计会把它也算成「内置模板的可编辑控件」。
     walk(keep(), (n) => {
-      if (n.type === "textarea" || (n.type === "input" && n.props && n.props["aria-label"] === "提示词名字")) {
-        builtinInputs.push(n);
-      }
+      if (!n.props || !String(n.props.className || "").split(/\s+/).includes("gt-prompt")) return;
+      walk(n, (m) => {
+        if (m.type === "textarea" || (m.type === "input" && m.props && m.props["aria-label"] === "提示词名字")) {
+          builtinInputs.push(m);
+        }
+      });
     });
     assert.equal(builtinInputs.length, 0, "内置模板不应有任何可编辑控件");
     findByText(keep(), "内置模板").props.onClick();
@@ -3356,6 +3373,131 @@ await check("语言名含路径穿越时不会写到快照目录之外", async (
     }
   }
   dispose2();
+});
+
+/* ------------------------------------------------ 反馈：两个渠道 */
+
+/** 反馈区在设置页里的锚点：按「发送反馈」按钮反查所属 section。 */
+function feedbackSection() {
+  const tree = renderFresh(settingsDef.component, {}, { effects: true });
+  const btn = findByText(tree, "发送反馈");
+  assert.ok(btn, "设置页应有「发送反馈」按钮");
+  return { tree, btn };
+}
+
+/**
+ * 渲染设置页并等额度查询落地。
+ *
+ * 额度来自一次异步 GET，落在 useState 里；首帧只能拿到 null。真宿主会
+ * 在 state 变化后重渲染，这里用两次 renderKeep 模拟。
+ *
+ * `fresh` 为 true 时换一个组件引用：effectStore 是 WeakMap，按组件引用缓存，
+ * 不换引用的话上一个用例的额度结果会被当成「effect 已跑过」而跳过。
+ */
+async function renderFeedbackReady(fresh) {
+  if (fresh) {
+    stateSlots = new Map();
+    refSlots = new Map();
+    effectStores.delete(settingsDef.component);
+  }
+  renderKeep(settingsDef.component, {});
+  await sleep(60);
+  return renderKeep(settingsDef.component, {});
+}
+
+/** 在整棵树里找含指定文字的任意元素（文案有 button、p、span 多种载体）。 */
+function findAnyText(node, text) {
+  let hit = null;
+  walk(node, (n) => {
+    if (hit || !n.type || typeof n.type !== "string") return;
+    if (textOf(n).includes(text)) hit = n;
+  });
+  return hit;
+}
+
+await check("反馈：GitHub Issue 链接预填正文，且不含任何本机信息", async () => {
+  const { tree } = feedbackSection();
+  const link = findByType(tree, "a", "gt-feedback-issue");
+  assert.ok(link, "应有「通过 GitHub 提 Issue」链接");
+  const url = new URL(link.props.href);
+  assert.equal(url.hostname, "github.com");
+  assert.equal(url.pathname, "/renhao-wan/ccgui-plugin-github-trending/issues/new");
+  assert.ok(url.searchParams.get("title").includes("反馈"));
+  const body = url.searchParams.get("body");
+  assert.ok(!body.includes("D:\\"), "正文不应带本机路径");
+  assert.equal(link.props.target, "_blank");
+  assert.match(link.props.rel, /noreferrer/);
+});
+
+await check("反馈：额度查询失败时不显示数字，但仍可发送", async () => {
+  feedbackQuota = { status: 500, value: null };
+  const tree = await renderFeedbackReady(true);
+  const quota = findByType(tree, "span", "gt-feedback-quota");
+  assert.ok(quota, "应渲染额度提示");
+  assert.match(textOf(quota), /额度有限/);
+  assert.doesNotMatch(textOf(quota), /\d+ 条/);
+  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+});
+
+await check("反馈：额度查得到时显示剩余条数", async () => {
+  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+  const tree = await renderFeedbackReady(true);
+  const quota = findByType(tree, "span", "gt-feedback-quota");
+  assert.match(textOf(quota), /27/);
+});
+
+await check("反馈：输入后点发送，POST 到 worker，body 只带白名单字段", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  // 输入框内容跨渲染存在，用 renderKeep 才能走完「打字 → 点发送 → 看到结果」。
+  const tree = await renderFeedbackReady(true);
+  const area = findByType(tree, "textarea", "gt-feedback-text");
+  assert.ok(area, "反馈区应有输入框");
+  area.props.onChange({ target: { value: "界面有点卡" } });
+  await sleep(20);
+  const btn = findByText(renderKeep(settingsDef.component, {}), "发送反馈");
+  assert.ok(!btn.props.disabled, "有内容时应可发送");
+  btn.props.onClick();
+  assert.ok(await waitFor(() => httpCalls.some((c) => c.url.endsWith("/feedback")), 3000), "应发出 /feedback");
+  const call = httpCalls.find((c) => c.url.endsWith("/feedback"));
+  assert.equal(call.method, "POST");
+  assert.equal(new URL(call.url).hostname, "ccgui-feedback.workers.dev");
+  const body = JSON.parse(call.body);
+  assert.deepEqual(Object.keys(body).sort(), ["hostVersion", "pluginId", "pluginVersion", "text", "ts"]);
+  assert.equal(body.text, "界面有点卡");
+  assert.equal(body.pluginId, "github-trending");
+  assert.ok(!JSON.stringify(body).includes("D:"), "请求体不应带本机路径");
+  // 成功后输入框清空、显示成功文案。
+  assert.ok(
+    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "反馈已发送"), 2000),
+    "应显示成功文案",
+  );
+});
+
+await check("反馈：429 时提示额度用完", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 429, body: '{"ok":false,"error":"rate_limited","remaining":0}' };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "再来一条" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  assert.ok(
+    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "额度已用完"), 3000),
+    "应显示额度用完文案",
+  );
+});
+
+await check("反馈：500 时提示发送失败并给出 Issue 退路", async () => {
+  feedbackSend = { status: 500, body: "boom" };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "再来一条" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  assert.ok(
+    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "可改用 GitHub Issue"), 3000),
+    "失败文案应指回 Issue",
+  );
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
 });
 
 /* ------------------------------------------------------------ 汇总 */

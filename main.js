@@ -1727,10 +1727,154 @@ function readmeTextFromBody(body) {
   }
 }
 
+// ---- src/lib/feedback.mjs ----
+/**
+ * 反馈渠道的纯函数层：正文归一化、Issue 链接拼装、请求体收敛、响应文案。
+ *
+ * 全部离线可测。网络与 UI 在 main.head.js 里，这一层只回答「发什么」和
+ * 「回什么」，方便把隐私边界钉死在测试里：请求体只允许五个字段。
+ */
+
+/** 正文上限。再长就不是一条反馈，而是一篇文档了。 */
+const TEXT_LIMIT = 1000;
+
+/**
+ * 收敛用户输入：控制字符折叠成空格、合并连续空白、限长。
+ * 保留大小写、中文与 emoji——反馈要原样送到人眼前。
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+function normaliseFeedbackText(raw) {
+  return String(raw === undefined || raw === null ? "" : raw)
+    .replace(/[\u0000-\u001f\u007f�]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, TEXT_LIMIT)
+    .trim();
+}
+
+/**
+ * GitHub 新建 Issue 的预填链接。
+ *
+ * 用预填而不是直接调 API：API 要 PAT，PAT 写进插件源码等于公开。预填链接
+ * 只依赖用户浏览器里已有的登录态，插件一行网络代码都不用写。
+ *
+ * @param {{repo: string, pluginName: string, text: string, pluginVersion: string, hostVersion: string}} o
+ * @returns {string}
+ */
+function buildIssueUrl(o) {
+  const text = normaliseFeedbackText(o.text);
+  const body = [
+    text || "_（请在这里描述问题或建议）_",
+    "",
+    "---",
+    "插件：" + String(o.pluginName || "") + " " + String(o.pluginVersion || ""),
+    "CC GUI：" + String(o.hostVersion || ""),
+  ].join("\n");
+  const q = new URLSearchParams({
+    title: "[反馈] " + String(o.pluginName || ""),
+    body,
+  });
+  return "https://github.com/" + String(o.repo || "") + "/issues/new?" + q.toString();
+}
+
+/** 请求体允许的字段。白名单而非黑名单：漏传字段比误传路径好。 */
+const PAYLOAD_FIELDS = ["text", "pluginId", "pluginVersion", "hostVersion", "ts"];
+
+/**
+ * 组装发往中转的请求体，只保留白名单字段。
+ *
+ * @param {object} o
+ * @returns {{text: string, pluginId: string, pluginVersion: string, hostVersion: string, ts: number}}
+ */
+function buildFeedbackPayload(o) {
+  const src = {
+    text: normaliseFeedbackText(o.text),
+    pluginId: String(o.pluginId || ""),
+    pluginVersion: String(o.pluginVersion || ""),
+    hostVersion: String(o.hostVersion || ""),
+    ts: Number(o.now) || Date.now(),
+  };
+  const out = {};
+  for (const k of PAYLOAD_FIELDS) out[k] = src[k];
+  return out;
+}
+
+function parseJson(body) {
+  if (typeof body !== "string" || !body) return null;
+  try {
+    const v = JSON.parse(body);
+    return v && typeof v === "object" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把一次中转响应翻译成界面文案。
+ *
+ * @param {{status?: number, body?: string, error?: Error}} r
+ * @returns {{ok: boolean, kind: string, message: string, remaining: number|null}}
+ */
+function describeFeedbackResult(r) {
+  if (r && r.error) {
+    const raw = String(r.error.message || r.error);
+    if (/timed?\s*out|timeout/i.test(raw)) {
+      return { ok: false, kind: "timeout", message: "发送超时，可改用 GitHub Issue 反馈", remaining: null };
+    }
+    if (/network:|permission|授权/i.test(raw)) {
+      return { ok: false, kind: "denied", message: "网络权限未生效，请重新安装插件", remaining: null };
+    }
+    return { ok: false, kind: "network", message: "连不上反馈服务，可改用 GitHub Issue 反馈", remaining: null };
+  }
+
+  const status = Number(r && r.status) || 0;
+  const data = parseJson(r && r.body);
+  const remaining = data && Number.isFinite(Number(data.remaining)) ? Number(data.remaining) : null;
+
+  if (status >= 200 && status < 300) {
+    return { ok: true, kind: "sent", message: "反馈已发送，谢谢", remaining };
+  }
+  if (status === 429) {
+    return { ok: false, kind: "rate_limited", message: "今天的反馈额度已用完，明天再来", remaining: 0 };
+  }
+  if (status === 400 || status === 413) {
+    return { ok: false, kind: "invalid", message: "反馈内容不合要求，请缩短后重试", remaining };
+  }
+  return { ok: false, kind: "http", message: "发送失败（HTTP " + status + "），可改用 GitHub Issue 反馈", remaining };
+}
+
+/**
+ * 额度提示文案。查不到额度时也要给一句话，不能空着。
+ *
+ * @param {{remaining: number, dailyLimit: number}|null} quota
+ * @returns {{remaining: number|null, message: string}}
+ */
+function describeQuota(quota) {
+  if (!quota || !Number.isFinite(Number(quota.remaining))) {
+    return { remaining: null, message: "额度有限，请勿刷屏" };
+  }
+  const remaining = Math.max(0, Number(quota.remaining));
+  if (remaining === 0) {
+    return { remaining: 0, message: "今天的反馈额度已用完，明天再来" };
+  }
+  return { remaining, message: "今天还可发 " + remaining + " 条反馈" };
+}
+
 
 const PLUGIN_ID = "github-trending";
 const HISTORY_DIR = "history";
 const REQUEST_TIMEOUT_MS = 20000;
+
+/**
+ * 反馈中转。主机名必须与 manifest.json 的 network: 授权逐字一致——
+ * exec/network 授权是精确匹配，不支持通配。
+ */
+const FEEDBACK_ENDPOINT = "https://ccgui-feedback.workers.dev";
+const FEEDBACK_REPO = "renhao-wan/ccgui-plugin-github-trending";
+/** 发反馈比拉榜单轻，挂 15s 就该让用户改走 Issue。 */
+const FEEDBACK_TIMEOUT_MS = 15000;
 const AGENT_TIMEOUT_MS = 120000;
 /**
  * 开会话的超时。这条路径不能像解读那样等 120s：`discussing` 非空期间全榜的
@@ -2108,6 +2252,69 @@ async function httpGet(url, headers) {
     if (!TRANSIENT_NET.test(raw) || /timed?\s*out|timeout|permission|network:/i.test(raw)) throw error;
     await new Promise((resolve) => setTimeout(resolve, 500));
     return await httpGetOnce(url, headers);
+  }
+}
+
+/** 宿主版本。老版本宿主可能没有这一项，取不到就留空，不能因此发不出反馈。 */
+function hostAppVersion(ctx) {
+  try {
+    return ctx && ctx.host && typeof ctx.host.appVersion === "string" ? ctx.host.appVersion : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 发一条反馈到中转。返回 describeFeedbackResult 的归一化结果。
+ *
+ * 不复用 httpGet：那条是 GET + 连接层重试，反馈是 POST，重试会把同一条
+ * 内容发两遍——用户看到「发送失败」再点一次，比静默重复更可控。
+ */
+async function sendFeedback(ctx, text) {
+  const payload = buildFeedbackPayload({
+    text,
+    pluginId: PLUGIN_ID,
+    pluginVersion: ctx.version,
+    hostVersion: hostAppVersion(ctx),
+  });
+  try {
+    const res = await withTimeout(
+      ctx.bridge.invoke("plugin_http_request", {
+        method: "POST",
+        url: FEEDBACK_ENDPOINT + "/feedback",
+        headers: { "Content-Type": "application/json", "User-Agent": "ccgui-github-trending/" + ctx.version },
+        body: JSON.stringify(payload),
+      }),
+      FEEDBACK_TIMEOUT_MS,
+      "feedback",
+    );
+    return describeFeedbackResult({ status: Number(res && res.status) || 0, body: res && res.body });
+  } catch (error) {
+    return describeFeedbackResult({ error });
+  }
+}
+
+/**
+ * 查今天的剩余额度。失败时返回 null——额度查不到不能挡住发反馈，
+ * UI 会退回到「额度有限，请勿刷屏」这句不需要数字的话。
+ */
+async function fetchQuota(ctx) {
+  try {
+    const res = await withTimeout(
+      ctx.bridge.invoke("plugin_http_request", {
+        method: "GET",
+        url: FEEDBACK_ENDPOINT + "/quota",
+        headers: { "User-Agent": "ccgui-github-trending/" + ctx.version },
+        body: null,
+      }),
+      FEEDBACK_TIMEOUT_MS,
+      "quota",
+    );
+    const body = res && typeof res.body === "string" ? res.body : "";
+    const data = body ? JSON.parse(body) : null;
+    return data && Number.isFinite(Number(data.remaining)) ? { remaining: Number(data.remaining), dailyLimit: Number(data.dailyLimit) || 30 } : null;
+  } catch {
+    return null;
   }
 }
 
@@ -5104,6 +5311,158 @@ function PlaceholderHelp() {
   );
 }
 
+/**
+ * 反馈区。独立组件而不是塞进 SettingsSection：它有自己的异步状态
+ * （发信、查额度），混进设置页会让那个已经八百行的组件再长一截。
+ *
+ * 两个渠道共用同一个输入框：
+ * - GitHub Issue：只是预填链接，不耗额度、不需要网络权限，永远可用。
+ * - 中转发送：经 Worker 转发到邮箱，受每 IP 每天 30 条的共享额度限制。
+ *   「共享」指四个插件同一个额度池，所以额度键里不能带插件名。
+ */
+function FeedbackSection() {
+  const R = appCtx.react;
+  const h = R.createElement;
+  const ctx = appCtx;
+
+  const textState = R.useState("");
+  const text = textState[0];
+  const setText = textState[1];
+  // "" -> "sending" -> "sent"/"error"
+  const sendState = R.useState("");
+  const sendStatus = sendState[0];
+  const setSendStatus = sendState[1];
+  const resultState = R.useState(null);
+  const result = resultState[0];
+  const setResult = resultState[1];
+  const quotaState = R.useState(null);
+  const quota = quotaState[0];
+  const setQuota = quotaState[1];
+  const quotaTried = R.useRef(false);
+
+  // 只在第一次打开设置页时查额度。查不到就保持 null，UI 退回不带数字的文案。
+  R.useEffect(() => {
+    if (quotaTried.current) return;
+    quotaTried.current = true;
+    void (async () => {
+      const q = await fetchQuota(ctx);
+      setQuota(q);
+    })();
+  }, []);
+
+  const trimmed = normaliseFeedbackText(text);
+  const canSend = trimmed.length > 0 && sendStatus !== "sending";
+
+  const issueUrl = buildIssueUrl({
+    repo: FEEDBACK_REPO,
+    pluginName: "每日热点",
+    text: trimmed,
+    pluginVersion: ctx.version,
+    hostVersion: hostAppVersion(ctx),
+  });
+
+  async function submit() {
+    if (!canSend) return;
+    setSendStatus("sending");
+    setResult(null);
+    const r = await sendFeedback(ctx, trimmed);
+    setSendStatus(r.ok ? "sent" : "error");
+    setResult(r);
+    if (r.ok) {
+      setText("");
+      // 成功时把额度当场减一，免得用户连点第二次才看到 429。
+      setQuota((prev) => {
+        const next = prev && Number.isFinite(Number(prev.remaining)) ? Math.max(0, Number(prev.remaining) - 1) : null;
+        return next === null ? prev : { remaining: next, dailyLimit: prev.dailyLimit || 30 };
+      });
+    }
+  }
+
+  const quotaText = describeQuota(quota);
+  const statusText =
+    sendStatus === "sending"
+      ? "发送中…"
+      : result
+        ? result.message
+        : "";
+
+  return h(
+    "section",
+    { className: "gt-section" },
+    h(
+      "div",
+      { className: "gt-section-label" },
+      h("h2", null, "反馈"),
+      h("p", null, "遇到问题或想提建议，两种方式任选其一。"),
+    ),
+    h(
+      "div",
+      { className: "gt-section-panel" },
+      h("textarea", {
+        className: "gt-input gt-feedback-text",
+        value: text,
+        rows: 5,
+        maxLength: TEXT_LIMIT,
+        placeholder: "描述问题或建议…（最多 " + TEXT_LIMIT + " 字）",
+        spellCheck: false,
+        "aria-label": "反馈正文",
+        onChange: (e) => {
+          setText(e.target.value);
+          if (sendStatus !== "sending") setSendStatus("");
+        },
+      }),
+      h(
+        "div",
+        { className: "gt-feedback-row" },
+        h("span", { className: "gt-hint gt-feedback-count" }, text.length + " / " + TEXT_LIMIT),
+        h("span", { className: "gt-hint gt-feedback-quota" }, quotaText.message),
+      ),
+      h(
+        "div",
+        { className: "gt-feedback-actions" },
+        h(
+          "a",
+          {
+            className: "gt-btn gt-feedback-issue" + (trimmed ? "" : " gt-btn--muted"),
+            href: issueUrl,
+            target: "_blank",
+            rel: "noreferrer noopener",
+            title: "在浏览器里打开预填好的 Issue 页面",
+          },
+          "通过 GitHub 提 Issue",
+        ),
+        h(
+          "button",
+          {
+            type: "button",
+            className: "gt-btn gt-btn--primary" + (sendStatus === "sending" ? " gt-btn--busy" : ""),
+            disabled: !canSend,
+            onClick: () => void submit(),
+          },
+          sendStatus === "sending" ? "发送中…" : "发送反馈",
+        ),
+      ),
+      statusText
+        ? h(
+            "p",
+            {
+              className:
+                "gt-note-line gt-feedback-status"
+                + (sendStatus === "sent" ? " is-ok" : "")
+                + (sendStatus === "error" ? " is-bad" : ""),
+            },
+            statusText,
+          )
+        : null,
+      h(
+        "p",
+        { className: "gt-hint" },
+        "发送的内容只有这段文字、插件版本与 CC GUI 版本。不含会话、代码或本机路径。",
+      ),
+    ),
+  );
+}
+
 function SettingsSection() {
   const R = appCtx.react;
   const h = R.createElement;
@@ -5602,7 +5961,7 @@ function SettingsSection() {
   return h(
     "div",
     { className: "gt-settings" },
-    h("p", { className: "gt-settings-intro" }, "榜单与解读只在这台机器上处理，插件不上传任何内容。"),
+    h("p", { className: "gt-settings-intro" }, "榜单与解读只在这台机器上处理；只有你主动点「发送反馈」时才会把那段文字发出去。"),
 
     h(
       "section",
@@ -5742,6 +6101,8 @@ function SettingsSection() {
         tokenControl,
       ),
     ),
+
+    h(FeedbackSection, null),
 
     h("p", { className: "gt-settings-foot" }, "版本 " + ctx.version + " · " + saveHint),
   );
@@ -6344,6 +6705,35 @@ const CSS = `
   background: var(--gt-raised); border: 1px solid var(--gt-border);
 }
 .gt-settings-foot { font-size: 12px; color: var(--gt-muted); margin: 16px 0 0; }
+
+.gt-feedback-text {
+  width: 100%; min-height: 96px; resize: vertical;
+  font-family: inherit; font-size: 13px; line-height: 1.6;
+}
+/* ---- 反馈区 ---- */
+.gt-feedback-row {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-top: 6px;
+}
+.gt-feedback-count { font-variant-numeric: tabular-nums; }
+/* 额度用完时这句要能读懂，不要靠颜色区分——颜色在深浅色里不一致。 */
+.gt-feedback-quota { text-align: right; }
+.gt-feedback-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+/* <a> 当按钮用时没有 <button> 的默认盒模型，补上同样的外观。 */
+.gt-feedback-issue {
+  border: 1px solid var(--gt-border);
+  background: var(--gt-surface);
+  color: var(--gt-text);
+  text-decoration: none;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.gt-feedback-issue:hover { background: var(--gt-raised); }
+.gt-feedback-status { margin: 10px 0 0; }
+.gt-feedback-status.is-ok { color: var(--gt-positive); }
+.gt-feedback-status.is-bad { color: var(--gt-negative); }
 
 /* 工具栏分三档，断点来自实测的「装不下」宽度（内容宽 + 左右各 18px 内边距）：
  *

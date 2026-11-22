@@ -2,7 +2,7 @@
 
 在 CC GUI 里每天看一眼 GitHub 上什么在热：**Trending 日/周/月榜** + **近 7 天新建的高增长仓库**，带新上榜、掉榜与排名变化；想随便逛逛时可以抽一批热门仓库，或按仓库名去 GitHub 搜。需要时再让模型写一段中文解读。
 
-数据只在本机处理，不经过任何第三方服务。
+榜单与解读只在本机处理，不经过任何第三方服务；只有你主动点「发送反馈」时，才会把那段文字发出去。
 
 ![每日热点：Trending 日榜带名次与涨跌标签，行内展开 README 预览，底部是模型写的中文解读](docs/screenshot.png)
 
@@ -36,6 +36,7 @@
 | `network:github.com` | 抓 `github.com/trending` 公开页面（不占 API 配额） |
 | `network:api.github.com` | 新星库 / 随便看看 / 仓库名搜索；README 在 raw 没命中时回落这里读取。可选 Token 只发给这个域名 |
 | `network:raw.githubusercontent.com` | README 的主路径：**不占 API 配额**、不需要 Token，只请求公开文件 |
+| `network:ccgui-feedback.workers.dev` | 「发送反馈」：把你填的那段文字转发到作者邮箱。不点就不会发 |
 | `agent` | 「生成解读」时起一个只读的后台轮次；引擎清单来自宿主的 `agent.catalog()` |
 | `assets:directory` | 设置页里用系统文件夹选择器指定 AI 工作区 |
 | `host:session` | 「讨论」通过 `sessions.startRun` 起一个可在侧栏接管的聊天会话 |
@@ -48,12 +49,31 @@
 
 ## 隐私边界
 
-- 只访问 `github.com`、`api.github.com` 与 `raw.githubusercontent.com` 三个域名。
+- 只访问 `github.com`、`api.github.com`、`raw.githubusercontent.com` 三个域名；
+  只有你主动点「发送反馈」时才会额外访问 `ccgui-feedback.workers.dev`。
 - 榜单与解读只在本机显示；解读不会自动写入任何文件。
 - 历史快照存在插件数据目录（默认 `plugin-data/github-trending/history/`），随时可在插件详情页清空。
 - 「生成解读」与「讨论」的模型进程默认都在插件数据目录下运行（设置页可改成别的目录），因此不会把这些记录混进某个真实项目的工作区历史。
 - 「讨论」的会话归宿主管；插件自己不保存对话内容，会话历史按宿主的会话规则留存。为了让会话在侧栏可见，点「讨论」时会把 AI 工作目录登记为侧栏工作区——默认就是插件数据目录，不会碰你的项目；侧栏里会多出一个以该目录名命名的分组，不需要时可在侧栏移除（下次点讨论会重新登记）。
 - GitHub Token 存在本机插件数据里，只作为 `Authorization` 头发给 `api.github.com`，**绝不发给 `raw.githubusercontent.com`**；不填也能用（搜索接口未认证 10 次/分钟，README 走 raw 不占配额）。
+
+## 反馈
+
+设置页底部有「反馈」一区，两种方式任选：
+
+1. **通过 GitHub 提 Issue** —— 打开已经预填好你那段文字的 Issue 页面，
+   登录状态下只差一次点击。不需要任何网络权限，永远可用。
+2. **发送反馈** —— 经中转直接发到作者邮箱，不用注册、不用跳转。
+
+**发送的内容只有**：你填的那段文字、插件版本、CC GUI 版本、时间戳。
+不含会话内容、代码、文件路径或任何本机信息。请求体字段在单测里钉死了白名单
+（`test/feedback.test.mjs`），多一个字段就测试失败。
+
+额度是**每台机器每天 30 条，四个插件共享同一个池**（另加 10 分钟 3 条的突发保护），
+防止被脚本刷。额度用完时界面会直说，并提示改用 GitHub Issue——不会静默失败。
+
+中转的源码在 [ccgui-feedback-worker](https://github.com/renhao-wan/ccgui-feedback-worker)：
+凭据只存在 Worker 端，插件里没有任何邮件密钥。
 
 ## 已知限制
 
@@ -73,7 +93,7 @@
 
 ```bash
 npm run build     # 把 src/lib/*.mjs 内联进 main.js
-npm test          # 纯函数单测（解析 / 搜索归一化 / 随机抽样与搜索词 / 本地筛选 / 对比 / prompt 预算与模板 / 复制 Markdown / README 预处理）
+npm test          # 纯函数单测（解析 / 搜索归一化 / 随机抽样与搜索词 / 本地筛选 / 对比 / prompt 预算与模板 / 复制 Markdown / README 预处理 / 反馈正文与请求体白名单）
 npm run smoke     # 假宿主冒烟：刷新 → 列表 → 解读 → 讨论 → 随便看看 → 停止 → 限流 → 卸载
 npm run validate  # manifest、权限 ↔ 调用、禁用写法、产物自检
 npm run check     # 上面四步全跑
@@ -95,6 +115,7 @@ src/lib/diff.mjs      # 快照对比：新上榜 / 掉榜 / 排名变化
 src/lib/prompt.mjs    # 解读 prompt、讨论模板与占位符、提示词列表归一化
 src/lib/report.mjs    # 榜单 → Markdown（工具栏「复制 Markdown」）
 src/lib/readme.mjs    # README 去 badge/HTML、截断、base64 还原
+src/lib/feedback.mjs  # 反馈正文收敛、Issue URL 预填、请求体白名单、额度文案
 src/lib/catalog.mjs   # 宿主引擎清单 → agent.start 参数（readOnly / 工作区）
 scripts/build.mjs     # 内联构建（剥掉 export 前缀）
 scripts/screenshot.mjs # 生成 docs/screenshot.png（开发用，不进发布包）
