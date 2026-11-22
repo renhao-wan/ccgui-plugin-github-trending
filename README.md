@@ -73,7 +73,9 @@
 防止被脚本刷。额度用完时界面会直说，并提示改用 GitHub Issue——不会静默失败。
 
 中转是作者自建的 Cloudflare Worker，凭据只存在它的 secret 里——
-插件里没有任何邮件密钥，因为没有密钥可放。
+插件里没有任何邮件密钥，因为没有密钥可放。**中转的代码是公开的**，
+上面关于隐私的每一项承诺都可以自己核对：
+[ccgui-feedback-worker](https://github.com/renhao-wan/ccgui-feedback-worker)。
 
 ### 发不出去时
 
