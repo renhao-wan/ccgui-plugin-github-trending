@@ -3474,6 +3474,66 @@ await check("反馈：输入后点发送，POST 到 worker，body 只带白名�
   );
 });
 
+await check("反馈：发送成功后，按钮本身给出回执，不只是角落一行小字", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "回执要看得见" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  await waitFor(() => httpCalls.some((c) => c.url.endsWith("/feedback")), 3000);
+
+  // 输入框已清空，此时按钮若还是「发送反馈」就变成不可点的一坨死按钮——
+  // 用户会以为自己没点上。成功回执要落在按钮上。
+  assert.ok(
+    await waitFor(() => findByText(renderKeep(settingsDef.component, {}), "已发送"), 3000),
+    "成功后按钮文案应变成「已发送」",
+  );
+
+  // 状态行读屏软件要能播报：role=status + aria-live。
+  const status = findByType(renderKeep(settingsDef.component, {}), "p", "gt-feedback-status");
+  assert.ok(status, "应有成功状态行");
+  assert.match(textOf(status), /反馈已发送/, "状态行应写着「反馈已发送」");
+  assert.equal(status.props.role, "status", "状态行应为 role=status");
+  assert.equal(status.props["aria-live"], "polite", "状态行应 aria-live=polite");
+  assert.match(status.props.className, /is-ok/, "成功状态行应有 is-ok 类");
+});
+
+await check("反馈：发送失败后按钮回到「发送反馈」，不用刷新页面", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 500, body: "boom" };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "这次会失败" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  await waitFor(() => httpCalls.some((c) => c.url.endsWith("/feedback")), 3000);
+  await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "可改用 GitHub Issue"), 3000);
+  // 失败时正文不清空，按钮必须能再点一次——否则用户得重新打字。
+  const btn = findByText(renderKeep(settingsDef.component, {}), "发送反馈");
+  assert.ok(btn, "失败后按钮文案应回到「发送反馈」");
+  assert.ok(!btn.props.disabled, "正文还在，按钮应可再次点击");
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+});
+
+await check("反馈：成功后再打字，旧回执随之撤掉", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "第一条" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "反馈已发送"), 3000);
+
+  // 再写字：按钮该回到「发送反馈」，下面那行「反馈已发送」不能留着——
+  // 否则界面同时在说「已经发过了」和「可以再发」。
+  findByType(renderKeep(settingsDef.component, {}), "textarea", "gt-feedback-text")
+    .props.onChange({ target: { value: "第二条" } });
+  await sleep(20);
+  const after = renderKeep(settingsDef.component, {});
+  assert.ok(findByText(after, "发送反馈"), "重新输入后按钮应回到「发送反馈」");
+  assert.ok(!findAnyText(after, "反馈已发送"), "旧的成功回执应随之撤掉");
+});
+
 await check("反馈：429 时提示额度用完", async () => {
   httpCalls.length = 0;
   feedbackSend = { status: 429, body: '{"ok":false,"error":"rate_limited","remaining":0}' };

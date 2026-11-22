@@ -5386,6 +5386,11 @@ function FeedbackSection() {
         ? result.message
         : "";
 
+  // 成功时正文被清空，按钮会变成不可点的死按钮。若文案还停在「发送反馈」，
+  // 用户看到的就是「点了没反应」——回执必须落在按钮自己身上。
+  const sendLabel =
+    sendStatus === "sending" ? "发送中…" : sendStatus === "sent" ? "已发送" : "发送反馈";
+
   return h(
     "section",
     { className: "gt-section" },
@@ -5408,7 +5413,12 @@ function FeedbackSection() {
         "aria-label": "反馈正文",
         onChange: (e) => {
           setText(e.target.value);
-          if (sendStatus !== "sending") setSendStatus("");
+          // 重新输入等于开了一条新反馈：上一条的回执（成功或失败）都该撤掉，
+          // 否则按钮已经回到「发送反馈」，下面却还写着「反馈已发送」。
+          if (sendStatus !== "sending") {
+            setSendStatus("");
+            setResult(null);
+          }
         },
       }),
       h(
@@ -5435,11 +5445,13 @@ function FeedbackSection() {
           "button",
           {
             type: "button",
-            className: "gt-btn gt-btn--primary" + (sendStatus === "sending" ? " gt-btn--busy" : ""),
+            className: "gt-btn gt-btn--primary"
+              + (sendStatus === "sending" ? " gt-btn--busy" : "")
+              + (sendStatus === "sent" ? " gt-feedback-sent" : ""),
             disabled: !canSend,
             onClick: () => void submit(),
           },
-          sendStatus === "sending" ? "发送中…" : "发送反馈",
+          sendLabel,
         ),
       ),
       statusText
@@ -5450,6 +5462,8 @@ function FeedbackSection() {
                 "gt-note-line gt-feedback-status"
                 + (sendStatus === "sent" ? " is-ok" : "")
                 + (sendStatus === "error" ? " is-bad" : ""),
+              role: "status",
+              "aria-live": "polite",
             },
             statusText,
           )
@@ -6731,9 +6745,17 @@ const CSS = `
   line-height: 1.4;
 }
 .gt-feedback-issue:hover { background: var(--gt-raised); }
-.gt-feedback-status { margin: 10px 0 0; }
-.gt-feedback-status.is-ok { color: var(--gt-positive); }
+.gt-feedback-status { margin: 10px 0 0; font-size: 13px; }
+.gt-feedback-status.is-ok { color: var(--gt-positive); font-weight: 500; }
 .gt-feedback-status.is-bad { color: var(--gt-negative); }
+/* 成功回执：按钮从「主操作」变成「已完成」——保留绿边而不是整块变绿，
+ * 免得和「发送中」的忙碌态混淆；文字本身已改成「已发送」。 */
+.gt-btn.gt-feedback-sent {
+  border-color: var(--gt-positive);
+  color: var(--gt-positive);
+  background: transparent;
+  cursor: default;
+}
 
 /* 工具栏分三档，断点来自实测的「装不下」宽度（内容宽 + 左右各 18px 内边距）：
  *
