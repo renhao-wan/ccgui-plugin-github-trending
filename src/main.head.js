@@ -2241,7 +2241,7 @@ function ReadmePanel({ readme, href }) {
     { className: "gt-readme", "aria-busy": readme.readmeLoading ? "true" : "false" },
     status,
     readme.readmeText
-      ? h("div", { className: "gt-readme-body" }, renderMarkdown(readme.readmeText))
+      ? h("div", { className: "gt-readme-body" }, renderDigestMarkdown(readme.readmeText))
       : null,
   );
 }
@@ -2892,121 +2892,15 @@ function SkeletonList() {
 /* ---------- 解读正文的 Markdown 渲染 ---------- */
 
 /**
- * 行内节点。解析结果来自 src/lib/markdown.mjs，这里只负责变成元素，
- * 全程不拼 HTML 字符串——模型输出属于不可信内容。
+ * 把模型写出的 Markdown 渲染成元素。
  *
- * 强调类节点带 children（解析器会对它们递归，处理 `**\`repo\`**` 这种嵌套），
- * 没带 children 的老式节点退化成纯文本。
+ * 解析与渲染都在 src/lib/markdown.mjs + markdown-view.mjs 里，与工作志
+ * 插件共用一份——两边使用的是同一个模型，输出语法本来就该一致。
+ * 全程不拼 HTML 字符串：模型输出属于不可信内容，只当文本处理。
  */
-function inlineNodes(inlines, keyBase) {
+function renderDigestMarkdown(text) {
   const h = appCtx.react.createElement;
-  return (inlines || []).map((n, i) => {
-    const key = keyBase + "i" + i;
-    const kids = n.children ? inlineNodes(n.children, key + "_") : n.v;
-    if (n.t === "strong") return h("strong", { key }, kids);
-    if (n.t === "em") return h("em", { key }, kids);
-    if (n.t === "del") return h("del", { key }, kids);
-    if (n.t === "code") return h("code", { key, className: "gt-md-code" }, n.v);
-    if (n.t === "link") {
-      return h("a", { key, href: n.href, target: "_blank", rel: "noreferrer noopener" }, n.v);
-    }
-    return n.v;
-  });
-}
-
-/**
- * 解析结果缓存。流式输出时每个 delta 都会重渲染整棵解读树，而解析要扫全文；
- * 内容没变（别处 set 触发的重渲染）就不该再解析一遍。
- *
- * 存最近 4 份而不是 1 份：现在同时有两个 Markdown 消费者（解读正文、行内
- * README 预览），单槽缓存会互相顶掉——每渲染一次榜单都要重新解析一遍 README。
- * 4 份足够覆盖「一个展开的 README + 一份解读 + 切换时的过渡」，且总量有上限。
- */
-const mdCache = new Map();
-const MD_CACHE_LIMIT = 4;
-
-function markdownBlocks(text) {
-  const src = String(text || "");
-  const hit = mdCache.get(src);
-  if (hit) {
-    // 命中后挪到队尾：Map 保持插入序，删第一个就是删最久没用的。
-    mdCache.delete(src);
-    mdCache.set(src, hit);
-    return hit;
-  }
-  const blocks = parseMarkdown(src);
-  mdCache.set(src, blocks);
-  while (mdCache.size > MD_CACHE_LIMIT) mdCache.delete(mdCache.keys().next().value);
-  return blocks;
-}
-
-/** 块节点 → 元素。表格单独包一层可横向滚动，窄窗口下不会把整页撑宽。 */
-function renderMarkdown(text) {
-  const h = appCtx.react.createElement;
-  const blocks = markdownBlocks(text);
-  return blocks.map((b, i) => {
-    const key = "md" + i;
-    if (b.type === "heading") return h("h" + b.level, { key, className: "gt-md-h" + b.level }, inlineNodes(b.inlines, key));
-    if (b.type === "paragraph") return h("p", { key, className: "gt-md-p" }, inlineNodes(b.inlines, key));
-    if (b.type === "hr") return h("hr", { key, className: "gt-md-hr" });
-    if (b.type === "quote") return h("blockquote", { key, className: "gt-md-quote" }, inlineNodes(b.inlines, key));
-    if (b.type === "code") {
-      return h(
-        "pre",
-        { key, className: "gt-md-pre" },
-        h("code", { className: b.lang ? "language-" + b.lang : "" }, b.text),
-      );
-    }
-    if (b.type === "ul" || b.type === "ol") {
-      return h(
-        b.type,
-        { key, className: "gt-md-list" },
-        b.items.map((item, j) =>
-          h(
-            "li",
-            {
-              key: key + "li" + j,
-              // 缩进用内边距表达层级：嵌套列表在窄面板里越缩越窄，不如一级一档
-              style: item.depth ? { marginLeft: item.depth * 14 } : undefined,
-            },
-            inlineNodes(item.inlines, key + "li" + j),
-          ),
-        ),
-      );
-    }
-    if (b.type === "table") {
-      const cellStyle = (ci) => (b.align[ci] ? { textAlign: b.align[ci] } : undefined);
-      return h(
-        "div",
-        { key, className: "gt-md-table-wrap" },
-        h(
-          "table",
-          { className: "gt-md-table" },
-          h(
-            "thead",
-            null,
-            h(
-              "tr",
-              null,
-              b.head.map((cell, ci) => h("th", { key: key + "th" + ci, style: cellStyle(ci) }, inlineNodes(cell, key + "th" + ci))),
-            ),
-          ),
-          h(
-            "tbody",
-            null,
-            b.rows.map((row, ri) =>
-              h(
-                "tr",
-                { key: key + "tr" + ri },
-                row.map((cell, ci) => h("td", { key: key + "td" + ci, style: cellStyle(ci) }, inlineNodes(cell, key + "td" + ri + "_" + ci))),
-              ),
-            ),
-          ),
-        ),
-      );
-    }
-    return null;
-  });
+  return renderMarkdown(h, text, { prefix: "gt" });
 }
 
 function DigestPanel({ snap }) {
@@ -3109,7 +3003,7 @@ function DigestPanel({ snap }) {
       "div",
       { className: "gt-digest-body", ref: bodyRef },
       snap.digest
-        ? renderMarkdown(snap.digest)
+        ? renderDigestMarkdown(snap.digest)
         : h("p", { className: "gt-md-p gt-digest-wait" }, "正在整理今天的榜单…"),
     ),
     snap.digest && !snap.generating
