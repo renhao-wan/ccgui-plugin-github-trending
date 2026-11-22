@@ -1739,19 +1739,29 @@ function readmeTextFromBody(body) {
 const TEXT_LIMIT = 1000;
 
 /**
- * 收敛用户输入：控制字符折叠成空格、合并连续空白、限长。
- * 保留大小写、中文与 emoji——反馈要原样送到人眼前。
+ * 收敛用户输入：去控制字符、统一换行、折叠连续空行与行尾空白、限长。
+ * 保留大小写、中文、emoji 与**换行**——用户最常贴的就是报错日志，
+ * 压成一行后堆栈就没法看了。
  *
  * @param {unknown} raw
  * @returns {string}
  */
 function normaliseFeedbackText(raw) {
   return String(raw === undefined || raw === null ? "" : raw)
-    .replace(/[\u0000-\u001f\u007f�]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
+    // 先统一换行，再剥控制字符（保留 \n）。制表符换成空格——堆栈缩进有用。
+    .replace(/\r\n?/g, "\n")
+    .replace(/\t/g, " ")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f�]/g, "")
+    // 只去行尾空白与整段的首尾空白。**正文内行首缩进要留着**：
+    // 报错堆栈靠它对齐，去掉后 `at fetchTrending` 就和日志正文混在一起了。
+    .replace(/[ \t]+$/gm, "")
+    .replace(/^[ \t]+/, "")
+    // 三个以上连续换行压成两个（一段空行），既保留分段又不留大片空白。
+    .replace(/\n{3,}/g, "\n\n")
+    // 首尾空行去掉。
+    .replace(/^\n+|\n+$/g, "")
     .slice(0, TEXT_LIMIT)
-    .trim();
+    .replace(/[ \t\n]+$/, "");
 }
 
 /**
@@ -1851,6 +1861,17 @@ function describeFeedbackResult(r) {
   const code = data && typeof data.error === "string" ? data.error : "";
 
   if (status >= 200 && status < 300) {
+    // 成功响应必须带 ok:true。只看状态码会把运营商劫持页、登录门户、
+    // 代理错误页（都会返回 200）当成「已发送」——用户以为发出去了，
+    // 实际什么都没有。
+    if (!data || data.ok !== true) {
+      return {
+        ok: false,
+        kind: "garbled",
+        message: "反馈服务返回了无法识别的内容，可能被网络拦截，可改用 GitHub Issue 反馈",
+        remaining: null,
+      };
+    }
     return { ok: true, kind: "sent", message: "反馈已发送，谢谢", remaining };
   }
 
@@ -1864,11 +1885,16 @@ function describeFeedbackResult(r) {
       message: burst
         ? "发得太快了，稍等几分钟再试，或改用 GitHub Issue 反馈"
         : "今天的反馈额度已用完，明天再来，或改用 GitHub Issue 反馈",
-      remaining: 0,
+      // burst 时今天还有额度，写死 0 会让界面谎报「今天用完了」。
+      remaining: burst ? remaining : 0,
     };
   }
 
-  if (status === 400 || status === 413) {
+  if (status === 413) {
+    return { ok: false, kind: "invalid", message: "反馈内容太长了，请缩短后重试", remaining };
+  }
+
+  if (status === 400) {
     // 400 的几种原因要分开说：empty_text 是用户没写，unknown_plugin 是
     // 版本错位，叫用户去「缩短内容」是把他引到错的方向。
     if (code === "unknown_plugin") {
@@ -1885,11 +1911,13 @@ function describeFeedbackResult(r) {
     return { ok: false, kind: "invalid", message: "反馈内容不合要求，请缩短后重试", remaining };
   }
 
-  if (status === 502) {
+  if (status === 502 || status === 503 || status === 500) {
     return {
       ok: false,
       kind: "http",
-      message: "中转暂时发不出邮件，稍后再试，或改用 GitHub Issue 反馈",
+      // 502 = 发不出邮件、503 = KV 不可用、500 = 中转内部错误。
+      // 三种都是中转那边的事，用户唯一能做的是稍后再试或换 Issue。
+      message: "中转暂时不可用，稍后再试，或改用 GitHub Issue 反馈",
       remaining,
     };
   }
@@ -1925,19 +1953,19 @@ function describeFeedbackResult(r) {
  */
 function describeQuota(quota) {
   if (quota && quota.offline) {
-    return { remaining: null, message: "暂时连不上反馈服务，发送时再试" };
+    return { remaining: null, message: "暂时连不上反馈服务，发送时再试", canRetry: true };
   }
   // Number(null) === 0、Number("") === 0：不显式挡掉，脏数据会被读成「0 条」，
   // 界面就说「今天的额度已用完」。先用「是不是数字」把它挡在这一层。
   const raw = quota ? quota.remaining : undefined;
   if (typeof raw !== "number" || !Number.isFinite(raw)) {
-    return { remaining: null, message: "额度有限，请勿刷屏" };
+    return { remaining: null, message: "额度有限，请勿刷屏", canRetry: true };
   }
   const remaining = Math.max(0, raw);
   if (remaining === 0) {
-    return { remaining: 0, message: "今天的反馈额度已用完，明天再来" };
+    return { remaining: 0, message: "今天的反馈额度已用完，明天再来", canRetry: true };
   }
-  return { remaining, message: "今天还可发 " + remaining + " 条反馈" };
+  return { remaining, message: "今天还可发 " + remaining + " 条反馈", canRetry: false };
 }
 
 
@@ -5419,15 +5447,23 @@ function FeedbackSection() {
   const quota = quotaState[0];
   const setQuota = quotaState[1];
   const quotaTried = R.useRef(false);
+  // 同步的在途标志。canSend 是渲染时的闭包值，同一 tick 内两次触发都会
+  // 读到旧的 sendStatus=""，只在状态里防不住双击。
+  const sendingRef = R.useRef(false);
 
-  // 只在第一次打开设置页时查额度。查不到就保持 null，UI 退回不带数字的文案。
+  // 只在第一次打开设置页时查额度。查不到就保持 {offline:true}，UI 说明是
+  // 「连不上」而不是「额度紧张」——两句话对用户的意思完全不同。
+  async function loadQuota() {
+    const q = await fetchQuota(ctx);
+    setQuota(q);
+    return q;
+  }
+
   R.useEffect(() => {
     if (quotaTried.current) return;
     quotaTried.current = true;
-    void (async () => {
-      const q = await fetchQuota(ctx);
-      setQuota(q);
-    })();
+    void loadQuota();
+    // 只在挂载时查一次；之后由「重试」按钮或发送结果更新。
   }, []);
 
   const trimmed = normaliseFeedbackText(text);
@@ -5442,20 +5478,41 @@ function FeedbackSection() {
   });
 
   async function submit() {
-    if (!canSend) return;
+    // sendingRef 是同步的：同一 tick 内两次触发都会读到 true，挡住双击。
+    // sendStatus 要等重渲染才更新，靠它挡不住。
+    if (!canSend || sendingRef.current) return;
+    sendingRef.current = true;
+    const submitted = trimmed;
     setSendStatus("sending");
     setResult(null);
-    const r = await sendFeedback(ctx, trimmed);
+
+    let r;
+    try {
+      r = await sendFeedback(ctx, submitted);
+    } finally {
+      sendingRef.current = false;
+    }
+
     setSendStatus(r.ok ? "sent" : "error");
     setResult(r);
-    if (r.ok) {
-      setText("");
-      // 成功时把额度当场减一，免得用户连点第二次才看到 429。
-      setQuota((prev) => {
-        const next = prev && Number.isFinite(Number(prev.remaining)) ? Math.max(0, Number(prev.remaining) - 1) : null;
-        return next === null ? prev : { remaining: next, dailyLimit: prev.dailyLimit || 30 };
-      });
-    }
+    if (!r.ok) return;
+
+    // 只清掉「这次发出去的那段」。发送期间用户可能又敲了内容（那 2.9 秒
+    // 里 textarea 没禁用），直接清空会把他新写的也抹掉。
+    setText((cur) => (cur === submitted ? "" : cur));
+
+    // 额度优先用服务端回传的真实值。查额度时失败了也不要紧——成功响应里
+    // 带了 remaining，正好顺手把「暂时连不上」纠正过来。
+    setQuota((prev) => {
+      const fromServer = Number.isFinite(Number(r.remaining)) ? Number(r.remaining) : null;
+      if (fromServer !== null) {
+        return { remaining: fromServer, dailyLimit: (prev && prev.dailyLimit) || 30 };
+      }
+      // 服务端没给数字（旧版中转）：有旧值就自减，否则保持原样。
+      const prevRemaining = prev && typeof prev.remaining === "number" ? prev.remaining : null;
+      if (prevRemaining === null) return prev;
+      return { remaining: Math.max(0, prevRemaining - 1), dailyLimit: prev.dailyLimit || 30 };
+    });
   }
 
   const quotaText = describeQuota(quota);
@@ -5505,7 +5562,24 @@ function FeedbackSection() {
         "div",
         { className: "gt-feedback-row" },
         h("span", { className: "gt-hint gt-feedback-count" }, text.length + " / " + TEXT_LIMIT),
-        h("span", { className: "gt-hint gt-feedback-quota" }, quotaText.message),
+        h(
+          "span",
+          { className: "gt-hint gt-feedback-quota" },
+          quotaText.message,
+          // 额度查不到 / 用完了都给一条重试路径，否则用户只能重开设置页。
+          quotaText.canRetry
+            ? h(
+                "button",
+                {
+                  type: "button",
+                  className: "gt-link-btn gt-feedback-quota-retry",
+                  disabled: sendStatus === "sending",
+                  onClick: () => void loadQuota(),
+                },
+                "重试",
+              )
+            : null,
+        ),
       ),
       h(
         "div",
@@ -6812,6 +6886,14 @@ const CSS = `
 .gt-feedback-count { font-variant-numeric: tabular-nums; }
 /* 额度用完时这句要能读懂，不要靠颜色区分——颜色在深浅色里不一致。 */
 .gt-feedback-quota { text-align: right; }
+/* 额度区的「重试」：长得像链接但仍是按钮，键盘可达。 */
+.gt-link-btn {
+  margin-left: 6px; padding: 0; border: 0; background: none;
+  font: inherit; font-size: 12px; color: var(--gt-accent);
+  text-decoration: underline; cursor: pointer;
+}
+.gt-link-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.gt-link-btn:focus-visible { outline: 2px solid var(--gt-accent); outline-offset: 2px; }
 .gt-feedback-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 /* <a> 当按钮用时没有 <button> 的默认盒模型，补上同样的外观。 */
 .gt-feedback-issue {
@@ -6834,6 +6916,8 @@ const CSS = `
   border-color: var(--gt-positive);
   color: var(--gt-positive);
   background: transparent;
+  /* 继承 :disabled 的 0.45 会把它又变灰，那就白改了。 */
+  opacity: 1;
   cursor: default;
 }
 

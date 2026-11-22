@@ -3495,15 +3495,23 @@ function FeedbackSection() {
   const quota = quotaState[0];
   const setQuota = quotaState[1];
   const quotaTried = R.useRef(false);
+  // 同步的在途标志。canSend 是渲染时的闭包值，同一 tick 内两次触发都会
+  // 读到旧的 sendStatus=""，只在状态里防不住双击。
+  const sendingRef = R.useRef(false);
 
-  // 只在第一次打开设置页时查额度。查不到就保持 null，UI 退回不带数字的文案。
+  // 只在第一次打开设置页时查额度。查不到就保持 {offline:true}，UI 说明是
+  // 「连不上」而不是「额度紧张」——两句话对用户的意思完全不同。
+  async function loadQuota() {
+    const q = await fetchQuota(ctx);
+    setQuota(q);
+    return q;
+  }
+
   R.useEffect(() => {
     if (quotaTried.current) return;
     quotaTried.current = true;
-    void (async () => {
-      const q = await fetchQuota(ctx);
-      setQuota(q);
-    })();
+    void loadQuota();
+    // 只在挂载时查一次；之后由「重试」按钮或发送结果更新。
   }, []);
 
   const trimmed = normaliseFeedbackText(text);
@@ -3518,20 +3526,41 @@ function FeedbackSection() {
   });
 
   async function submit() {
-    if (!canSend) return;
+    // sendingRef 是同步的：同一 tick 内两次触发都会读到 true，挡住双击。
+    // sendStatus 要等重渲染才更新，靠它挡不住。
+    if (!canSend || sendingRef.current) return;
+    sendingRef.current = true;
+    const submitted = trimmed;
     setSendStatus("sending");
     setResult(null);
-    const r = await sendFeedback(ctx, trimmed);
+
+    let r;
+    try {
+      r = await sendFeedback(ctx, submitted);
+    } finally {
+      sendingRef.current = false;
+    }
+
     setSendStatus(r.ok ? "sent" : "error");
     setResult(r);
-    if (r.ok) {
-      setText("");
-      // 成功时把额度当场减一，免得用户连点第二次才看到 429。
-      setQuota((prev) => {
-        const next = prev && Number.isFinite(Number(prev.remaining)) ? Math.max(0, Number(prev.remaining) - 1) : null;
-        return next === null ? prev : { remaining: next, dailyLimit: prev.dailyLimit || 30 };
-      });
-    }
+    if (!r.ok) return;
+
+    // 只清掉「这次发出去的那段」。发送期间用户可能又敲了内容（那 2.9 秒
+    // 里 textarea 没禁用），直接清空会把他新写的也抹掉。
+    setText((cur) => (cur === submitted ? "" : cur));
+
+    // 额度优先用服务端回传的真实值。查额度时失败了也不要紧——成功响应里
+    // 带了 remaining，正好顺手把「暂时连不上」纠正过来。
+    setQuota((prev) => {
+      const fromServer = Number.isFinite(Number(r.remaining)) ? Number(r.remaining) : null;
+      if (fromServer !== null) {
+        return { remaining: fromServer, dailyLimit: (prev && prev.dailyLimit) || 30 };
+      }
+      // 服务端没给数字（旧版中转）：有旧值就自减，否则保持原样。
+      const prevRemaining = prev && typeof prev.remaining === "number" ? prev.remaining : null;
+      if (prevRemaining === null) return prev;
+      return { remaining: Math.max(0, prevRemaining - 1), dailyLimit: prev.dailyLimit || 30 };
+    });
   }
 
   const quotaText = describeQuota(quota);
@@ -3581,7 +3610,24 @@ function FeedbackSection() {
         "div",
         { className: "gt-feedback-row" },
         h("span", { className: "gt-hint gt-feedback-count" }, text.length + " / " + TEXT_LIMIT),
-        h("span", { className: "gt-hint gt-feedback-quota" }, quotaText.message),
+        h(
+          "span",
+          { className: "gt-hint gt-feedback-quota" },
+          quotaText.message,
+          // 额度查不到 / 用完了都给一条重试路径，否则用户只能重开设置页。
+          quotaText.canRetry
+            ? h(
+                "button",
+                {
+                  type: "button",
+                  className: "gt-link-btn gt-feedback-quota-retry",
+                  disabled: sendStatus === "sending",
+                  onClick: () => void loadQuota(),
+                },
+                "重试",
+              )
+            : null,
+        ),
       ),
       h(
         "div",
@@ -4888,6 +4934,14 @@ const CSS = `
 .gt-feedback-count { font-variant-numeric: tabular-nums; }
 /* 额度用完时这句要能读懂，不要靠颜色区分——颜色在深浅色里不一致。 */
 .gt-feedback-quota { text-align: right; }
+/* 额度区的「重试」：长得像链接但仍是按钮，键盘可达。 */
+.gt-link-btn {
+  margin-left: 6px; padding: 0; border: 0; background: none;
+  font: inherit; font-size: 12px; color: var(--gt-accent);
+  text-decoration: underline; cursor: pointer;
+}
+.gt-link-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.gt-link-btn:focus-visible { outline: 2px solid var(--gt-accent); outline-offset: 2px; }
 .gt-feedback-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
 /* <a> 当按钮用时没有 <button> 的默认盒模型，补上同样的外观。 */
 .gt-feedback-issue {
@@ -4910,6 +4964,8 @@ const CSS = `
   border-color: var(--gt-positive);
   color: var(--gt-positive);
   background: transparent;
+  /* 继承 :disabled 的 0.45 会把它又变灰，那就白改了。 */
+  opacity: 1;
   cursor: default;
 }
 

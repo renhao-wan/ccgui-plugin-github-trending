@@ -10,12 +10,29 @@ import {
 } from "../src/lib/feedback.mjs";
 
 test("normaliseFeedbackText 折叠控制字符并限长", () => {
-  assert.equal(normaliseFeedbackText("  两行\n\n文字\t带制表  "), "两行 文字 带制表");
+  assert.equal(normaliseFeedbackText("  两行\n\n文字\t带制表  "), "两行\n\n文字 带制表");
   assert.equal(normaliseFeedbackText(null), "");
   assert.equal(normaliseFeedbackText(undefined), "");
   assert.equal(normaliseFeedbackText(123), "123");
   assert.equal(normaliseFeedbackText("\u0000\u001f\ufffd"), "");
   assert.equal(normaliseFeedbackText("a".repeat(TEXT_LIMIT + 50)).length, TEXT_LIMIT);
+});
+
+test("normaliseFeedbackText 保留换行，堆栈日志不被压成一行", () => {
+  // 用户最常贴的就是报错日志。压成一行后堆栈就没法看了。
+  const paste = "点了「生成解读」后报错：\nError: timeout\n    at fetchTrending (main.js:480)\n\n试了三次都一样。";
+  const out = normaliseFeedbackText(paste);
+  assert.match(out, /\n/, "应保留换行");
+  assert.match(out, /Error: timeout\n\s+at fetchTrending/);
+  assert.ok(!/\r/.test(out), "CRLF 应收敛成 LF");
+});
+
+test("normaliseFeedbackText 折叠连续空行与行尾空白", () => {
+  assert.equal(normaliseFeedbackText("a\n\n\n\n\nb"), "a\n\nb", "连续空行压成一行空行");
+  // 行尾空白去掉，但行首缩进保留——堆栈靠它对齐（见上一条用例）。
+  assert.equal(normaliseFeedbackText("a   \n    b"), "a\n    b", "行尾去空白、行首缩进保留");
+  assert.equal(normaliseFeedbackText("\n\n\na\n\n\n"), "a", "首尾空行去掉");
+  assert.equal(normaliseFeedbackText("  开头缩进要去掉"), "开头缩进要去掉", "整段开头的缩进去掉");
 });
 
 test("normaliseFeedbackText 保留中文与 emoji", () => {
@@ -209,6 +226,56 @@ test("describeQuota 中转连不上时不冒充「额度有限」", () => {
   assert.equal(r.remaining, null);
   assert.match(r.message, /连不上|暂时|服务/);
   assert.doesNotMatch(r.message, /刷屏/, "网络故障不该说成用户刷屏");
+});
+
+test("describeFeedbackResult 只有带 ok:true 的 200 才算发送成功", () => {
+  // 运营商劫持页、登录门户、代理错误页都会返回 200。只看状态码就会
+  // 告诉用户「已发送」，而他实际上什么也没发出去。
+  const hijack = describeFeedbackResult({
+    status: 200,
+    body: "<html><body>请登录校园网</body></html>",
+  });
+  assert.equal(hijack.ok, false, "HTML 劫持页不能判成功");
+  assert.match(hijack.message, /GitHub Issue/);
+  assert.doesNotMatch(hijack.message, /已发送/);
+
+  const empty = describeFeedbackResult({ status: 200, body: "" });
+  assert.equal(empty.ok, false, "空响应不能判成功");
+
+  const notOk = describeFeedbackResult({ status: 200, body: '{"error":"proxy blocked"}' });
+  assert.equal(notOk.ok, false, "没有 ok:true 不能判成功");
+
+  // 真的成功响应必须带 ok:true。
+  const good = describeFeedbackResult({ status: 200, body: '{"ok":true,"remaining":26}' });
+  assert.equal(good.ok, true);
+  assert.equal(good.remaining, 26);
+});
+
+test("describeFeedbackResult 突发限流透传服务端的真实剩余额度", () => {
+  // Worker 在 burst 时回的是 remaining:27（今天还剩 27 条）。
+  // 插件写死 0 的话，一旦界面用这个值更新额度，就会说「今天用完了」。
+  const r = describeFeedbackResult({
+    status: 429,
+    body: '{"ok":false,"error":"rate_limited","kind":"burst","remaining":27}',
+  });
+  assert.equal(r.remaining, 27, "突发限流不该把剩余额度说成 0");
+  assert.match(r.message, /太快|稍候|分钟/);
+});
+
+test("describeFeedbackResult 把 413 / 503 分开说", () => {
+  const big = describeFeedbackResult({ status: 413, body: '{"ok":false,"error":"too_large"}' });
+  assert.match(big.message, /长|缩短/);
+
+  // KV 挂了是中转自己的事，别让用户去改内容。
+  const storage = describeFeedbackResult({ status: 503, body: '{"ok":false,"error":"storage_unavailable"}' });
+  assert.match(storage.message, /中转|稍后/);
+  assert.match(storage.message, /GitHub Issue/);
+  assert.doesNotMatch(storage.message, /缩短|内容不合/);
+
+  // 500 也应该是「中转出了问题」，不是用户的错。
+  const internal = describeFeedbackResult({ status: 500, body: '{"ok":false,"error":"internal_error"}' });
+  assert.match(internal.message, /GitHub Issue/);
+  assert.doesNotMatch(internal.message, /缩短/);
 });
 
 test("describeQuota 额度字段是脏数据时退回安全文案而不是显示 NaN", () => {

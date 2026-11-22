@@ -3542,6 +3542,125 @@ await check("反馈：成功后再打字，旧回执随之撤掉", async () => {
   assert.ok(!findAnyText(after, "反馈已发送"), "旧的成功回执应随之撤掉");
 });
 
+await check("反馈：同一 tick 连点两次只发一条", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "手滑双击了" } });
+  await sleep(20);
+  const btn = findByText(renderKeep(settingsDef.component, {}), "发送反馈");
+  // 触摸屏双击 / 辅助技术重复触发：两次 onClick 在同一 tick 内，
+  // sendStatus 还没重渲染，靠它挡不住，必须靠同步 ref。
+  btn.props.onClick();
+  btn.props.onClick();
+  await waitFor(() => httpCalls.some((c) => c.url.endsWith("/feedback")), 3000);
+  await sleep(80);
+  const posts = httpCalls.filter((c) => c.url.endsWith("/feedback"));
+  assert.equal(posts.length, 1, "双击只能发出一条");
+});
+
+await check("反馈：发送中继续打字，成功后新内容不会被清掉", async () => {
+  httpCalls.length = 0;
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "第一段" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  // 请求在飞的时候用户接着写（textarea 没禁用）。
+  findByType(renderKeep(settingsDef.component, {}), "textarea", "gt-feedback-text")
+    .props.onChange({ target: { value: "第二段还没发" } });
+  await waitFor(() => httpCalls.some((c) => c.url.endsWith("/feedback")), 3000);
+  assert.ok(
+    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "反馈已发送"), 3000),
+    "应显示成功",
+  );
+  const area = findByType(renderKeep(settingsDef.component, {}), "textarea", "gt-feedback-text");
+  assert.equal(area.props.value, "第二段还没发", "发送期间新写的内容不能被清掉");
+});
+
+await check("反馈：额度查不到但发送成功，额度区不再停留在「连不上」", async () => {
+  httpCalls.length = 0;
+  feedbackQuota = { status: 500, value: null };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":24}' };
+  const tree = await renderFeedbackReady(true);
+  const before = findByType(tree, "span", "gt-feedback-quota");
+  assert.match(textOf(before), /连不上|暂时/, "初始状态应是连不上");
+
+  findByType(renderKeep(settingsDef.component, {}), "textarea", "gt-feedback-text")
+    .props.onChange({ target: { value: "试试能不能发" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  await waitFor(() => httpCalls.some((c) => c.url.endsWith("/feedback")), 3000);
+  assert.ok(
+    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "反馈已发送"), 3000),
+  );
+  // 成功响应里带了 remaining:24，额度区应该用它，而不是继续挂「连不上」。
+  // 注意 waitFor 命中时返回的是 true，元素本身要再取一次。
+  assert.ok(
+    await waitFor(
+      () => /24/.test(textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota"))),
+      3000,
+    ),
+    "成功后应用服务端回传的额度（实际："
+      + textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota"))
+      + "）",
+  );
+  assert.doesNotMatch(
+    textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota")),
+    /连不上/,
+    "成功后不该还挂着「连不上」",
+  );
+
+  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+});
+
+await check("反馈：额度查不到时提供「重试」按钮", async () => {
+  feedbackQuota = { status: 500, value: null };
+  const tree = await renderFeedbackReady(true);
+  const retry = findByType(tree, "button", "gt-feedback-quota-retry");
+  assert.ok(retry, "额度查不到时应给重试按钮");
+  // 点一下能重新查到。
+  feedbackQuota = { status: 200, value: { remaining: 25, dailyLimit: 30 } };
+  retry.props.onClick();
+  assert.ok(
+    await waitFor(
+      () => /25/.test(textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota") || { props: {} })),
+      3000,
+    ),
+    "重试后应显示新额度",
+  );
+  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+});
+
+await check("反馈：成功桥接态不被 :disabled 的 0.45 透明度糊掉", () => {
+  // 发送成功后正文清空、canSend 变 false，按钮带 disabled。.gt-btn:disabled 的
+  // opacity:0.45 会把「已发送」这条回执一起淡掉，看起来像点不动。
+  assert.match(cssCalls[0], /\.gt-btn\.gt-feedback-sent\s*\{[^}]*opacity:\s*1/);
+  // 额度区的「重试」是按钮当链接用：必须真的有键盘焦点样式。
+  assert.match(cssCalls[0], /\.gt-link-btn:focus-visible\s*\{[^}]*outline/);
+});
+
+await check("反馈：200 但正文不是我们的 JSON 时不当成功", async () => {
+  httpCalls.length = 0;
+  // 运营商劫持 / 登录门户：状态 200，内容是 HTML。
+  feedbackSend = { status: 200, body: "<html>请登录校园网</html>" };
+  const tree = await renderFeedbackReady(true);
+  findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "被劫持了" } });
+  await sleep(20);
+  findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
+  const msg = await waitFor(
+    () => findAnyText(renderKeep(settingsDef.component, {}), "GitHub Issue"),
+    3000,
+  );
+  assert.ok(msg, "劫持页应提示改用 Issue");
+  assert.ok(
+    !findAnyText(renderKeep(settingsDef.component, {}), "反馈已发送"),
+    "劫持页绝不能说「已发送」",
+  );
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+});
+
 await check("反馈：突发限流提示「稍等」而不是「明天」，且不谎报额度用完", async () => {
   httpCalls.length = 0;
   // Worker 突发保护：10 分钟内第 4 条。此时今天还有额度，只是这会儿太快。
@@ -3606,7 +3725,7 @@ await check("反馈：500 时提示发送失败并给出 Issue 退路", async ()
   await sleep(20);
   findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
   assert.ok(
-    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "可改用 GitHub Issue"), 3000),
+    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "GitHub Issue"), 3000),
     "失败文案应指回 Issue",
   );
   feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
