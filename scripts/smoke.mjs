@@ -59,10 +59,10 @@ const day2 = [
 
 /* ------------------------------------------------------------ React 替身 */
 
-// 替身本体在 scripts/fake-react.mjs（四插件共用，工作志那份是基准）。
+// 替身本体在 ccgui-plugin-shared/fake-react（四插件共用一份源码）。
 // 与另外三个插件不同，这里曾有两条技术路线：本文件原先是「全局自增序号」，
 // 兄弟组件增删会让后面的槽位整体顶歪；现在统一到按组件实例分域的实现。
-import { createFakeReact, walk, textOf, findByText, findByType, findAll } from './fake-react.mjs';
+import { createFakeReact, walk, textOf, findByText, findByType, findAll } from 'ccgui-plugin-shared/fake-react';
 
 const fake = createFakeReact({ componentName: "anon" });
 const fakeReact = fake.api;

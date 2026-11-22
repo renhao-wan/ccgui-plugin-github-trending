@@ -16,10 +16,12 @@
     "validate": "node scripts/validate-manifest.mjs",
     "icon": "node scripts/make-icon.mjs",
     "screenshot": "node scripts/screenshot.mjs",
-    "check": "npm run sync && npm run build && npm test && npm run smoke && npm run validate",
-    "sync": "node scripts/check-feedback-sync.mjs"
+    "check": "npm run build && npm test && npm run smoke && npm run validate"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.0"
   }
 }
