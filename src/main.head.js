@@ -25,7 +25,7 @@ const REQUEST_TIMEOUT_MS = 20000;
  * 反馈中转。主机名必须与 manifest.json 的 network: 授权逐字一致——
  * exec/network 授权是精确匹配，不支持通配。
  */
-const FEEDBACK_ENDPOINT = "https://ccgui-feedback.workers.dev";
+const FEEDBACK_ENDPOINT = "https://ccgui-feedback.2653990378.workers.dev";
 const FEEDBACK_REPO = "renhao-wan/ccgui-plugin-github-trending";
 /** 发反馈比拉榜单轻，挂 15s 就该让用户改走 Issue。 */
 const FEEDBACK_TIMEOUT_MS = 15000;

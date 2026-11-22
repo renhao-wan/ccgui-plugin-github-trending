@@ -36,7 +36,7 @@
 | `network:github.com` | 抓 `github.com/trending` 公开页面（不占 API 配额） |
 | `network:api.github.com` | 新星库 / 随便看看 / 仓库名搜索；README 在 raw 没命中时回落这里读取。可选 Token 只发给这个域名 |
 | `network:raw.githubusercontent.com` | README 的主路径：**不占 API 配额**、不需要 Token，只请求公开文件 |
-| `network:ccgui-feedback.workers.dev` | 「发送反馈」：把你填的那段文字转发到作者邮箱。不点就不会发 |
+| `network:ccgui-feedback.2653990378.workers.dev` | 「发送反馈」：把你填的那段文字转发到作者邮箱。不点就不会发 |
 | `agent` | 「生成解读」时起一个只读的后台轮次；引擎清单来自宿主的 `agent.catalog()` |
 | `assets:directory` | 设置页里用系统文件夹选择器指定 AI 工作区 |
 | `host:session` | 「讨论」通过 `sessions.startRun` 起一个可在侧栏接管的聊天会话 |
@@ -50,7 +50,7 @@
 ## 隐私边界
 
 - 只访问 `github.com`、`api.github.com`、`raw.githubusercontent.com` 三个域名；
-  只有你主动点「发送反馈」时才会额外访问 `ccgui-feedback.workers.dev`。
+  只有你主动点「发送反馈」时才会额外访问 `ccgui-feedback.2653990378.workers.dev`。
 - 榜单与解读只在本机显示；解读不会自动写入任何文件。
 - 历史快照存在插件数据目录（默认 `plugin-data/github-trending/history/`），随时可在插件详情页清空。
 - 「生成解读」与「讨论」的模型进程默认都在插件数据目录下运行（设置页可改成别的目录），因此不会把这些记录混进某个真实项目的工作区历史。

@@ -621,7 +621,7 @@ const ctx = {
       if (cmd !== "plugin_http_request") throw new Error("unexpected bridge command " + cmd);
       httpCalls.push({ url: args.url, headers: args.headers || {}, method: args.method, body: args.body });
       // 反馈中转：用例按 feedbackMode 决定这条路回什么。
-      if (args.url.startsWith("https://ccgui-feedback.workers.dev/")) {
+      if (args.url.startsWith("https://ccgui-feedback.2653990378.workers.dev/")) {
         if (args.url.endsWith("/quota")) {
           return { status: feedbackQuota.status, body: JSON.stringify(feedbackQuota.value) };
         }
@@ -3461,7 +3461,7 @@ await check("反馈：输入后点发送，POST 到 worker，body 只带白名�
   assert.ok(await waitFor(() => httpCalls.some((c) => c.url.endsWith("/feedback")), 3000), "应发出 /feedback");
   const call = httpCalls.find((c) => c.url.endsWith("/feedback"));
   assert.equal(call.method, "POST");
-  assert.equal(new URL(call.url).hostname, "ccgui-feedback.workers.dev");
+  assert.equal(new URL(call.url).hostname, "ccgui-feedback.2653990378.workers.dev");
   const body = JSON.parse(call.body);
   assert.deepEqual(Object.keys(body).sort(), ["hostVersion", "pluginId", "pluginVersion", "text", "ts"]);
   assert.equal(body.text, "界面有点卡");
