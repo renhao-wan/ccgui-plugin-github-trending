@@ -10,7 +10,7 @@
   "license": "MIT",
   "icon": "docs/icon.png",
   "screenshots": ["docs/screenshot.png"],
-  "keywords": ["github", "trending", "hot", "daily", "digest", "discover", "热点", "榜单", "搜索"],
+  "keywords": ["github", "trending", "hot", "digest", "discover", "热点", "榜单", "搜索"],
   "tier": "js",
   "permissions": [
     "ui:center-tab",
