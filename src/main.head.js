@@ -419,62 +419,28 @@ function hostAppVersion(ctx) {
 }
 
 /**
- * 发一条反馈到中转。返回 describeFeedbackResult 的归一化结果。
+ * 反馈的网络层由 createFeedbackNet 统一提供（src/lib/feedback-net.mjs）。
  *
- * 不复用 httpGet：那条是 GET + 连接层重试，反馈是 POST，重试会把同一条
- * 内容发两遍——用户看到「发送失败」再点一次，比静默重复更可控。
+ * 只用同一个延迟初始化的实例：端点与自己的插件 id 都从常量来，不可能
+ * 出现「请求体是 A、User-Agent 是 B」的错位。装好后 send / quota 就是
+ * 四插件逐字相同的那两个函数。
  */
-async function sendFeedback(ctx, text) {
-  const payload = buildFeedbackPayload({
-    text,
-    pluginId: PLUGIN_ID,
-    pluginVersion: ctx.version,
-    hostVersion: hostAppVersion(ctx),
-  });
-  try {
-    const res = await withTimeout(
-      ctx.bridge.invoke("plugin_http_request", {
-        method: "POST",
-        url: FEEDBACK_ENDPOINT + "/feedback",
-        headers: { "Content-Type": "application/json", "User-Agent": "ccgui-github-trending/" + ctx.version },
-        body: JSON.stringify(payload),
-      }),
-      FEEDBACK_TIMEOUT_MS,
-      "feedback",
-    );
-    return describeFeedbackResult({ status: Number(res && res.status) || 0, body: res && res.body });
-  } catch (error) {
-    return describeFeedbackResult({ error });
+let feedbackNet = null;
+function getFeedbackNet() {
+  if (!feedbackNet) {
+    feedbackNet = createFeedbackNet(appCtx, {
+      endpoint: FEEDBACK_ENDPOINT,
+      pluginId: PLUGIN_ID,
+      timeoutMs: FEEDBACK_TIMEOUT_MS,
+    });
   }
+  return feedbackNet;
 }
-
-/**
- * 查今天的剩余额度。失败时返回 `{offline: true}`——额度查不到不能挡住发反馈，
- * 但要让界面知道「是连不上」而不是「额度紧张」，两句话说给用户听的意思完全不同。
- */
+async function sendFeedback(ctx, text) {
+  return getFeedbackNet().send(text);
+}
 async function fetchQuota(ctx) {
-  try {
-    const res = await withTimeout(
-      ctx.bridge.invoke("plugin_http_request", {
-        method: "GET",
-        url: FEEDBACK_ENDPOINT + "/quota",
-        headers: { "User-Agent": "ccgui-github-trending/" + ctx.version },
-        body: null,
-      }),
-      FEEDBACK_TIMEOUT_MS,
-      "quota",
-    );
-    const status = Number(res && res.status) || 0;
-    if (!(status >= 200 && status < 300)) return { offline: true };
-    const body = res && typeof res.body === "string" ? res.body : "";
-    const data = body ? JSON.parse(body) : null;
-    // 用 quotaCount 而不是 Number.isFinite(Number(...))：后者把 null/"" 读成 0，
-    // 界面会说「今天的额度已用完」。
-    const remaining = data ? quotaCount(data.remaining) : null;
-    return remaining === null ? null : { remaining, dailyLimit: Number(data.dailyLimit) || 30 };
-  } catch {
-    return { offline: true };
-  }
+  return getFeedbackNet().quota();
 }
 
 async function fetchTrending(ctx, period, language) {

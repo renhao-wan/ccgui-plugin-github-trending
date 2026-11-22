@@ -59,133 +59,25 @@ const day2 = [
 
 /* ------------------------------------------------------------ React 替身 */
 
-let stateSlots = new Map();
-let refSlots = new Map();
-const effectStores = new WeakMap();
-let effectStore = new Map();
-let stateIdx = 0;
-let refIdx = 0;
-let effectIdx = 0;
-const pendingEffects = [];
+// 替身本体在 scripts/fake-react.mjs（四插件共用，工作志那份是基准）。
+// 与另外三个插件不同，这里曾有两条技术路线：本文件原先是「全局自增序号」，
+// 兄弟组件增删会让后面的槽位整体顶歪；现在统一到按组件实例分域的实现。
+import { createFakeReact, walk, textOf, findByText, findByType, findAll } from './fake-react.mjs';
 
-const fakeReact = {
-  createElement: (type, props, ...children) => ({ type, props, children }),
-  useState: (init) => {
-    const i = stateIdx++;
-    if (!stateSlots.has(i)) stateSlots.set(i, typeof init === "function" ? init() : init);
-    return [stateSlots.get(i), (v) => stateSlots.set(i, typeof v === "function" ? v(stateSlots.get(i)) : v)];
-  },
-  useEffect: (fn, deps) => {
-    pendingEffects.push({ i: effectIdx++, fn, deps });
-  },
-  useMemo: (fn) => fn(),
-  useCallback: (fn) => fn,
-  useRef: (init) => {
-    // ref 必须跨渲染保持同一个对象：防抖定时器、baseline 都挂在 ref 上，
-    // 每次返回新对象会让「改动即自动保存」永远走首次渲染分支。
-    const i = refIdx++;
-    if (!refSlots.has(i)) refSlots.set(i, { current: init === undefined ? null : init });
-    return refSlots.get(i);
-  },
-  useSyncExternalStore: (subscribe, getSnapshot) => {
-    subscribe(() => {});
-    return getSnapshot();
-  },
-};
-
-function sameDeps(a, b) {
-  if (!a || !b) return false;
-  return a.length === b.length && a.every((d, i) => Object.is(d, b[i]));
-}
-
-function flushEffects() {
-  for (const e of pendingEffects) {
-    const prev = effectStore.get(e.i);
-    if (prev && (!e.deps || sameDeps(prev.deps, e.deps))) continue;
-    if (prev && typeof prev.cleanup === "function") {
-      try {
-        prev.cleanup();
-      } catch {
-        /* ignore */
-      }
-    }
-    let cleanup = null;
-    try {
-      cleanup = e.fn();
-    } catch {
-      /* effect 错误交给断言暴露 */
-    }
-    effectStore.set(e.i, { deps: e.deps, cleanup: typeof cleanup === "function" ? cleanup : null });
-  }
-  pendingEffects.length = 0;
-}
+const fake = createFakeReact({ componentName: "anon" });
+const fakeReact = fake.api;
 
 function expand(node) {
-  if (Array.isArray(node)) return node.map(expand);
-  if (!node || typeof node !== "object") return node;
-  if (typeof node.type === "function") {
-    const props = Object.assign({}, node.props || {}, { children: node.children || [] });
-    return expand(node.type(props));
-  }
-  return Object.assign({}, node, { children: (node.children || []).map(expand) });
+  return fake.expand(node);
 }
-
 function renderFresh(comp, props, opts) {
-  stateSlots = new Map();
-  refSlots = new Map();
-  effectStore = new Map();
-  effectStores.set(comp, effectStore);
-  stateIdx = 0;
-  refIdx = 0;
-  effectIdx = 0;
-  pendingEffects.length = 0;
-  const tree = expand(comp(props || {}));
-  if (opts && opts.effects) flushEffects();
-  else pendingEffects.length = 0;
-  return tree;
+  return fake.renderFresh(comp, props, opts);
 }
-
-/**
- * 保留组件内部状态的渲染：下拉展开、输入框内容这类局部状态要跨渲染存在，
- * 否则「点了展开再看菜单」永远看不到菜单。effect 照常在依赖变化时重跑。
- */
 function renderKeep(comp, props) {
-  effectStore = effectStores.get(comp) || new Map();
-  effectStores.set(comp, effectStore);
-  stateIdx = 0;
-  refIdx = 0;
-  effectIdx = 0;
-  pendingEffects.length = 0;
-  const tree = expand(comp(props || {}));
-  flushEffects();
-  return tree;
+  return fake.renderKeep(comp, props);
 }
-
-function walk(node, fn) {
-  if (Array.isArray(node)) {
-    for (const n of node) walk(n, fn);
-    return;
-  }
-  if (!node || typeof node !== "object") return;
-  fn(node);
-  for (const k of node.children || []) walk(k, fn);
-}
-
-function textOf(node) {
-  if (typeof node === "string") return node;
-  if (typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(textOf).join("");
-  if (!node || typeof node !== "object") return "";
-  return (node.children || []).map(textOf).join("");
-}
-
-function findByText(node, text) {
-  let hit = null;
-  walk(node, (n) => {
-    if (hit) return;
-    if (n.type === "button" && textOf(n).includes(text)) hit = n;
-  });
-  return hit;
+function flushEffects() {
+  fake.flushEffects();
 }
 
 /**
@@ -218,19 +110,6 @@ function countByType(node, type) {
  * 按标签名找元素，可再按类名收窄。className 用空格切分后精确比对——
  * 用 includes 的话 gt-md-table-wrap 会同时命中 gt-md-table。
  */
-function findByType(node, type, cls) {
-  let hit = null;
-  walk(node, (n) => {
-    if (hit || n.type !== type) return;
-    if (cls) {
-      const c = n.props && n.props.className;
-      if (typeof c !== "string" || !c.split(/\s+/).includes(cls)) return;
-    }
-    hit = n;
-  });
-  return hit;
-}
-
 /** 按 className 里的某个类名找元素（冒烟测试里只断言存在性）。 */
 function countByClass(node, cls) {
   let n = 0;
@@ -3395,11 +3274,7 @@ function feedbackSection() {
  * 不换引用的话上一个用例的额度结果会被当成「effect 已跑过」而跳过。
  */
 async function renderFeedbackReady(fresh) {
-  if (fresh) {
-    stateSlots = new Map();
-    refSlots = new Map();
-    effectStores.delete(settingsDef.component);
-  }
+  if (fresh) fake.forgetComponent(settingsDef.component);
   renderKeep(settingsDef.component, {});
   await sleep(60);
   return renderKeep(settingsDef.component, {});
