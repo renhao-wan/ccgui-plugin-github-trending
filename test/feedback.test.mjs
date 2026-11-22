@@ -7,6 +7,8 @@ import {
   buildFeedbackPayload,
   describeFeedbackResult,
   describeQuota,
+  nextQuota,
+  quotaCount,
 } from "../src/lib/feedback.mjs";
 
 test("normaliseFeedbackText 折叠控制字符并限长", () => {
@@ -285,4 +287,39 @@ test("describeQuota 额度字段是脏数据时退回安全文案而不是显示
     assert.doesNotMatch(r.message, /NaN|undefined/, "不能把 NaN/undefined 漏到界面上");
     assert.ok(r.message.length > 0);
   }
+});
+
+test("nextQuota 在服务端没给额度时不会把 null 读成 0 条", () => {
+  // describeFeedbackResult 在响应体里没有 remaining 时会回 remaining: null。
+  // 旧写法 Number.isFinite(Number(null)) === true 把它当成 0，
+  // 界面于是谎报「今天的反馈额度已用完」——用户明明刚发送成功。
+  const prev = { remaining: 12, dailyLimit: 30 };
+  const q = nextQuota(prev, null);
+  assert.equal(q.remaining, 11, "没有回传额度时应当自减，而不是清零");
+  assert.notEqual(q.remaining, 0);
+});
+
+test("nextQuota 只采信真正的数字", () => {
+  assert.equal(nextQuota({ remaining: 5, dailyLimit: 30 }, 7).remaining, 7);
+  assert.equal(nextQuota({ remaining: 5, dailyLimit: 30 }, "7").remaining, 7, "数字字符串可以接受");
+  // 空字符串与 null 一样是「没给」，不是「零」。
+  for (const missing of [null, undefined, "", "abc", NaN, Infinity, {}]) {
+    const q = nextQuota({ remaining: 9, dailyLimit: 30 }, missing);
+    assert.equal(q.remaining, 8, `${JSON.stringify(missing)} 应走自减分支，实际 ${q.remaining}`);
+  }
+});
+
+test("nextQuota 没有旧额度时保持原样", () => {
+  assert.equal(nextQuota(null, null), null);
+  assert.equal(nextQuota({ offline: true }, null).offline, true);
+});
+
+test("describeFeedbackResult 与 fetchQuota 用的额度转换不把空串当 0", () => {
+  // Worker 若回 {"remaining":""}，Number("") === 0 会让界面说「今天用完了」。
+  const r = describeFeedbackResult({ status: 200, body: '{"ok":true,"remaining":""}' });
+  assert.equal(r.remaining, null, "空串应当被当成「没给」，而不是 0");
+  assert.equal(quotaCount(""), null);
+  assert.equal(quotaCount(null), null);
+  assert.equal(quotaCount("0"), 0, "真正的 0 要保留");
+  assert.equal(quotaCount(0), 0);
 });

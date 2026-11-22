@@ -1822,6 +1822,46 @@ function parseJson(body) {
 }
 
 /**
+ * 把服务端给的额度字段收敛成 `number | null`。
+ *
+ * **别用 `Number.isFinite(Number(v))`**：`Number(null)` 与 `Number("")` 都是 0，
+ * 于是「中转没带这个字段」会被读成「今天 0 条额度」，界面就对刚发送成功的
+ * 用户说「今天的额度已用完」。这里只认真正的数字与非空数字字符串。
+ *
+ * @param {unknown} v
+ * @returns {number|null}
+ */
+function quotaCount(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string") {
+    if (!v.trim()) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+/**
+ * 发送成功后更新界面上的剩余额度。
+ *
+ * 服务端回传的额度优先（顺手纠正「暂时连不上」）；没给就按本地旧值自减
+ * 一条，旧值也没有就原样保留。纯函数，单测钉住「别把 null 读成 0」。
+ *
+ * @param {{remaining?: number, dailyLimit?: number, offline?: boolean}|null} prev
+ * @param {unknown} fromServer 服务端回传的 remaining
+ * @returns {object|null}
+ */
+function nextQuota(prev, fromServer) {
+  const n = quotaCount(fromServer);
+  if (n !== null) {
+    return { remaining: n, dailyLimit: (prev && prev.dailyLimit) || 30 };
+  }
+  const prevRemaining = prev && typeof prev.remaining === "number" ? prev.remaining : null;
+  if (prevRemaining === null) return prev;
+  return { remaining: Math.max(0, prevRemaining - 1), dailyLimit: prev.dailyLimit || 30 };
+}
+
+/**
  * 把一次中转响应翻译成界面文案。
  *
  * 一条原则：**永远给出「你还能做什么」**。反馈发不出去不是用户的错，
@@ -1857,7 +1897,7 @@ function describeFeedbackResult(r) {
 
   const status = Number(r && r.status) || 0;
   const data = parseJson(r && r.body);
-  const remaining = data && Number.isFinite(Number(data.remaining)) ? Number(data.remaining) : null;
+  const remaining = data ? quotaCount(data.remaining) : null;
   const code = data && typeof data.error === "string" ? data.error : "";
 
   if (status >= 200 && status < 300) {
@@ -2420,7 +2460,10 @@ async function fetchQuota(ctx) {
     if (!(status >= 200 && status < 300)) return { offline: true };
     const body = res && typeof res.body === "string" ? res.body : "";
     const data = body ? JSON.parse(body) : null;
-    return data && Number.isFinite(Number(data.remaining)) ? { remaining: Number(data.remaining), dailyLimit: Number(data.dailyLimit) || 30 } : null;
+    // 用 quotaCount 而不是 Number.isFinite(Number(...))：后者把 null/"" 读成 0，
+    // 界面会说「今天的额度已用完」。
+    const remaining = data ? quotaCount(data.remaining) : null;
+    return remaining === null ? null : { remaining, dailyLimit: Number(data.dailyLimit) || 30 };
   } catch {
     return { offline: true };
   }
@@ -5502,17 +5545,8 @@ function FeedbackSection() {
     setText((cur) => (cur === submitted ? "" : cur));
 
     // 额度优先用服务端回传的真实值。查额度时失败了也不要紧——成功响应里
-    // 带了 remaining，正好顺手把「暂时连不上」纠正过来。
-    setQuota((prev) => {
-      const fromServer = Number.isFinite(Number(r.remaining)) ? Number(r.remaining) : null;
-      if (fromServer !== null) {
-        return { remaining: fromServer, dailyLimit: (prev && prev.dailyLimit) || 30 };
-      }
-      // 服务端没给数字（旧版中转）：有旧值就自减，否则保持原样。
-      const prevRemaining = prev && typeof prev.remaining === "number" ? prev.remaining : null;
-      if (prevRemaining === null) return prev;
-      return { remaining: Math.max(0, prevRemaining - 1), dailyLimit: prev.dailyLimit || 30 };
-    });
+    // 带了 remaining，正好顺手把「暂时连不上」纠正过来。没有回传就自减一格。
+    setQuota((prev) => nextQuota(prev, r.remaining));
   }
 
   const quotaText = describeQuota(quota);
