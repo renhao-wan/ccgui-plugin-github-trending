@@ -1,6 +1,6 @@
 {
   "name": "ccgui-plugin-github-trending",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "每日热点：GitHub Trending 与近 7 天新星库",
@@ -23,6 +23,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.1"
+    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.2"
   }
 }

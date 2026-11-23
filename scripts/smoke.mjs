@@ -128,8 +128,8 @@ const pickedWorkspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "gt-picked-"));
 const kv = new Map();
 const httpCalls = [];
 /** 反馈中转的假响应。用例逐个改写，跑完不必复原（每个用例自己设）。 */
-let feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
-let feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+let feedbackQuota = { status: 200, value: { remaining: 1, dailyLimit: 1, fallbackRemaining: 3 } };
+let feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
 const agentStarts = [];
 const agentInterrupts = [];
 /** sessions.startRun 的入参；讨论功能的核心断言对象。 */
@@ -501,7 +501,7 @@ const ctx = {
       httpCalls.push({ url: args.url, headers: args.headers || {}, method: args.method, body: args.body });
       // 反馈中转：用例按 feedbackMode 决定这条路回什么。
       if (args.url.startsWith("https://ccgui-feedback.2653990378.workers.dev/")) {
-        if (args.url.endsWith("/quota")) {
+        if (args.url.includes("/quota")) {
           return { status: feedbackQuota.status, body: JSON.stringify(feedbackQuota.value) };
         }
         if (args.url.endsWith("/feedback")) {
@@ -3319,19 +3319,19 @@ await check("反馈：额度查询失败时不显示数字，但仍可发送", a
   await sleep(20);
   const btn = findByText(renderKeep(settingsDef.component, {}), "发送反馈");
   assert.ok(!btn.props.disabled, "额度未知时仍可发送");
-  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+  feedbackQuota = { status: 200, value: { remaining: 1, dailyLimit: 1, fallbackRemaining: 3 } };
 });
 
-await check("反馈：额度查得到时显示剩余条数", async () => {
-  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+await check("反馈：额度查得到时显示「每两天可提交 1 条」", async () => {
+  feedbackQuota = { status: 200, value: { remaining: 1, dailyLimit: 1, fallbackRemaining: 3 } };
   const tree = await renderFeedbackReady(true);
   const quota = findByType(tree, "span", "gt-feedback-quota");
-  assert.match(textOf(quota), /27/);
+  assert.match(textOf(quota), /两天|48/);
 });
 
 await check("反馈：输入后点发送，POST 到 worker，body 只带白名单字段", async () => {
   httpCalls.length = 0;
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
   // 输入框内容跨渲染存在，用 renderKeep 才能走完「打字 → 点发送 → 看到结果」。
   const tree = await renderFeedbackReady(true);
   const area = findByType(tree, "textarea", "gt-feedback-text");
@@ -3359,7 +3359,7 @@ await check("反馈：输入后点发送，POST 到 worker，body 只带白名�
 
 await check("反馈：发送成功后，按钮本身给出回执，不只是角落一行小字", async () => {
   httpCalls.length = 0;
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
   const tree = await renderFeedbackReady(true);
   findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "回执要看得见" } });
   await sleep(20);
@@ -3395,12 +3395,12 @@ await check("反馈：发送失败后按钮回到「发送反馈」，不用刷�
   const btn = findByText(renderKeep(settingsDef.component, {}), "发送反馈");
   assert.ok(btn, "失败后按钮文案应回到「发送反馈」");
   assert.ok(!btn.props.disabled, "正文还在，按钮应可再次点击");
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
 });
 
 await check("反馈：成功后再打字，旧回执随之撤掉", async () => {
   httpCalls.length = 0;
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
   const tree = await renderFeedbackReady(true);
   findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "第一条" } });
   await sleep(20);
@@ -3419,7 +3419,7 @@ await check("反馈：成功后再打字，旧回执随之撤掉", async () => {
 
 await check("反馈：同一 tick 连点两次只发一条", async () => {
   httpCalls.length = 0;
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
   const tree = await renderFeedbackReady(true);
   findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "手滑双击了" } });
   await sleep(20);
@@ -3436,7 +3436,7 @@ await check("反馈：同一 tick 连点两次只发一条", async () => {
 
 await check("反馈：发送中继续打字，成功后新内容不会被清掉", async () => {
   httpCalls.length = 0;
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
   const tree = await renderFeedbackReady(true);
   findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "第一段" } });
   await sleep(20);
@@ -3469,11 +3469,11 @@ await check("反馈：额度查不到但发送成功，额度区不再停留在�
   assert.ok(
     await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "反馈已发送"), 3000),
   );
-  // 成功响应里带了 remaining:24，额度区应该用它，而不是继续挂「连不上」。
-  // 注意 waitFor 命中时返回的是 true，元素本身要再取一次。
+  // 成功响应里 remaining:0（本插件进入 48h 冷却），额度区应切到冷却/共享文案，
+  // 而不是继续挂「连不上」。注意 waitFor 命中时返回的是 true，元素本身要再取一次。
   assert.ok(
     await waitFor(
-      () => /24/.test(textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota"))),
+      () => /共享|48|两天/.test(textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota"))),
       3000,
     ),
     "成功后应用服务端回传的额度（实际："
@@ -3486,8 +3486,8 @@ await check("反馈：额度查不到但发送成功，额度区不再停留在�
     "成功后不该还挂着「连不上」",
   );
 
-  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackQuota = { status: 200, value: { remaining: 1, dailyLimit: 1, fallbackRemaining: 3 } };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
 });
 
 await check("反馈：额度查不到时提供「重试」按钮", async () => {
@@ -3496,16 +3496,16 @@ await check("反馈：额度查不到时提供「重试」按钮", async () => {
   const retry = findByType(tree, "button", "gt-feedback-quota-retry");
   assert.ok(retry, "额度查不到时应给重试按钮");
   // 点一下能重新查到。
-  feedbackQuota = { status: 200, value: { remaining: 25, dailyLimit: 30 } };
+  feedbackQuota = { status: 200, value: { remaining: 1, dailyLimit: 1, fallbackRemaining: 2 } };
   retry.props.onClick();
   assert.ok(
     await waitFor(
-      () => /25/.test(textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota") || { props: {} })),
+      () => /两天|48/.test(textOf(findByType(renderKeep(settingsDef.component, {}), "span", "gt-feedback-quota") || { props: {} })),
       3000,
     ),
     "重试后应显示新额度",
   );
-  feedbackQuota = { status: 200, value: { remaining: 27, dailyLimit: 30 } };
+  feedbackQuota = { status: 200, value: { remaining: 1, dailyLimit: 1, fallbackRemaining: 3 } };
 });
 
 await check("反馈：成功桥接态不被 :disabled 的 0.45 透明度糊掉", () => {
@@ -3533,15 +3533,15 @@ await check("反馈：200 但正文不是我们的 JSON 时不当成功", async 
     !findAnyText(renderKeep(settingsDef.component, {}), "反馈已发送"),
     "劫持页绝不能说「已发送」",
   );
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
 });
 
-await check("反馈：突发限流提示「稍等」而不是「明天」，且不谎报额度用完", async () => {
+await check("反馈：突发限流提示「稍等」而不是「48 小时冷却」，且不谎报额度用完", async () => {
   httpCalls.length = 0;
-  // Worker 突发保护：10 分钟内第 4 条。此时今天还有额度，只是这会儿太快。
+  // 兜底池的 10 分钟窗口撞了：本插件仍在 48h 冷却里，只是这会儿太快。
   feedbackSend = {
     status: 429,
-    body: '{"ok":false,"error":"rate_limited","kind":"burst","remaining":27,"resetAt":1795392000000}',
+    body: '{"ok":false,"error":"rate_limited","kind":"burst","remaining":0,"fallbackRemaining":2,"resetAt":1795392000000}',
   };
   const tree = await renderFeedbackReady(true);
   findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "手快了点" } });
@@ -3553,13 +3553,13 @@ await check("反馈：突发限流提示「稍等」而不是「明天」，且�
   );
   assert.ok(msg, "突发限流应提示发得太快");
   assert.ok(
-    !findAnyText(renderKeep(settingsDef.component, {}), "明天"),
-    "突发限流不该说「明天」——十分钟后就好",
+    !findAnyText(renderKeep(settingsDef.component, {}), "48 小时"),
+    "突发限流不该说成 48 小时冷却——十分钟后就好",
   );
   // 失败不吞正文，用户不用重打一遍。
   const area = findByType(renderKeep(settingsDef.component, {}), "textarea", "gt-feedback-text");
   assert.equal(area.props.value, "手快了点", "失败后正文应保留");
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
 });
 
 await check("反馈：502 说成服务端发不出，不甩「内容不合要求」", async () => {
@@ -3577,19 +3577,19 @@ await check("反馈：502 说成服务端发不出，不甩「内容不合要求
   // 责任归属很重要：用户没做错事，别让他去改内容。
   assert.ok(!findAnyText(renderKeep(settingsDef.component, {}), "内容不合"), "不能把服务端故障说成用户的错");
   assert.ok(findAnyText(renderKeep(settingsDef.component, {}), "GitHub Issue"), "给出退路");
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
 });
 
-await check("反馈：429 时提示额度用完", async () => {
+await check("反馈：429 冷却时提示 48 小时规则并给退路", async () => {
   httpCalls.length = 0;
-  feedbackSend = { status: 429, body: '{"ok":false,"error":"rate_limited","remaining":0}' };
+  feedbackSend = { status: 429, body: '{"ok":false,"error":"rate_limited","kind":"cooldown","remaining":0}' };
   const tree = await renderFeedbackReady(true);
   findByType(tree, "textarea", "gt-feedback-text").props.onChange({ target: { value: "再来一条" } });
   await sleep(20);
   findByText(renderKeep(settingsDef.component, {}), "发送反馈").props.onClick();
   assert.ok(
-    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "额度已用完"), 3000),
-    "应显示额度用完文案",
+    await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "48"), 3000),
+    "应显示 48 小时冷却文案",
   );
 });
 
@@ -3603,7 +3603,7 @@ await check("反馈：500 时提示发送失败并给出 Issue 退路", async ()
     await waitFor(() => findAnyText(renderKeep(settingsDef.component, {}), "GitHub Issue"), 3000),
     "失败文案应指回 Issue",
   );
-  feedbackSend = { status: 200, body: '{"ok":true,"remaining":26}' };
+  feedbackSend = { status: 200, body: '{"ok":true,"remaining":0,"dailyLimit":1,"fallbackRemaining":2}' };
 });
 
 /* ------------------------------------------------------------ 汇总 */

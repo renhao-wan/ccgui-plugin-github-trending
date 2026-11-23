@@ -1,7 +1,7 @@
 {
   "id": "github-trending",
   "name": "每日热点",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "sdkVersion": "^0.3",
   "minAppVersion": "1.2.4",
   "author": "renhao-wan",
@@ -9,8 +9,19 @@
   "repo": "renhao-wan/ccgui-plugin-github-trending",
   "license": "MIT",
   "icon": "docs/icon.png",
-  "screenshots": ["docs/screenshot.png"],
-  "keywords": ["github", "trending", "hot", "digest", "discover", "热点", "榜单", "搜索"],
+  "screenshots": [
+    "docs/screenshot.png"
+  ],
+  "keywords": [
+    "github",
+    "trending",
+    "hot",
+    "digest",
+    "discover",
+    "热点",
+    "榜单",
+    "搜索"
+  ],
   "tier": "js",
   "permissions": [
     "ui:center-tab",
