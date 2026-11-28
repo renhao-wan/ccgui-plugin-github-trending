@@ -3128,154 +3128,13 @@ function usePopover() {
 }
 
 /**
- * 自绘下拉：原生 <select> 的展开层由系统绘制，不跟宿主的深浅色主题。
- * 键盘、方向键、Esc、点击外部关闭都对齐宿主习惯。
+ * 自绘下拉。实现在共用包 `ccgui-plugin-shared/dropdown`，构建期内联到本文件。
+ *
+ * 以前这里有一份 145 行的本地实现，worklog / leetcode 又各抄了一份，三份已经
+ * 漂开（leetcode 那份漏了 value / label / check / empty 四条 CSS，菜单在浅色
+ * 主题下变成黑块）。现在结构与类名只有一份，prefix 决定前缀，CSS 仍归本插件。
  */
-function Dropdown(props) {
-  const R = appCtx.react;
-  const h = R.createElement;
-  const { open, setOpen, up, triggerRef, openPopover } = usePopover();
-  const focusState = R.useState(-1);
-  const focusIdx = focusState[0];
-  const setFocusIdx = focusState[1];
-  const itemRefs = R.useRef([]);
-
-  const items = Array.isArray(props.items) ? props.items : [];
-  const value = props.value == null ? "" : String(props.value);
-  const selectedIdx = items.findIndex((it) => String(it.value) === value);
-  const selected = selectedIdx >= 0 ? items[selectedIdx] : null;
-  const placeholder = props.placeholder || "请选择";
-
-  R.useEffect(() => {
-    if (!open) return;
-    const el = itemRefs.current[focusIdx];
-    if (el && typeof el.focus === "function") el.focus();
-  }, [open, focusIdx]);
-
-  const openMenu = () => {
-    if (props.disabled || items.length === 0) return;
-    let i = selectedIdx;
-    if (i < 0) i = items.findIndex((it) => !it.disabled);
-    setFocusIdx(i < 0 ? 0 : i);
-    openPopover(Math.min(260, items.length * 32 + 8));
-  };
-
-  const choose = (item) => {
-    if (!item || item.disabled) return;
-    setOpen(false);
-    if (String(item.value) !== value) props.onChange(item.value);
-  };
-
-  const move = (step) => {
-    if (!items.length) return;
-    let i = focusIdx;
-    for (let n = 0; n < items.length; n += 1) {
-      i = (i + step + items.length) % items.length;
-      if (!items[i].disabled) break;
-    }
-    setFocusIdx(i);
-  };
-
-  /**
-   * 键盘处理挂在**容器**上，不是 trigger 上。
-   *
-   * 菜单一打开，useEffect 会把焦点移到 option 上（option 带 tabIndex=-1），
-   * 此后按键事件从 option 冒泡到容器。只挂在 trigger 上的话，打开之后方向键、
-   * Enter 确认、Esc 关闭全部失灵——只剩鼠标能用。
-   *
-   * 容器与 trigger 不能各挂一个：同一事件会冒泡两遍，Enter 会触发两次
-   * onChange。所以只有一个 handler，靠 `ev.target` 认来源。
-   */
-  const onKeyDown = (ev) => {
-    if (props.disabled) return;
-    // 按 className 认来源，不用 triggerRef.current：ref 在假宿主/替身里
-    // 未必被赋值，一旦为 null 判断就会恒假，空格键静默失效。
-    const t = ev && ev.target;
-    const onTrigger = Boolean(
-      t && typeof t.className === "string" && t.className.split(/\s+/).includes("gt-dd-trigger"),
-    );
-    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-      ev.preventDefault();
-      if (!open) openMenu();
-      else move(ev.key === "ArrowDown" ? 1 : -1);
-    } else if (ev.key === "Enter") {
-      ev.preventDefault();
-      if (open) choose(items[focusIdx]);
-      else openMenu();
-    } else if (ev.key === " ") {
-      // 空格只在 trigger 上当「打开」：菜单项里按空格同理会冒泡到这里，
-      // 但那是可滚动列表，别为了这个吃掉滚动键。
-      if (onTrigger) {
-        ev.preventDefault();
-        if (open) choose(items[focusIdx]);
-        else openMenu();
-      }
-    } else if (ev.key === "Escape" && open) {
-      ev.preventDefault();
-      setOpen(false);
-    } else if (ev.key === "Tab" && open) {
-      // 焦点会离开这个组件；scrim 是 fixed 全屏，不关掉会留下一层看不见的
-      // 遮罩继续吞点击。
-      setOpen(false);
-    }
-  };
-
-  return h(
-    "div",
-    {
-      className: "gt-dd" + (open ? " is-open" : "") + (up ? " is-up" : ""),
-      onKeyDown,
-    },
-    h(
-      "button",
-      {
-        type: "button",
-        className: "gt-dd-trigger",
-        ref: triggerRef,
-        disabled: props.disabled,
-        "aria-haspopup": "listbox",
-        "aria-expanded": open,
-        onClick: () => (open ? setOpen(false) : openMenu()),
-      },
-      h("span", { className: "gt-dd-value" + (selected ? "" : " is-empty") }, selected ? selected.label : placeholder),
-      h("span", { className: "gt-dd-caret", "aria-hidden": "true" }),
-    ),
-    open ? h("div", { className: "gt-dd-scrim", onClick: () => setOpen(false) }) : null,
-    open
-      ? h(
-          "div",
-          { className: "gt-dd-menu", role: "listbox" },
-          items.length
-            ? items.map((item, i) =>
-                h(
-                  "div",
-                  {
-                    key: String(item.value) + ":" + i,
-                    ref: (el) => {
-                      itemRefs.current[i] = el;
-                    },
-                    className:
-                      "gt-dd-item" +
-                      (i === focusIdx ? " is-active" : "") +
-                      (item.disabled ? " is-disabled" : ""),
-                    role: "option",
-                    "aria-selected": String(item.value) === value,
-                    "aria-disabled": item.disabled ? true : undefined,
-                    tabIndex: -1,
-                    onClick: () => choose(item),
-                    onMouseEnter: () => {
-                      if (!item.disabled) setFocusIdx(i);
-                    },
-                  },
-                  h("span", { className: "gt-dd-label" }, item.label),
-                  h("span", { className: "gt-dd-check", "aria-hidden": "true" }, "✓"),
-                ),
-              )
-            : h("div", { className: "gt-dd-empty" }, props.emptyText || "没有可选项"),
-        )
-      : null,
-  );
-}
+const Dropdown = createDropdown(() => appCtx.react, { prefix: "gt" });
 
 function segField(label, control, hint) {
   const h = appCtx.react.createElement;
@@ -4589,6 +4448,7 @@ const CSS = `
 .gt-dd-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gt-dd-check { flex: none; font-size: 12px; color: var(--gt-accent); opacity: 0; }
 .gt-dd-item[aria-selected="true"] .gt-dd-check { opacity: 1; }
+.gt-dd-group { padding: 6px 10px 2px; font-size: 11px; color: var(--gt-muted); user-select: none; }
 .gt-dd-empty { padding: 8px 10px; font-size: 12px; color: var(--gt-muted); }
 
 /* 可折叠的次要项：Token 之类默认收起来 */
